@@ -1,6 +1,9 @@
 import openai
 import os
+from typing import AsyncGenerator, Union
+
 from aisuite.provider import Provider, LLMError
+from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 
 
 class DeepseekaliProvider(Provider):
@@ -25,13 +28,58 @@ class DeepseekaliProvider(Provider):
         # Eg: OPENAI_API_KEY, OPENAI_ORG_ID, OPENAI_PROJECT_ID. Except for OPEN_AI_BASE_URL which has to be the deepseek url
 
         # Pass the entire config to the OpenAI client constructor
-        self.client = openai.OpenAI(**config)
+        self.client = openai.AsyncOpenAI(**config)
 
-    def chat_completions_create(self, model, messages, **kwargs):
+    async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         # Any exception raised by OpenAI will be returned to the caller.
         # Maybe we should catch them and raise a custom LLMError.
-        return self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            **kwargs  # Pass any additional arguments to the OpenAI API
-        )
+        if stream:
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+                **kwargs  # Pass any additional arguments to the OpenAI API
+            )
+            async def stream_generator():
+                async for chunk in response:
+                    if chunk.choices:
+                        yield ChatCompletionResponse(
+                            id=chunk.id,
+                            created=chunk.created,
+                            model=chunk.model,
+                            choices=[
+                                StreamChoice(
+                                    index=choice.index,
+                                    delta=ChoiceDelta(
+                                        content=choice.delta.content,
+                                        role=choice.delta.role
+                                    ),
+                                    finish_reason=choice.finish_reason
+                                )
+                                for choice in chunk.choices
+                            ],
+                            usage=None  # Usage is not provided in stream chunks
+                        )
+            return stream_generator()
+        else:
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=False,
+                **kwargs  # Pass any additional arguments to the OpenAI API
+            )
+
+            return ChatCompletionResponse(
+                id=response.id,
+                created=response.created,
+                model=model,
+                choices=[
+                    Choice(
+                        index=choice.index,
+                        message=choice.message.content,
+                        finish_reason=choice.finish_reason
+                    )
+                    for choice in response.choices
+                ],
+                usage=None
+            )

@@ -81,7 +81,7 @@ class Completions:
     def __init__(self, client: "Client"):
         self.client = client
 
-    def create(self, model: str, messages: list, **kwargs):
+    def create(self, model: str, messages: list, stream: bool = False, **kwargs):
         """
         Create chat completion based on the model, messages, and any extra arguments.
         """
@@ -114,4 +114,4 @@ class Completions:
             raise ValueError(f"Could not load provider for '{provider_key}'.")
 
         # Delegate the chat completion to the correct provider's implementation
-        return provider.chat_completions_create(model_name, messages, **kwargs)
+        return provider.chat_completions_create(model_name, messages, stream=stream, **kwargs)
