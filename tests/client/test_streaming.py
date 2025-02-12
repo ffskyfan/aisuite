@@ -10,12 +10,15 @@ STREAM_TIMEOUT = 15
 # Fixture for Deepseek provider
 @pytest.fixture
 def deepseek_client():
-    return Client(provider="deepseek", api_key=os.getenv("DEEPSEEK_API_KEY"))
+    return Client(provider_configs={
+        "deepseek": {"api_key": os.getenv("DEEPSEEK_API_KEY")}
+    })
 
-# Fixture for DeepseekAli provider  
 @pytest.fixture
 def deepseekali_client():
-    return Client(provider="deepseekali", api_key=os.getenv("DASHSCOPE_API_KEY"))
+    return Client(provider_configs={
+        "deepseekali": {"api_key": os.getenv("DASHSCOPE_API_KEY")}
+    })
 
 @pytest.mark.asyncio
 async def test_deepseek_streaming_response(deepseek_client):
@@ -24,7 +27,7 @@ async def test_deepseek_streaming_response(deepseek_client):
     
     # Capture streamed response
     stream = await deepseek_client.chat.completions.create(
-        model="deepseek-chat",
+        model="deepseek:deepseek-chat",
         messages=messages,
         stream=True
     )
@@ -49,7 +52,7 @@ async def test_deepseekali_multi_turn(deepseekali_client):
     ]
     
     stream = await deepseekali_client.chat.completions.create(
-        model="deepseek-alibaba",
+        model="deepseekali:deepseek-v3", 
         messages=messages,
         stream=True
     )
@@ -84,7 +87,7 @@ async def test_stream_timeout(deepseek_client):
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
             deepseek_client.chat.completions.create(
-                model="deepseek-chat",
+            model="deepseek:deepseek-chat",
                 messages=messages,
                 stream=True
             ),
