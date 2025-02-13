@@ -39,23 +39,24 @@ class OpenaiProvider(Provider):
             async def stream_generator():
                 async for chunk in response:
                     if chunk.choices:
-                        yield ChatCompletionResponse(
-                            id=chunk.id,
-                            created=chunk.created,
-                            model=chunk.model,
-                            choices=[
-                                StreamChoice(
-                                    index=choice.index,
-                                    delta=ChoiceDelta(
-                                        content=choice.delta.content,
-                                        role=choice.delta.role
-                                    ),
-                                    finish_reason=choice.finish_reason
-                                )
-                                for choice in chunk.choices
-                            ],
-                            usage=None  # Usage is not provided in stream chunks
-                        )
+                            yield ChatCompletionResponse(
+                                choices=[
+                                    StreamChoice(
+                                        index=choice.index,
+                                        delta=ChoiceDelta(
+                                            content=choice.delta.content,
+                                            role=choice.delta.role
+                                        ),
+                                        finish_reason=choice.finish_reason
+                                    )
+                                    for choice in chunk.choices
+                                ],
+                                metadata={
+                                    'id': chunk.id,
+                                    'created': chunk.created,
+                                    'model': chunk.model
+                                }
+                            )
             return stream_generator()
         else:
             response = await self.client.chat.completions.create(
@@ -66,9 +67,6 @@ class OpenaiProvider(Provider):
             )
 
             return ChatCompletionResponse(
-                id=response.id,
-                created=response.created,
-                model=response.model,
                 choices=[
                     Choice(
                         index=choice.index,
@@ -77,9 +75,14 @@ class OpenaiProvider(Provider):
                     )
                     for choice in response.choices
                 ],
-                usage={
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
+                metadata={
+                    "id": response.id,
+                    "created": response.created,
+                    "model": response.model,
+                    "usage": {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens
+                    }
                 }
             )

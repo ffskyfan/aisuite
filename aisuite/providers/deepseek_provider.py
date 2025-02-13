@@ -40,23 +40,24 @@ class DeepseekProvider(Provider):
             async def stream_generator():
                 async for chunk in response:
                     if chunk.choices:
-                        yield ChatCompletionResponse(
-                            id=chunk.id,
-                            created=chunk.created,
-                            model=chunk.model,
-                            choices=[
-                                StreamChoice(
-                                    index=choice.index,
-                                    delta=ChoiceDelta(
-                                        content=choice.delta.content,
-                                        role=choice.delta.role
-                                    ),
-                                    finish_reason=choice.finish_reason
-                                )
-                                for choice in chunk.choices
-                            ],
-                            usage=None  # Usage is not provided in stream chunks
-                        )
+                            yield ChatCompletionResponse(
+                                choices=[
+                                    StreamChoice(
+                                        index=choice.index,
+                                        delta=ChoiceDelta(
+                                            content=choice.delta.content,
+                                            role=choice.delta.role
+                                        ),
+                                        finish_reason=choice.finish_reason
+                                    )
+                                    for choice in chunk.choices
+                                ],
+                                metadata={
+                                    'id': chunk.id,
+                                    'created': chunk.created,
+                                    'model': chunk.model
+                                }
+                            )
             return stream_generator()
         else:
             response = await self.client.chat.completions.create(
@@ -67,9 +68,6 @@ class DeepseekProvider(Provider):
             )
 
             return ChatCompletionResponse(
-                id=response.id,
-                created=response.created,
-                model=model,
                 choices=[
                     Choice(
                         index=choice.index,
@@ -78,5 +76,9 @@ class DeepseekProvider(Provider):
                     )
                     for choice in response.choices
                 ],
-                usage=None
+                metadata={
+                    "id": response.id,
+                    "created": response.created,
+                    "model": model
+                }
             )

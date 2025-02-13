@@ -14,11 +14,24 @@ class StreamChoice:
     finish_reason: Optional[str] = None
 
 class ChatCompletionResponse:
-    """Used to conform to the response model of OpenAI"""
-
-    def __init__(self, id: str = None, created: int = None, model: str = None, choices: list = None, usage: dict = None):
-        self.id = id
-        self.created = created
-        self.model = model
+    """Standard response format for chat completions across all providers"""
+    
+    def __init__(self, choices: list = None, metadata: dict = None):
         self.choices = choices if choices is not None else []
-        self.usage = usage
+        self.metadata = metadata or {}
+
+    @property
+    def id(self):
+        return self.metadata.get('id')
+
+    @property
+    def created(self):
+        return self.metadata.get('created')
+
+    @property
+    def model(self):
+        return self.metadata.get('model')
+
+    @property
+    def usage(self):
+        return self.metadata.get('usage')
