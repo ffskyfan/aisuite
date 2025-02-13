@@ -71,9 +71,6 @@ class DeepseekaliProvider(Provider):
             )
 
             return ChatCompletionResponse(
-                id=response.id,
-                created=response.created,
-                model=model,
                 choices=[
                     Choice(
                         index=choice.index,
@@ -82,5 +79,9 @@ class DeepseekaliProvider(Provider):
                     )
                     for choice in response.choices
                 ],
-                usage=None
+                metadata={
+                    "id": response.id,
+                    "created": response.created,
+                    "model": model
+                }
             )
