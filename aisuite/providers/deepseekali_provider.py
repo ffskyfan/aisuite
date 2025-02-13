@@ -44,9 +44,6 @@ class DeepseekaliProvider(Provider):
                 async for chunk in response:
                     if chunk.choices:
                         yield ChatCompletionResponse(
-                            id=chunk.id,
-                            created=chunk.created,
-                            model=chunk.model,
                             choices=[
                                 StreamChoice(
                                     index=choice.index,
@@ -58,7 +55,11 @@ class DeepseekaliProvider(Provider):
                                 )
                                 for choice in chunk.choices
                             ],
-                            usage=None  # Usage is not provided in stream chunks
+                            metadata={
+                                'id': chunk.id,
+                                'created': chunk.created,
+                                'model': chunk.model
+                            }
                         )
             return stream_generator()
         else:
