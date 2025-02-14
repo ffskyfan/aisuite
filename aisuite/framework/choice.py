@@ -3,8 +3,10 @@ from typing import Literal, Optional
 
 
 class Choice:
-    def __init__(self):
-        self.finish_reason: Optional[Literal["stop", "tool_calls"]] = None
-        self.message = Message(
+    def __init__(self, index: Optional[int] = None, message: Optional[Message] = None, 
+                 finish_reason: Optional[Literal["stop", "tool_calls"]] = None):
+        self.index = index
+        self.finish_reason = finish_reason
+        self.message = message if message is not None else Message(
             content=None, tool_calls=None, role="assistant", refusal=None
         )

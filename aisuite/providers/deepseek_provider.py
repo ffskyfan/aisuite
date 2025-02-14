@@ -4,6 +4,7 @@ from typing import AsyncGenerator, Union
 
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
+from aisuite.framework.message import Message
 
 
 class DeepseekProvider(Provider):
@@ -71,8 +72,13 @@ class DeepseekProvider(Provider):
                 choices=[
                     Choice(
                         index=choice.index,
-                        message=choice.message.content,
-                        finish_reason=choice.finish_reason
+                        message=Message(
+                            content=choice.message.content,
+                            role=choice.message.role,
+                            tool_calls=None,
+                            refusal=None
+                        ),
+                        finish_reason=getattr(choice, 'finish_reason', None)
                     )
                     for choice in response.choices
                 ],
