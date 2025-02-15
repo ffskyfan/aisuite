@@ -3,9 +3,15 @@ import os
 import asyncio
 from aisuite.client import Client
 from aisuite.framework.chat_completion_response import ChatCompletionResponse
+from dotenv import load_dotenv
+from aisuite.framework.message import Message
+import google as genai
 
 # Test timeout for streaming responses (15 seconds)
 STREAM_TIMEOUT = 15
+
+# Load environment variables
+load_dotenv()
 
 # Fixture for Deepseek provider
 @pytest.fixture
@@ -93,3 +99,31 @@ async def test_stream_timeout(deepseek_client):
             ),
             timeout=0.1
         )
+
+@pytest.fixture
+def gemini_client():
+    return Client(provider_configs={
+        "gemini": {"api_key": os.getenv("GEMINI_API_KEY")}
+    })
+
+@pytest.mark.asyncio
+async def test_gemini_streaming_response(gemini_client):
+    """Test Gemini streaming response"""
+    messages = [Message(role="user", content="Hello, World!", tool_calls=None, refusal=None)]
+
+    # Capture streamed response
+    stream = await gemini_client.chat.completions.create(
+        model="gemini:gemini-2.0-flash",
+        messages=messages,
+        stream=True
+    )
+    
+    collected_chunks = []
+    async for chunk in stream:
+        assert isinstance(chunk, ChatCompletionResponse)
+        assert len(chunk.choices) == 1
+        collected_chunks.append(chunk.choices[0].delta.content)
+
+    # Verify final message
+    full_response = "".join([c for c in collected_chunks if c is not None])
+    assert len(full_response) > 0
