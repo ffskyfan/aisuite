@@ -1,4 +1,4 @@
-from google import genai
+from google import generativeai as genai
 import os
 from typing import AsyncGenerator, Union
 
@@ -14,64 +14,77 @@ class GeminiProvider(Provider):
             raise ValueError(
                 "Gemini API key is missing. Please provide it in the config or set the GEMINI_API_KEY environment variable."
             )
-        # Pass timeout to the client via transport if provided
-        timeout = config.pop("timeout", None)
-        if timeout:
-            transport = genai.transports.Transport(timeout=timeout)
-            self.client = genai.Client(api_key=config["api_key"], transport=transport)
-        else:
-            self.client = genai.Client(api_key=config["api_key"])
-
+        
+        # Configure the Gemini client
+        genai.configure(api_key=config["api_key"])
+        
+        # Default generation config
+        self.generation_config = {
+            "temperature": config.get("temperature", 1),
+            "top_p": config.get("top_p", 0.95),
+            "top_k": config.get("top_k", 64),
+            "max_output_tokens": config.get("max_output_tokens", 8192),
+            "response_mime_type": "text/plain",
+        }
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         # Check for testing environment
         if os.getenv("IS_TESTING"):
             return self._mock_response(stream, kwargs.get("response_text"), kwargs.get("response_chunks"))
 
-        # Convert aisuite messages to Gemini contents format (list of strings).
-        contents = [message.content for message in messages]
+        # Create the model with generation config and system instruction
+        generation_model = genai.GenerativeModel(
+            model_name=model,
+            generation_config=self.generation_config
+        )
+
+        # Convert messages to Gemini chat history format
+        history = []
+        for msg in messages[:-1]:  # Process all messages except the last one as history
+            history.append({
+                "role": msg.role,
+                "parts": [msg.content]
+            })
+
+        # Start chat session with history
+        chat = generation_model.start_chat(history=history if history else None)
+        
+        # Send the last message
+        last_message = messages[-1].content
 
         if stream:
-            response = self.client.models.generate_content_stream(
-                model=model,
-                contents=contents,
-                **kwargs  # Pass any additional arguments, including 'config'
-            )
+            response = chat.send_message(last_message, stream=True)
             async def stream_generator():
                 for chunk in response:
                     if chunk.text:  # Check for empty chunks
                         yield ChatCompletionResponse(
                             choices=[
                                 StreamChoice(
-                                    index=0,  # Gemini doesn't provide index in stream
+                                    index=0,
                                     delta=ChoiceDelta(
                                         content=chunk.text,
-                                        role="model"  # Gemini doesn't return role in stream
+                                        role="assistant"
                                     ),
-                                    finish_reason=None  # Gemini doesn't provide this in the stream.
+                                    finish_reason=None
                                 )
                             ],
                             metadata={
-                                'model': model  # Use the requested model
+                                'model': model
                             }
                         )
             return stream_generator()
         else:
-            response = self.client.models.generate_content(
-                model=model,
-                contents=contents,
-                **kwargs  # Pass any additional arguments, including 'config'
-            )
-
+            response = chat.send_message(last_message)
+            
             return ChatCompletionResponse(
                 choices=[
                     Choice(
                         index=0,
                         message=response.text,
-                        finish_reason=None  # TODO: Check if Gemini provides a finish reason
+                        finish_reason=None
                     )
                 ],
                 metadata={
-                    "model": model,  # Use the requested model
+                    "model": model,
                 }
             )
