@@ -1,90 +1,123 @@
-from google import generativeai as genai
 import os
-from typing import AsyncGenerator, Union
+from aisuite.providers import Provider
 
-from aisuite.provider import Provider, LLMError
-from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
-
+# Import Google GenAI SDK
+from google import genai
+from google.genai import types
 
 class GeminiProvider(Provider):
-    def __init__(self, **config):
-        # Initialize the Gemini client. API key is required.
-        config.setdefault("api_key", os.getenv("GEMINI_API_KEY"))
-        if not config["api_key"]:
-            raise ValueError(
-                "Gemini API key is missing. Please provide it in the config or set the GEMINI_API_KEY environment variable."
-            )
-        
-        # Configure the Gemini client
-        genai.configure(api_key=config["api_key"])
-        
-        # Default generation config
-        self.generation_config = {
-            "temperature": config.get("temperature", 1),
-            "top_p": config.get("top_p", 0.95),
-            "top_k": config.get("top_k", 64),
-            "max_output_tokens": config.get("max_output_tokens", 8192),
-            "response_mime_type": "text/plain",
-        }
-
-    async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
-        # Check for testing environment
-        if os.getenv("IS_TESTING"):
-            return self._mock_response(stream, kwargs.get("response_text"), kwargs.get("response_chunks"))
-
-        # Create the model with generation config and system instruction
-        generation_model = genai.GenerativeModel(
-            model_name=model,
-            generation_config=self.generation_config
-        )
-
-        # Convert messages to Gemini chat history format
-        history = []
-        for msg in messages[:-1]:  # Process all messages except the last one as history
-            history.append({
-                "role": msg.role,
-                "parts": [msg.content]
-            })
-
-        # Start chat session with history
-        chat = generation_model.start_chat(history=history if history else None)
-        
-        # Send the last message
-        last_message = messages[-1].content
-
+    def __init__(self, **kwargs):
+        """Initialize the Gemini provider with API key and client."""
+        super().__init__(**kwargs)
+        api_key = os.environ.get("GEMINI_API_KEY") or kwargs.get("api_key")
+        if api_key is None:
+            raise RuntimeError("GEMINI_API_KEY is required for GeminiProvider")
+        # Initialize the GenAI client for Gemini (non-Vertex usage)
+        self.client = genai.Client(api_key=api_key)
+    
+    
+    def chat_completions_create(self, model: str, messages: list, **kwargs):
+        """Create a chat completion (single-turn or streaming) using a Gemini model."""
+        # Determine if streaming
+        stream = kwargs.get("stream", False)
+        if "stream" in kwargs:
+            kwargs.pop("stream")
+        # Map model name to proper format
+        model_id = model
+        # Separate system message (if present) for config
+        config_kwargs = {}
+        if messages and messages[0].get("role") == "system":
+            config_kwargs["system_instruction"] = messages[0]["content"]
+            messages = messages[1:]
+        # Map max_tokens to max_output_tokens for Google SDK
+        if "max_tokens" in kwargs or "max_output_tokens" in kwargs:
+            max_toks = kwargs.pop("max_output_tokens", None) or kwargs.pop("max_tokens", None)
+            config_kwargs["max_output_tokens"] = max_toks
+        # Pass through other known generation parameters
+        for param in ["temperature", "top_p", "top_k", "candidate_count",
+                      "presence_penalty", "frequency_penalty", "seed"]:
+            if param in kwargs:
+                config_kwargs[param] = kwargs.pop(param)
+        # Handle stop sequences (stop or stop_sequences key)
+        stop_seq = None
+        if "stop_sequences" in kwargs or "stop" in kwargs:
+            stop_seq = kwargs.pop("stop_sequences", None) or kwargs.pop("stop", None)
+        if stop_seq:
+            # Ensure stop sequences is a list
+            if isinstance(stop_seq, str):
+                config_kwargs["stop_sequences"] = [stop_seq]
+            elif isinstance(stop_seq, list):
+                config_kwargs["stop_sequences"] = stop_seq
+        # (Ignore any remaining kwargs that are not applicable for now)
+        # Create config object if any config parameters were specified
+        config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+        # Prepare conversation history (all messages except the final prompt)
+        history_msgs = []
+        last_user_message = None
+        if messages:
+            # Assume the last message is the user prompt we want to answer
+            if messages[-1]["role"] == "user":
+                last_user_message = messages[-1]["content"]
+                convo_history = messages[:-1]
+            else:
+                # If last message is not user (edge case), treat all as history
+                convo_history = messages
+                last_user_message = None
+            # Convert history messages to Content objects
+            for msg in convo_history:
+                role = msg["role"]
+                if role not in ("user", "assistant"):
+                    # Skip any non-user/assistant (e.g., system already handled)
+                    continue
+                part = types.Part.from_text(text=msg["content"])
+                history_msgs.append(types.Content(role=role, parts=[part]))
+        # Create a new chat session with history and config (if any)
+        chat = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
+        if last_user_message is None:
+            # No user prompt to send (no completion to generate)
+            return None
+        # Send the last user message and get response (streaming or full)
         if stream:
-            response = chat.send_message(last_message, stream=True)
-            async def stream_generator():
-                for chunk in response:
-                    if chunk.text:  # Check for empty chunks
-                        yield ChatCompletionResponse(
-                            choices=[
-                                StreamChoice(
-                                    index=0,
-                                    delta=ChoiceDelta(
-                                        content=chunk.text,
-                                        role="assistant"
-                                    ),
-                                    finish_reason=None
-                                )
-                            ],
-                            metadata={
-                                'model': model
-                            }
-                        )
-            return stream_generator()
+            # Streaming response: return a generator yielding text chunks
+            def _stream():
+                for chunk in chat.send_message_stream(last_user_message):
+                    yield chunk.text  # yield each incremental text part
+            return _stream()
         else:
-            response = chat.send_message(last_message)
-            
-            return ChatCompletionResponse(
-                choices=[
-                    Choice(
-                        index=0,
-                        message=response.text,
-                        finish_reason=None
-                    )
-                ],
-                metadata={
-                    "model": model,
-                }
-            )
+            # Single-turn completion: get the full response
+            response = chat.send_message(message=last_user_message)
+            return response  # The response object with .text, .candidates, etc.
+    
+    def chat_create(self, model: str, messages: list = None, **kwargs):
+        """Create a persistent chat session (ChatSession) for multi-turn conversations."""
+        model_id = model
+        # Separate system message for config if provided in messages
+        config_kwargs = {}
+        history_msgs = []
+        if messages:
+            if messages and messages[0].get("role") == "system":
+                config_kwargs["system_instruction"] = messages[0]["content"]
+                messages = messages[1:]
+            # We can also extract generation params from kwargs for config (reuse logic)
+        # Merge any generation params into config (reusing logic from chat_completions_create)
+        if "max_tokens" in kwargs or "max_output_tokens" in kwargs:
+            max_toks = kwargs.pop("max_output_tokens", None) or kwargs.pop("max_tokens", None)
+            config_kwargs["max_output_tokens"] = max_toks
+        for param in ["temperature", "top_p", "top_k", "candidate_count",
+                      "presence_penalty", "frequency_penalty", "seed"]:
+            if param in kwargs:
+                config_kwargs[param] = kwargs.pop(param)
+        if "stop_sequences" in kwargs or "stop" in kwargs:
+            stop_seq = kwargs.pop("stop_sequences", None) or kwargs.pop("stop", None)
+            if stop_seq:
+                config_kwargs["stop_sequences"] = [stop_seq] if isinstance(stop_seq, str) else stop_seq
+        config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+        # Convert any provided conversation messages to Content objects for history
+        if messages:
+            for msg in messages:
+                if msg["role"] in ("user", "assistant"):
+                    part = types.Part.from_text(text=msg["content"])
+                    history_msgs.append(types.Content(role=msg["role"], parts=[part]))
+        # Create and return the chat session object
+        chat_session = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
+        return chat_session
