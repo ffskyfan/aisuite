@@ -1,5 +1,8 @@
 import os
 from aisuite.providers import Provider
+from typing import AsyncGenerator, Union
+from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
+from aisuite.provider import Provider, LLMError
 
 # Import Google GenAI SDK
 from google import genai
@@ -16,7 +19,7 @@ class GeminiProvider(Provider):
         self.client = genai.Client(api_key=api_key)
     
     
-    def chat_completions_create(self, model: str, messages: list, **kwargs):
+    async def chat_completions_create(self, model: str, messages: list, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion (single-turn or streaming) using a Gemini model."""
         # Determine if streaming
         stream = kwargs.get("stream", False)
@@ -78,11 +81,30 @@ class GeminiProvider(Provider):
             return None
         # Send the last user message and get response (streaming or full)
         if stream:
-            # Streaming response: return a generator yielding text chunks
-            def _stream():
+            # Streaming response: return a generator yielding ChatCompletionResponse objects
+            async def stream_generator():
+                response_id = None  # We'll use the first chunk's id for all chunks
                 for chunk in chat.send_message_stream(last_user_message):
-                    yield chunk.text  # yield each incremental text part
-            return _stream()
+                    if response_id is None:
+                        response_id = chunk.id
+                    yield ChatCompletionResponse(
+                        choices=[
+                            StreamChoice(
+                                index=0,
+                                delta=ChoiceDelta(
+                                    content=chunk.text,
+                                    role="assistant" if chunk.text else None
+                                ),
+                                finish_reason=None  # Gemini doesn't provide per-chunk finish reason
+                            )
+                        ],
+                        metadata={
+                            'id': response_id,
+                            'created': None,  # Gemini doesn't provide timestamp
+                            'model': model_id
+                        }
+                    )
+            return stream_generator()
         else:
             # Single-turn completion: get the full response
             response = chat.send_message(message=last_user_message)
