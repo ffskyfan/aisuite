@@ -1,11 +1,91 @@
 import os
 from typing import AsyncGenerator, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
+from aisuite.framework.message import Message
 from aisuite.provider import Provider, LLMError
 
 # Import Google GenAI SDK
 from google import genai
 from google.genai import types
+
+class GeminiMessageConverter:
+
+    @staticmethod
+    def to_gemini_request(self, conversation):
+        """
+        Convert AISuite conversation (list of messages) to Gemini API request format.
+        """
+        system_instruction = None
+        messages = conversation
+
+        # If the first message is a system role, use it as systemInstruction for Gemini
+        if messages and messages[0].get("role") == "system":
+            system_instruction = messages[0]["content"]
+            messages = messages[1:]  # remove system message from main history
+
+        # Build Gemini 'contents' list from remaining messages
+        contents = []
+        for msg in messages:
+            role = msg.get("role")
+            content_text = msg.get("content", "")
+            # Map AISuite role to Gemini role (Gemini expects "user" or "model")
+            if role == "assistant":
+                role = "model"
+            elif role == "user":
+                role = "user"
+            else:
+                # Other roles (if any) can be treated as user by default
+                role = "user"
+            # Each content entry has a role and parts (here just one text part)
+            content_entry = {
+                "role": role,
+                "parts": [ {"text": content_text} ]
+            }
+            contents.append(content_entry)
+
+        # Construct the request payload for Gemini API
+        request_payload = {"contents": contents}
+        if system_instruction:
+            # Gemini expects system instructions separately (as Content object)
+            request_payload["systemInstruction"] = {
+                "parts": [ {"text": system_instruction} ]
+            }
+        return request_payload
+
+    @staticmethod
+    def from_gemini_response(response):
+        """
+        将 Gemini API 响应转换为 AISuite 的 ChatCompletionResponse 格式。
+        
+        Args:
+            response: Gemini API 的响应对象
+        Returns:
+            ChatCompletionResponse 对象
+        """
+        # 创建 ChatCompletionResponse 对象
+        return ChatCompletionResponse(
+            choices=[
+                Choice(
+                    index=0,  # Gemini 通常只返回一个选项
+                    message=Message(
+                        role="assistant",
+                        content=response.text,
+                        tool_calls=None,
+                        refusal=None
+                    ),  # 使用 Message 对象包装响应内容
+                    finish_reason=response.candidates[0].finish_reason if response.candidates else None
+                )
+            ],
+            metadata={
+                "model": response.model_version,  # 模型名称
+                # Gemini API 可能不提供这些字段，所以我们设置为 None
+                "id": None,
+                "created": None,
+                "usage": None  # Gemini API 目前不提供 token 使用统计
+            }
+        )
+
+
 
 class GeminiProvider(Provider):
     def __init__(self, **kwargs):
@@ -28,8 +108,8 @@ class GeminiProvider(Provider):
         model_id = model
         # Separate system message (if present) for config
         config_kwargs = {}
-        if messages and messages[0].role == "system":
-            config_kwargs["system_instruction"] = messages[0].content
+        if messages and messages[0]['role'] == "system":
+            config_kwargs["system_instruction"] = messages[0]['content']
             messages = messages[1:]
         # Map max_tokens to max_output_tokens for Google SDK
         if "max_tokens" in kwargs or "max_output_tokens" in kwargs:
@@ -107,7 +187,7 @@ class GeminiProvider(Provider):
         else:
             # Single-turn completion: get the full response
             response = chat.send_message(message=last_user_message)
-            return response  # The response object with .text, .candidates, etc.
+            return GeminiMessageConverter.from_gemini_response(response)  # The response object with .text, .candidates, etc.
     
     def chat_create(self, model: str, messages: list = None, **kwargs):
         """Create a persistent chat session (ChatSession) for multi-turn conversations."""
