@@ -1,5 +1,4 @@
 import os
-from aisuite.providers import Provider
 from typing import AsyncGenerator, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.provider import Provider, LLMError
@@ -29,8 +28,8 @@ class GeminiProvider(Provider):
         model_id = model
         # Separate system message (if present) for config
         config_kwargs = {}
-        if messages and messages[0].get("role") == "system":
-            config_kwargs["system_instruction"] = messages[0]["content"]
+        if messages and messages[0].role == "system":
+            config_kwargs["system_instruction"] = messages[0].content
             messages = messages[1:]
         # Map max_tokens to max_output_tokens for Google SDK
         if "max_tokens" in kwargs or "max_output_tokens" in kwargs:
