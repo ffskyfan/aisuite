@@ -6,6 +6,7 @@ from typing import List, Optional, Union
 class ChoiceDelta:
     content: Optional[str] = None
     role: Optional[str] = None
+    reasoning_content: Optional[str] = None
 
 @dataclass
 class StreamChoice:

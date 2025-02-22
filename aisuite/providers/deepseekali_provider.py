@@ -50,7 +50,8 @@ class DeepseekaliProvider(Provider):
                                     index=choice.index,
                                     delta=ChoiceDelta(
                                         content=choice.delta.content,
-                                        role=choice.delta.role
+                                        role=choice.delta.role,
+                                        reasoning_content=getattr(choice.delta, 'reasoning_content', None)
                                     ),
                                     finish_reason=choice.finish_reason
                                 )
@@ -79,7 +80,8 @@ class DeepseekaliProvider(Provider):
                             content=choice.message.content,
                             role=choice.message.role,
                             tool_calls=None,
-                            refusal=None
+                            refusal=None,
+                            reasoning_content=getattr(choice.message, 'reasoning_content', None)
                         ),
                         finish_reason=getattr(choice, 'finish_reason', None)
                     )
