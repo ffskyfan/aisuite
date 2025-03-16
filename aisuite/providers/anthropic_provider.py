@@ -4,9 +4,11 @@
 
 import anthropic
 import json
+from typing import AsyncGenerator, Union
 from aisuite.provider import Provider
 from aisuite.framework import ChatCompletionResponse
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
+from aisuite.framework.chat_completion_response import Choice, ChoiceDelta, StreamChoice
 
 # Define a constant for the default max_tokens value
 DEFAULT_MAX_TOKENS = 4096
@@ -39,6 +41,45 @@ class AnthropicMessageConverter:
         normalized_response.usage = self._get_usage_stats(response)
         normalized_response.choices[0].message = self._get_message(response)
         return normalized_response
+        
+    def convert_stream_response(self, chunk, model):
+        """Convert a streaming response chunk from Anthropic to the framework's format."""
+        if hasattr(chunk, 'delta') and chunk.delta and chunk.delta.text:
+            return ChatCompletionResponse(
+                choices=[
+                    StreamChoice(
+                        index=0,
+                        delta=ChoiceDelta(
+                            content=chunk.delta.text,
+                            role="assistant" if chunk.delta.type == "text_delta" else None
+                        ),
+                        finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
+                    )
+                ],
+                metadata={
+                    'id': getattr(chunk, 'id', None),
+                    'created': None,  # Anthropic doesn't provide timestamp in chunks
+                    'model': model
+                }
+            )
+        # For the initial chunk that might not have content
+        return ChatCompletionResponse(
+            choices=[
+                StreamChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        content="",
+                        role="assistant"
+                    ),
+                    finish_reason=None
+                )
+            ],
+            metadata={
+                'id': getattr(chunk, 'id', None),
+                'created': None,
+                'model': model
+            }
+        )
 
     def _convert_single_message(self, msg):
         """Convert a single message to Anthropic format."""
@@ -203,15 +244,33 @@ class AnthropicProvider(Provider):
         self.client = anthropic.Anthropic(**config)
         self.converter = AnthropicMessageConverter()
 
-    def chat_completions_create(self, model, messages, **kwargs):
+    async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion using the Anthropic API."""
         kwargs = self._prepare_kwargs(kwargs)
         system_message, converted_messages = self.converter.convert_request(messages)
 
-        response = self.client.messages.create(
-            model=model, system=system_message, messages=converted_messages, **kwargs
-        )
-        return self.converter.convert_response(response)
+        if stream:
+            response = await self.client.messages.create(
+                model=model, 
+                system=system_message, 
+                messages=converted_messages, 
+                stream=True,
+                **kwargs
+            )
+            
+            async def stream_generator():
+                async for chunk in response:
+                    yield self.converter.convert_stream_response(chunk, model)
+            
+            return stream_generator()
+        else:
+            response = await self.client.messages.create(
+                model=model, 
+                system=system_message, 
+                messages=converted_messages, 
+                **kwargs
+            )
+            return self.converter.convert_response(response)
 
     def _prepare_kwargs(self, kwargs):
         """Prepare kwargs for the API call."""
