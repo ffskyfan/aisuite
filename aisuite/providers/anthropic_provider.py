@@ -241,7 +241,7 @@ class AnthropicMessageConverter:
 class AnthropicProvider(Provider):
     def __init__(self, **config):
         """Initialize the Anthropic provider with the given configuration."""
-        self.client = anthropic.Anthropic(**config)
+        self.client = anthropic.AsyncAnthropic(**config)
         self.converter = AnthropicMessageConverter()
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
