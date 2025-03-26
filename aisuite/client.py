@@ -1,4 +1,4 @@
-return self._extract_thinking_content(response)from .provider import ProviderFactory
+from .provider import ProviderFactory
 import os
 from .utils.tools import Tools
 
@@ -193,7 +193,7 @@ class Completions:
         response.choices[0].intermediate_messages = intermediate_messages
         return response
 
- 	def create(self, model: str, messages: list, stream: bool = False, **kwargs):
+    def create(self, model: str, messages: list, stream: bool = False, **kwargs):
         """
         Create chat completion based on the model, messages, and any extra arguments.
         Supports automatic tool execution when max_turns is specified.
