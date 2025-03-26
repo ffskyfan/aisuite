@@ -1,7 +1,7 @@
 """Interface to hold contents of api responses when they do not confirm to the OpenAI style response"""
 
 from pydantic import BaseModel
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 
 
 class Function(BaseModel):

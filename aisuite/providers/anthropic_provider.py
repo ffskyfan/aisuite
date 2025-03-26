@@ -37,9 +37,22 @@ class AnthropicMessageConverter:
     def convert_response(self, response):
         """Normalize the response from the Anthropic API to match OpenAI's response format."""
         normalized_response = ChatCompletionResponse()
-        normalized_response.choices[0].finish_reason = self._get_finish_reason(response)
-        normalized_response.usage = self._get_usage_stats(response)
-        normalized_response.choices[0].message = self._get_message(response)
+        # 创建一个Choice对象并添加到choices列表中，避免索引越界
+        message = self._get_message(response)
+        finish_reason = self._get_finish_reason(response)
+        usage = self._get_usage_stats(response)
+        
+        # 创建Choice对象并添加到列表中
+        from aisuite.framework.choice import Choice
+        normalized_response.choices.append(Choice(
+            index=0,
+            message=message,
+            finish_reason=finish_reason
+        ))
+        
+        # 设置使用量统计
+        normalized_response.metadata['usage'] = usage
+        
         return normalized_response
         
     def convert_stream_response(self, chunk, model):

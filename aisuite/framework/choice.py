@@ -1,5 +1,5 @@
 from aisuite.framework.message import Message
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 
 
 class Choice:
@@ -10,3 +10,4 @@ class Choice:
         self.message = message if message is not None else Message(
             content=None, tool_calls=None, role="assistant", refusal=None
         )
+        self.intermediate_messages: List[Message] = []
