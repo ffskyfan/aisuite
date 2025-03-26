@@ -242,6 +242,6 @@ class Completions:
 
         # Default behavior without tool execution
         # Delegate the chat completion to the correct provider's implementation
-        response = provider.chat_completions_create(model_name, messages, stream=stream, **kwargs)
-        return self._extract_thinking_content(response)
+        return provider.chat_completions_create(model_name, messages, stream=stream, **kwargs)
+        #return self._extract_thinking_content(response)
 
