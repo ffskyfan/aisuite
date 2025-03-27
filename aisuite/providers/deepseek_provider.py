@@ -1,10 +1,11 @@
 import openai
 import os
+import json
 from typing import AsyncGenerator, Union
 
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
-from aisuite.framework.message import Message
+from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
 
 
 class DeepseekProvider(Provider):
@@ -76,7 +77,7 @@ class DeepseekProvider(Provider):
                         message=Message(
                             content=choice.message.content,
                             role=choice.message.role,
-                            tool_calls=None,
+                            tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
                             refusal=None,
                             reasoning_content=getattr(choice.message, 'reasoning_content', None)
                         ),
@@ -90,3 +91,22 @@ class DeepseekProvider(Provider):
                     "model": model
                 }
             )
+
+    def _convert_tool_calls(self, tool_calls):
+        """Convert tool calls to the framework's format."""
+        if not tool_calls:
+            return None
+            
+        converted_tool_calls = []
+        for tool_call in tool_calls:
+            function = Function(
+                name=tool_call.function.name,
+                arguments=tool_call.function.arguments
+            )
+            tool_call_obj = ChatCompletionMessageToolCall(
+                id=tool_call.id,
+                function=function,
+                type="function"
+            )
+            converted_tool_calls.append(tool_call_obj)
+        return converted_tool_calls
