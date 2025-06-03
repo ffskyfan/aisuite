@@ -108,6 +108,12 @@ class GeminiProvider(Provider):
         model_id = model
         # Separate system message (if present) for config
         config_kwargs = {}
+        # Add this for thinking_config for 2.5 series models
+        if "2.5" in model_id:  # Heuristic check for 2.5 series models
+            # Ensure that types.ThinkingConfig and types.GenerateContentConfig are correctly referenced/imported
+            # Assuming 'types' is already imported from google.genai
+            config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
+
         if messages and messages[0]['role'] == "system":
             config_kwargs["system_instruction"] = messages[0]['content']
             messages = messages[1:]
@@ -167,22 +173,38 @@ class GeminiProvider(Provider):
                 response_id = None  # We'll use the first valid chunk's id for all chunks
                 for chunk in chat.send_message_stream(last_user_message):
                     if response_id is None:
-                        # Safely try to get response_id. If it exists and is not None, assign it.
-                        # Otherwise, response_id remains None for this chunk, and we'll try again on the next.
                         potential_id = getattr(chunk, 'response_id', None)
                         if potential_id is not None:
                             response_id = potential_id
                     
-                    # Safely get text content from the chunk
-                    current_chunk_text = getattr(chunk, 'text', "")
+                    current_chunk_text = ""
+                    current_chunk_reasoning = None
+                    reasoning_text_parts = []
+                    content_text_parts = []
+
+                    if chunk.candidates: # Ensure candidates exist
+                        for part in chunk.candidates[0].content.parts:
+                            # Check if the part is a thought and has text
+                            if getattr(part, 'thought', False) and getattr(part, 'text', None):
+                                reasoning_text_parts.append(part.text)
+                            # Else, if it's not a thought but has text, it's regular content
+                            elif getattr(part, 'text', None): 
+                                content_text_parts.append(part.text)
+                    
+                    if reasoning_text_parts:
+                        current_chunk_reasoning = "".join(reasoning_text_parts)
+                    
+                    if content_text_parts:
+                        current_chunk_text = "".join(content_text_parts)
 
                     yield ChatCompletionResponse(
                         choices=[
                             StreamChoice(
                                 index=0,
                                 delta=ChoiceDelta(
-                                    content=current_chunk_text, # Use safely accessed text
-                                    role="assistant" if current_chunk_text else None # Use safely accessed text for role logic
+                                    content=current_chunk_text if current_chunk_text else None,
+                                    role="assistant" if current_chunk_text else None,
+                                    reasoning_content=current_chunk_reasoning
                                 ),
                                 finish_reason=None  # Gemini doesn't provide per-chunk finish reason
                             )
