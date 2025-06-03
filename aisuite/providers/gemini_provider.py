@@ -164,23 +164,31 @@ class GeminiProvider(Provider):
         if stream:
             # Streaming response: return a generator yielding ChatCompletionResponse objects
             async def stream_generator():
-                response_id = None  # We'll use the first chunk's id for all chunks
+                response_id = None  # We'll use the first valid chunk's id for all chunks
                 for chunk in chat.send_message_stream(last_user_message):
                     if response_id is None:
-                        response_id = chunk.id
+                        # Safely try to get response_id. If it exists and is not None, assign it.
+                        # Otherwise, response_id remains None for this chunk, and we'll try again on the next.
+                        potential_id = getattr(chunk, 'response_id', None)
+                        if potential_id is not None:
+                            response_id = potential_id
+                    
+                    # Safely get text content from the chunk
+                    current_chunk_text = getattr(chunk, 'text', "")
+
                     yield ChatCompletionResponse(
                         choices=[
                             StreamChoice(
                                 index=0,
                                 delta=ChoiceDelta(
-                                    content=chunk.text,
-                                    role="assistant" if chunk.text else None
+                                    content=current_chunk_text, # Use safely accessed text
+                                    role="assistant" if current_chunk_text else None # Use safely accessed text for role logic
                                 ),
                                 finish_reason=None  # Gemini doesn't provide per-chunk finish reason
                             )
                         ],
                         metadata={
-                            'id': response_id,
+                            'id': response_id, # Use the captured ID (or None if never found)
                             'created': None,  # Gemini doesn't provide timestamp
                             'model': model_id
                         }
