@@ -56,14 +56,17 @@ class AnthropicMessageConverter:
         
     def convert_stream_response(self, chunk, model):
         """Convert a streaming response chunk from Anthropic to the framework's format."""
-        if hasattr(chunk, 'delta') and chunk.delta and chunk.delta.text:
+        # 安全地检查delta是否包含文本内容
+        if (hasattr(chunk, 'delta') and chunk.delta and 
+            hasattr(chunk.delta, 'type') and chunk.delta.type == "text_delta" and
+            hasattr(chunk.delta, 'text') and chunk.delta.text):
             return ChatCompletionResponse(
                 choices=[
                     StreamChoice(
                         index=0,
                         delta=ChoiceDelta(
                             content=chunk.delta.text,
-                            role="assistant" if chunk.delta.type == "text_delta" else None
+                            role="assistant"
                         ),
                         finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
                     )
@@ -74,16 +77,18 @@ class AnthropicMessageConverter:
                     'model': model
                 }
             )
-        # For the initial chunk that might not have content
+        
+        # 处理其他类型的delta事件（如工具调用、思考等）或没有文本内容的事件
+        # 对于这些情况，返回空内容的响应以保持流的连续性
         return ChatCompletionResponse(
             choices=[
                 StreamChoice(
                     index=0,
                     delta=ChoiceDelta(
                         content="",
-                        role="assistant"
+                        role="assistant" if hasattr(chunk, 'delta') else None
                     ),
-                    finish_reason=None
+                    finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
                 )
             ],
             metadata={
