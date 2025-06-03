@@ -151,8 +151,10 @@ class GeminiProvider(Provider):
                 if role not in ("user", "assistant"):
                     # Skip any non-user/assistant (e.g., system already handled)
                     continue
+                # Map AISuite role to Gemini role (Gemini expects "user" or "model")
+                gemini_role = "model" if role == "assistant" else "user"
                 part = types.Part.from_text(text=msg["content"])
-                history_msgs.append(types.Content(role=role, parts=[part]))
+                history_msgs.append(types.Content(role=gemini_role, parts=[part]))
         # Create a new chat session with history and config (if any)
         chat = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
         if last_user_message is None:
@@ -217,8 +219,10 @@ class GeminiProvider(Provider):
         if messages:
             for msg in messages:
                 if msg["role"] in ("user", "assistant"):
+                    # Map AISuite role to Gemini role (Gemini expects "user" or "model")
+                    gemini_role = "model" if msg["role"] == "assistant" else "user"
                     part = types.Part.from_text(text=msg["content"])
-                    history_msgs.append(types.Content(role=msg["role"], parts=[part]))
+                    history_msgs.append(types.Content(role=gemini_role, parts=[part]))
         # Create and return the chat session object
         chat_session = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
         return chat_session
