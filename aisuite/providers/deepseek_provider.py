@@ -29,10 +29,16 @@ class DeepseekProvider(Provider):
         # Pass the entire config to the OpenAI client constructor
         self.client = openai.AsyncOpenAI(**config)
 
+        # State for accumulating streaming tool calls
+        self._streaming_tool_calls = {}
+
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         # Any exception raised by OpenAI will be returned to the caller.
         # Maybe we should catch them and raise a custom LLMError.
         if stream:
+            # Reset streaming tool calls state
+            self._streaming_tool_calls = {}
+
             response = await self.client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -49,7 +55,7 @@ class DeepseekProvider(Provider):
                                         delta=ChoiceDelta(
                                             content=choice.delta.content,
                                             role=choice.delta.role,
-                                            tool_calls=choice.delta.tool_calls if hasattr(choice.delta, 'tool_calls') else None,
+                                            tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
                                             reasoning_content=getattr(choice.delta, 'reasoning_content', None)
                                         ),
                                         finish_reason=choice.finish_reason
@@ -93,11 +99,99 @@ class DeepseekProvider(Provider):
                 }
             )
 
+    def _accumulate_and_convert_tool_calls(self, delta):
+        """
+        Accumulate tool call chunks and convert to unified format when complete.
+
+        Args:
+            delta: The delta object from streaming response
+
+        Returns:
+            List of converted tool calls if any are complete, None otherwise
+        """
+        if not hasattr(delta, 'tool_calls') or not delta.tool_calls:
+            return None
+
+        # Accumulate tool call chunks
+        for tool_call_delta in delta.tool_calls:
+            index = getattr(tool_call_delta, 'index', 0)
+
+            # Initialize tool call accumulator if not exists
+            if index not in self._streaming_tool_calls:
+                self._streaming_tool_calls[index] = {
+                    "id": "",
+                    "type": "function",
+                    "function": {
+                        "name": "",
+                        "arguments": ""
+                    }
+                }
+
+            tool_call = self._streaming_tool_calls[index]
+
+            # Accumulate id
+            if hasattr(tool_call_delta, 'id') and tool_call_delta.id:
+                tool_call["id"] += tool_call_delta.id
+
+            # Accumulate function data
+            if hasattr(tool_call_delta, 'function') and tool_call_delta.function:
+                if hasattr(tool_call_delta.function, 'name') and tool_call_delta.function.name:
+                    tool_call["function"]["name"] += tool_call_delta.function.name
+
+                if hasattr(tool_call_delta.function, 'arguments') and tool_call_delta.function.arguments:
+                    tool_call["function"]["arguments"] += tool_call_delta.function.arguments
+
+            # Set type if provided
+            if hasattr(tool_call_delta, 'type') and tool_call_delta.type:
+                tool_call["type"] = tool_call_delta.type
+
+        # Check for complete tool calls and convert them
+        complete_tool_calls = []
+        for index, tool_call_data in list(self._streaming_tool_calls.items()):
+            if (tool_call_data["id"] and
+                tool_call_data["function"]["name"] and
+                tool_call_data["function"]["arguments"]):
+
+                try:
+                    # Try to parse arguments as JSON to ensure completeness
+                    json.loads(tool_call_data["function"]["arguments"])
+
+                    # Create mock object for _convert_tool_calls
+                    class MockToolCall:
+                        def __init__(self, id, function_name, function_args):
+                            self.id = id
+                            self.function = MockFunction(function_name, function_args)
+
+                    class MockFunction:
+                        def __init__(self, name, arguments):
+                            self.name = name
+                            self.arguments = arguments
+
+                    mock_tool_call = MockToolCall(
+                        tool_call_data["id"],
+                        tool_call_data["function"]["name"],
+                        tool_call_data["function"]["arguments"]
+                    )
+
+                    # Use existing conversion logic
+                    converted = self._convert_tool_calls([mock_tool_call])
+                    if converted:
+                        complete_tool_calls.extend(converted)
+
+                    # Remove completed tool call from accumulator
+                    del self._streaming_tool_calls[index]
+
+                except json.JSONDecodeError:
+                    # Arguments are not complete yet, continue accumulating
+                    continue
+
+        return complete_tool_calls if complete_tool_calls else None
+
     def _convert_tool_calls(self, tool_calls):
         """Convert tool calls to the framework's format."""
         if not tool_calls:
             return None
-            
+
         converted_tool_calls = []
         for tool_call in tool_calls:
             function = Function(
