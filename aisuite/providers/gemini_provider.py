@@ -204,6 +204,7 @@ class GeminiProvider(Provider):
                                 delta=ChoiceDelta(
                                     content=current_chunk_text if current_chunk_text else None,
                                     role="assistant" if current_chunk_text else None,
+                                    tool_calls=None,  # Gemini tool calls are not supported in streaming yet
                                     reasoning_content=current_chunk_reasoning
                                 ),
                                 finish_reason=None  # Gemini doesn't provide per-chunk finish reason

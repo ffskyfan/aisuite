@@ -66,7 +66,8 @@ class AnthropicMessageConverter:
                         index=0,
                         delta=ChoiceDelta(
                             content=chunk.delta.text,
-                            role="assistant"
+                            role="assistant",
+                            tool_calls=None  # Anthropic tool calls are handled differently in streaming
                         ),
                         finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
                     )
@@ -86,7 +87,8 @@ class AnthropicMessageConverter:
                     index=0,
                     delta=ChoiceDelta(
                         content="",
-                        role="assistant" if hasattr(chunk, 'delta') else None
+                        role="assistant" if hasattr(chunk, 'delta') else None,
+                        tool_calls=None  # Anthropic tool calls are handled differently in streaming
                     ),
                     finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
                 )

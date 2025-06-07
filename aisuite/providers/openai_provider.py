@@ -47,7 +47,8 @@ class OpenaiProvider(Provider):
                                         index=choice.index,
                                         delta=ChoiceDelta(
                                             content=choice.delta.content,
-                                            role=choice.delta.role
+                                            role=choice.delta.role,
+                                            tool_calls=choice.delta.tool_calls if hasattr(choice.delta, 'tool_calls') else None
                                         ),
                                         finish_reason=choice.finish_reason
                                     )

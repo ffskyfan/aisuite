@@ -51,6 +51,7 @@ class DeepseekaliProvider(Provider):
                                     delta=ChoiceDelta(
                                         content=choice.delta.content,
                                         role=choice.delta.role,
+                                        tool_calls=None,  # DeepSeekAli provider doesn't support tool calls yet
                                         reasoning_content=getattr(choice.delta, 'reasoning_content', None)
                                     ),
                                     finish_reason=choice.finish_reason

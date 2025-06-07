@@ -7,6 +7,7 @@ class ChoiceDelta:
     content: Optional[str] = None
     role: Optional[str] = None
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[List] = None  # Raw tool call deltas, not converted
 
 @dataclass
 class StreamChoice:
