@@ -54,48 +54,55 @@ class AnthropicMessageConverter:
         normalized_response.metadata['usage'] = usage
         return normalized_response
         
-    def convert_stream_response(self, chunk, model):
+    def convert_stream_response(self, chunk, model, provider=None):
         """Convert a streaming response chunk from Anthropic to the framework's format."""
-        # 安全地检查delta是否包含文本内容
-        if (hasattr(chunk, 'delta') and chunk.delta and 
+        content = ""
+        tool_calls = None
+        role = None
+
+        # Handle text delta
+        if (hasattr(chunk, 'delta') and chunk.delta and
             hasattr(chunk.delta, 'type') and chunk.delta.type == "text_delta" and
             hasattr(chunk.delta, 'text') and chunk.delta.text):
-            return ChatCompletionResponse(
-                choices=[
-                    StreamChoice(
-                        index=0,
-                        delta=ChoiceDelta(
-                            content=chunk.delta.text,
-                            role="assistant",
-                            tool_calls=None  # Anthropic tool calls are handled differently in streaming
-                        ),
-                        finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
-                    )
-                ],
-                metadata={
-                    'id': getattr(chunk, 'id', None),
-                    'created': None,  # Anthropic doesn't provide timestamp in chunks
-                    'model': model
-                }
-            )
-        
-        # 处理其他类型的delta事件（如工具调用、思考等）或没有文本内容的事件
-        # 对于这些情况，返回空内容的响应以保持流的连续性
+            content = chunk.delta.text
+            role = "assistant"
+
+        # Handle tool use delta (fine-grained streaming)
+        elif (hasattr(chunk, 'delta') and chunk.delta and
+              hasattr(chunk.delta, 'type') and chunk.delta.type == "input_json_delta" and
+              hasattr(chunk.delta, 'partial_json')):
+            # This is part of tool input streaming
+            if provider:
+                tool_calls = provider._accumulate_anthropic_tool_calls(chunk)
+            role = "assistant" if tool_calls else None
+
+        # Handle complete tool use blocks
+        elif (hasattr(chunk, 'content_block') and chunk.content_block and
+              hasattr(chunk.content_block, 'type') and chunk.content_block.type == "tool_use"):
+            # Complete tool use block
+            if provider:
+                tool_calls = provider._process_anthropic_tool_use(chunk.content_block)
+            role = "assistant" if tool_calls else None
+
+        # Handle other delta types
+        elif hasattr(chunk, 'delta') and chunk.delta:
+            role = "assistant"
+
         return ChatCompletionResponse(
             choices=[
                 StreamChoice(
                     index=0,
                     delta=ChoiceDelta(
-                        content="",
-                        role="assistant" if hasattr(chunk, 'delta') else None,
-                        tool_calls=None  # Anthropic tool calls are handled differently in streaming
+                        content=content if content else None,
+                        role=role,
+                        tool_calls=tool_calls
                     ),
                     finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
                 )
             ],
             metadata={
                 'id': getattr(chunk, 'id', None),
-                'created': None,
+                'created': None,  # Anthropic doesn't provide timestamp in chunks
                 'model': model
             }
         )
@@ -263,24 +270,30 @@ class AnthropicProvider(Provider):
         self.client = anthropic.AsyncAnthropic(**config)
         self.converter = AnthropicMessageConverter()
 
+        # State for accumulating streaming tool calls
+        self._streaming_tool_calls = {}
+
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion using the Anthropic API."""
         kwargs = self._prepare_kwargs(kwargs)
         system_message, converted_messages = self.converter.convert_request(messages)
 
         if stream:
+            # Reset streaming tool calls state
+            self._streaming_tool_calls = {}
+
             response = await self.client.messages.create(
-                model=model, 
-                system=system_message, 
-                messages=converted_messages, 
+                model=model,
+                system=system_message,
+                messages=converted_messages,
                 stream=True,
                 **kwargs
             )
-            
+
             async def stream_generator():
                 async for chunk in response:
-                    yield self.converter.convert_stream_response(chunk, model)
-            
+                    yield self.converter.convert_stream_response(chunk, model, self)
+
             return stream_generator()
         else:
             response = await self.client.messages.create(
@@ -300,3 +313,94 @@ class AnthropicProvider(Provider):
             kwargs["tools"] = self.converter.convert_tool_spec(kwargs["tools"])
 
         return kwargs
+
+    def _accumulate_anthropic_tool_calls(self, chunk):
+        """
+        Accumulate tool call chunks from Anthropic fine-grained streaming.
+
+        Args:
+            chunk: The streaming chunk containing tool input delta
+
+        Returns:
+            List of converted tool calls if any are complete, None otherwise
+        """
+        if not hasattr(chunk, 'delta') or not chunk.delta:
+            return None
+
+        # Get the tool use index from the chunk
+        index = getattr(chunk, 'index', 0)
+
+        # Initialize tool call accumulator if not exists
+        if index not in self._streaming_tool_calls:
+            self._streaming_tool_calls[index] = {
+                "id": "",
+                "name": "",
+                "input": ""
+            }
+
+        tool_call = self._streaming_tool_calls[index]
+
+        # Accumulate partial JSON input
+        if hasattr(chunk.delta, 'partial_json'):
+            tool_call["input"] += chunk.delta.partial_json
+
+        # Check for complete tool calls and convert them
+        complete_tool_calls = []
+        for idx, tool_call_data in list(self._streaming_tool_calls.items()):
+            if tool_call_data["id"] and tool_call_data["name"] and tool_call_data["input"]:
+                try:
+                    # Try to parse input as JSON to ensure completeness
+                    json.loads(tool_call_data["input"])
+
+                    function = Function(
+                        name=tool_call_data["name"],
+                        arguments=tool_call_data["input"]
+                    )
+
+                    tool_call_obj = ChatCompletionMessageToolCall(
+                        id=tool_call_data["id"],
+                        function=function,
+                        type="function"
+                    )
+
+                    complete_tool_calls.append(tool_call_obj)
+
+                    # Remove completed tool call from accumulator
+                    del self._streaming_tool_calls[idx]
+
+                except json.JSONDecodeError:
+                    # Input is not complete yet, continue accumulating
+                    continue
+
+        return complete_tool_calls if complete_tool_calls else None
+
+    def _process_anthropic_tool_use(self, content_block):
+        """
+        Process complete Anthropic tool use block.
+
+        Args:
+            content_block: The tool use content block
+
+        Returns:
+            List of converted tool calls
+        """
+        if not content_block or not hasattr(content_block, 'type') or content_block.type != "tool_use":
+            return None
+
+        try:
+            function = Function(
+                name=content_block.name,
+                arguments=json.dumps(content_block.input) if hasattr(content_block, 'input') else "{}"
+            )
+
+            tool_call_obj = ChatCompletionMessageToolCall(
+                id=content_block.id,
+                function=function,
+                type="function"
+            )
+
+            return [tool_call_obj]
+
+        except Exception:
+            # If there's any error processing the tool use, return None
+            return None

@@ -1,7 +1,8 @@
 import os
+import json
 from typing import AsyncGenerator, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
-from aisuite.framework.message import Message
+from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
 from aisuite.provider import Provider, LLMError
 
 # Import Google GenAI SDK
@@ -56,12 +57,38 @@ class GeminiMessageConverter:
     def from_gemini_response(response):
         """
         将 Gemini API 响应转换为 AISuite 的 ChatCompletionResponse 格式。
-        
+
         Args:
             response: Gemini API 的响应对象
         Returns:
             ChatCompletionResponse 对象
         """
+        # Extract tool calls if present
+        tool_calls = None
+        content = response.text
+
+        if response.candidates and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'function_call') and part.function_call:
+                    try:
+                        function = Function(
+                            name=part.function_call.name,
+                            arguments=json.dumps(part.function_call.args) if hasattr(part.function_call, 'args') else "{}"
+                        )
+
+                        tool_call_obj = ChatCompletionMessageToolCall(
+                            id=f"call_{part.function_call.name}_{hash(str(part.function_call.args)) % 10000}",
+                            function=function,
+                            type="function"
+                        )
+
+                        if tool_calls is None:
+                            tool_calls = []
+                        tool_calls.append(tool_call_obj)
+                    except Exception:
+                        # If there's any error processing the function call, skip it
+                        pass
+
         # 创建 ChatCompletionResponse 对象
         return ChatCompletionResponse(
             choices=[
@@ -69,8 +96,8 @@ class GeminiMessageConverter:
                     index=0,  # Gemini 通常只返回一个选项
                     message=Message(
                         role="assistant",
-                        content=response.text,
-                        tool_calls=None,
+                        content=content,
+                        tool_calls=tool_calls,
                         refusal=None
                     ),  # 使用 Message 对象包装响应内容
                     finish_reason=response.candidates[0].finish_reason if response.candidates else None
@@ -90,12 +117,14 @@ class GeminiMessageConverter:
 class GeminiProvider(Provider):
     def __init__(self, **kwargs):
         """Initialize the Gemini provider with API key and client."""
-        super().__init__(**kwargs)
         api_key = os.environ.get("GEMINI_API_KEY") or kwargs.get("api_key")
         if api_key is None:
             raise RuntimeError("GEMINI_API_KEY is required for GeminiProvider")
         # Initialize the GenAI client for Gemini (non-Vertex usage)
         self.client = genai.Client(api_key=api_key)
+
+        # State for accumulating streaming tool calls
+        self._streaming_tool_calls = {}
     
     
     async def chat_completions_create(self, model: str, messages: list, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
@@ -168,6 +197,9 @@ class GeminiProvider(Provider):
             return None
         # Send the last user message and get response (streaming or full)
         if stream:
+            # Reset streaming tool calls state
+            self._streaming_tool_calls = {}
+
             # Streaming response: return a generator yielding ChatCompletionResponse objects
             async def stream_generator():
                 response_id = None  # We'll use the first valid chunk's id for all chunks
@@ -176,24 +208,28 @@ class GeminiProvider(Provider):
                         potential_id = getattr(chunk, 'response_id', None)
                         if potential_id is not None:
                             response_id = potential_id
-                    
+
                     current_chunk_text = ""
                     current_chunk_reasoning = None
                     reasoning_text_parts = []
                     content_text_parts = []
+                    tool_calls = None
 
                     if chunk.candidates: # Ensure candidates exist
                         for part in chunk.candidates[0].content.parts:
                             # Check if the part is a thought and has text
                             if getattr(part, 'thought', False) and getattr(part, 'text', None):
                                 reasoning_text_parts.append(part.text)
+                            # Check if the part is a function call
+                            elif hasattr(part, 'function_call') and part.function_call:
+                                tool_calls = self._process_gemini_function_call(part.function_call)
                             # Else, if it's not a thought but has text, it's regular content
-                            elif getattr(part, 'text', None): 
+                            elif getattr(part, 'text', None):
                                 content_text_parts.append(part.text)
-                    
+
                     if reasoning_text_parts:
                         current_chunk_reasoning = "".join(reasoning_text_parts)
-                    
+
                     if content_text_parts:
                         current_chunk_text = "".join(content_text_parts)
 
@@ -203,8 +239,8 @@ class GeminiProvider(Provider):
                                 index=0,
                                 delta=ChoiceDelta(
                                     content=current_chunk_text if current_chunk_text else None,
-                                    role="assistant" if current_chunk_text else None,
-                                    tool_calls=None,  # Gemini tool calls are not supported in streaming yet
+                                    role="assistant" if current_chunk_text or tool_calls else None,
+                                    tool_calls=tool_calls,
                                     reasoning_content=current_chunk_reasoning
                                 ),
                                 finish_reason=None  # Gemini doesn't provide per-chunk finish reason
@@ -257,3 +293,35 @@ class GeminiProvider(Provider):
         # Create and return the chat session object
         chat_session = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
         return chat_session
+
+    def _process_gemini_function_call(self, function_call):
+        """
+        Process Gemini function call and convert to framework format.
+
+        Args:
+            function_call: Gemini function call object
+
+        Returns:
+            List of converted tool calls if complete, None otherwise
+        """
+        if not function_call:
+            return None
+
+        try:
+            # Gemini function calls are typically complete in a single chunk
+            function = Function(
+                name=function_call.name,
+                arguments=json.dumps(function_call.args) if hasattr(function_call, 'args') else "{}"
+            )
+
+            tool_call_obj = ChatCompletionMessageToolCall(
+                id=f"call_{function_call.name}_{hash(str(function_call.args)) % 10000}",  # Generate a unique ID
+                function=function,
+                type="function"
+            )
+
+            return [tool_call_obj]
+
+        except Exception:
+            # If there's any error processing the function call, return None
+            return None
