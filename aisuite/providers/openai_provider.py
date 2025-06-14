@@ -54,7 +54,8 @@ class OpenaiProvider(Provider):
                                         delta=ChoiceDelta(
                                             content=choice.delta.content,
                                             role=choice.delta.role,
-                                            tool_calls=self._accumulate_and_convert_tool_calls(choice.delta)
+                                            tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
+                                            reasoning_content=getattr(choice.delta, 'reasoning_content', None)
                                         ),
                                         finish_reason=choice.finish_reason
                                     )
@@ -83,7 +84,8 @@ class OpenaiProvider(Provider):
                             content=choice.message.content,
                             role=choice.message.role,
                             tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
-                            refusal=None
+                            refusal=None,
+                            reasoning_content=getattr(choice.message, 'reasoning_content', None)
                         ),
                         finish_reason=choice.finish_reason
                     )

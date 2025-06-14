@@ -63,13 +63,21 @@ class GeminiMessageConverter:
         Returns:
             ChatCompletionResponse 对象
         """
-        # Extract tool calls if present
+        # Extract tool calls and reasoning content if present
         tool_calls = None
         content = response.text
+        reasoning_content = None
 
         if response.candidates and response.candidates[0].content.parts:
+            reasoning_text_parts = []
+            content_text_parts = []
+            
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'function_call') and part.function_call:
+                # Check if the part is a thought and has text
+                if getattr(part, 'thought', False) and getattr(part, 'text', None):
+                    reasoning_text_parts.append(part.text)
+                # Check if the part is a function call
+                elif hasattr(part, 'function_call') and part.function_call:
                     try:
                         function = Function(
                             name=part.function_call.name,
@@ -88,6 +96,17 @@ class GeminiMessageConverter:
                     except Exception:
                         # If there's any error processing the function call, skip it
                         pass
+                # Else, if it's not a thought but has text, it's regular content
+                elif getattr(part, 'text', None):
+                    content_text_parts.append(part.text)
+
+            # Combine reasoning parts if any
+            if reasoning_text_parts:
+                reasoning_content = "".join(reasoning_text_parts)
+            
+            # Use combined content text or fallback to response.text
+            if content_text_parts:
+                content = "".join(content_text_parts)
 
         # 创建 ChatCompletionResponse 对象
         return ChatCompletionResponse(
@@ -98,7 +117,8 @@ class GeminiMessageConverter:
                         role="assistant",
                         content=content,
                         tool_calls=tool_calls,
-                        refusal=None
+                        refusal=None,
+                        reasoning_content=reasoning_content
                     ),  # 使用 Message 对象包装响应内容
                     finish_reason=response.candidates[0].finish_reason if response.candidates else None
                 )

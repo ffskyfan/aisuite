@@ -59,12 +59,20 @@ class AnthropicMessageConverter:
         content = ""
         tool_calls = None
         role = None
+        reasoning_content = None
 
         # Handle text delta
         if (hasattr(chunk, 'delta') and chunk.delta and
             hasattr(chunk.delta, 'type') and chunk.delta.type == "text_delta" and
             hasattr(chunk.delta, 'text') and chunk.delta.text):
             content = chunk.delta.text
+            role = "assistant"
+
+        # Handle thinking delta (reasoning content)
+        elif (hasattr(chunk, 'delta') and chunk.delta and
+              hasattr(chunk.delta, 'type') and chunk.delta.type == "thinking_delta" and
+              hasattr(chunk.delta, 'thinking') and chunk.delta.thinking):
+            reasoning_content = chunk.delta.thinking
             role = "assistant"
 
         # Handle tool use delta (fine-grained streaming)
@@ -95,7 +103,8 @@ class AnthropicMessageConverter:
                     delta=ChoiceDelta(
                         content=content if content else None,
                         role=role,
-                        tool_calls=tool_calls
+                        tool_calls=tool_calls,
+                        reasoning_content=reasoning_content
                     ),
                     finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
                 )
@@ -203,11 +212,23 @@ class AnthropicMessageConverter:
             if tool_message:
                 return tool_message
 
+        # Extract thinking content if present
+        reasoning_content = None
+        text_content = None
+        
+        for content_block in response.content:
+            if hasattr(content_block, 'type'):
+                if content_block.type == "thinking" and hasattr(content_block, 'thinking'):
+                    reasoning_content = content_block.thinking
+                elif content_block.type == "text" and hasattr(content_block, 'text'):
+                    text_content = content_block.text
+
         return Message(
-            content=response.content[0].text,
+            content=text_content or (response.content[0].text if response.content else None),
             role="assistant",
             tool_calls=None,
             refusal=None,
+            reasoning_content=reasoning_content
         )
 
     def convert_response_with_tool_use(self, response):
@@ -232,12 +253,23 @@ class AnthropicMessageConverter:
                 ),
                 "",
             )
+            
+            # Extract thinking content if present
+            reasoning_content = next(
+                (
+                    content.thinking
+                    for content in response.content
+                    if content.type == "thinking" and hasattr(content, 'thinking')
+                ),
+                None,
+            )
 
             return Message(
                 content=text_content or None,
                 tool_calls=[tool_call_obj] if tool_call else None,
                 role="assistant",
                 refusal=None,
+                reasoning_content=reasoning_content
             )
         return None
 
