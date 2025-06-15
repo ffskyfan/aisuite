@@ -43,7 +43,6 @@ class AnthropicMessageConverter:
         usage = self._get_usage_stats(response)
         
         # 创建Choice对象并添加到列表中
-        from aisuite.framework.choice import Choice
         normalized_response.choices.append(Choice(
             index=0,
             message=message,

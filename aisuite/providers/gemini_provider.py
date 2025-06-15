@@ -3,7 +3,7 @@ import json
 from typing import AsyncGenerator, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
-from aisuite.provider import Provider, LLMError
+from aisuite.provider import Provider 
 
 # Import Google GenAI SDK
 from google import genai
