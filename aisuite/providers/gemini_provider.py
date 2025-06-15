@@ -148,7 +148,7 @@ class GeminiProvider(Provider):
 
 
 
-    def _convert_tools_definition(self, openai_tools):
+    def _convert_tool_spec(self, openai_tools):
         """
         Convert OpenAI tools format to Gemini function_declarations format.
 
@@ -273,7 +273,7 @@ class GeminiProvider(Provider):
         # Handle tools parameter - convert OpenAI format to Gemini format
         if "tools" in kwargs:
             openai_tools = kwargs.pop("tools")
-            gemini_tools = self._convert_tools_definition(openai_tools)
+            gemini_tools = self._convert_tool_spec(openai_tools)
             if gemini_tools:
                 config_kwargs["tools"] = gemini_tools
 
