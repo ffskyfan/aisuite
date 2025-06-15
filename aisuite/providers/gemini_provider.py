@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 from typing import AsyncGenerator, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
@@ -8,6 +9,9 @@ from aisuite.provider import Provider, LLMError
 # Import Google GenAI SDK
 from google import genai
 from google.genai import types
+
+# Module-level logger for static methods
+logger = logging.getLogger(__name__)
 
 class GeminiMessageConverter:
 
@@ -63,21 +67,32 @@ class GeminiMessageConverter:
         Returns:
             ChatCompletionResponse 对象
         """
+        logger.debug("from_gemini_response called with response type: %s", type(response).__name__)
+        logger.debug("Response has candidates: %s", hasattr(response, 'candidates') and response.candidates)
+
         # Extract tool calls and reasoning content if present
         tool_calls = None
         content = response.text
         reasoning_content = None
 
         if response.candidates and response.candidates[0].content.parts:
+            logger.debug("Processing %d parts in non-streaming response", len(response.candidates[0].content.parts))
             reasoning_text_parts = []
             content_text_parts = []
-            
-            for part in response.candidates[0].content.parts:
+
+            for i, part in enumerate(response.candidates[0].content.parts):
+                logger.debug("Non-streaming Part %d: type=%s, has_thought=%s, has_function_call=%s, has_text=%s",
+                           i, type(part).__name__, getattr(part, 'thought', False),
+                           hasattr(part, 'function_call'), getattr(part, 'text', None) is not None)
+
                 # Check if the part is a thought and has text
                 if getattr(part, 'thought', False) and getattr(part, 'text', None):
+                    logger.debug("Non-streaming found reasoning content: %s...", part.text[:100])
                     reasoning_text_parts.append(part.text)
                 # Check if the part is a function call
                 elif hasattr(part, 'function_call') and part.function_call:
+                    logger.info("Non-streaming found function call: %s", part.function_call.name)
+                    logger.debug("Non-streaming function call args: %s", getattr(part.function_call, 'args', 'No args'))
                     try:
                         function = Function(
                             name=part.function_call.name,
@@ -93,12 +108,17 @@ class GeminiMessageConverter:
                         if tool_calls is None:
                             tool_calls = []
                         tool_calls.append(tool_call_obj)
-                    except Exception:
+                        logger.debug("Non-streaming successfully created tool call: %s", tool_call_obj)
+                    except Exception as e:
                         # If there's any error processing the function call, skip it
+                        logger.error("Non-streaming error processing function call: %s", e)
                         pass
                 # Else, if it's not a thought but has text, it's regular content
                 elif getattr(part, 'text', None):
+                    logger.debug("Non-streaming found text content: %s...", part.text[:50])
                     content_text_parts.append(part.text)
+                else:
+                    logger.debug("Non-streaming unknown part type or empty part")
 
             # Combine reasoning parts if any
             if reasoning_text_parts:
@@ -145,6 +165,107 @@ class GeminiProvider(Provider):
 
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
+
+        # Initialize logger
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self.logger.setLevel(logging.INFO)
+
+    def _convert_tools_definition(self, openai_tools):
+        """
+        Convert OpenAI tools format to Gemini function_declarations format.
+
+        OpenAI format:
+        {
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "description": "Get weather information",
+                "parameters": {...}
+              }
+            }
+          ]
+        }
+
+        Gemini format:
+        {
+          "tools": [
+            {
+              "function_declarations": [
+                {
+                  "name": "get_weather",
+                  "description": "Get weather information",
+                  "parameters": {...}
+                }
+              ]
+            }
+          ]
+        }
+
+        Args:
+            openai_tools: List of tools in OpenAI format
+
+        Returns:
+            List of tools in Gemini format, or None if no valid tools
+        """
+        self.logger.debug("_convert_tools_definition called with: %s", openai_tools)
+
+        if not openai_tools:
+            self.logger.debug("No tools provided, returning None")
+            return None
+
+        function_declarations = []
+
+        for i, tool in enumerate(openai_tools):
+            self.logger.debug("Processing tool %d: %s", i, tool)
+
+            # Check if this is a valid OpenAI function tool
+            if not isinstance(tool, dict):
+                self.logger.debug("Tool %d is not a dict, skipping", i)
+                continue
+
+            if tool.get("type") != "function":
+                self.logger.debug("Tool %d type is not 'function', skipping", i)
+                continue
+
+            if "function" not in tool:
+                self.logger.debug("Tool %d has no 'function' field, skipping", i)
+                continue
+
+            func_def = tool["function"]
+            self.logger.debug("Function definition: %s", func_def)
+
+            # Extract required fields for Gemini
+            if "name" not in func_def:
+                self.logger.debug("Function %d has no name, skipping", i)
+                continue
+
+            # Build Gemini function declaration
+            gemini_func = {
+                "name": func_def["name"],
+                "description": func_def.get("description", ""),
+            }
+
+            # Add parameters if present
+            if "parameters" in func_def:
+                gemini_func["parameters"] = func_def["parameters"]
+
+            function_declarations.append(gemini_func)
+            self.logger.debug("Converted function: %s", gemini_func)
+
+        if not function_declarations:
+            self.logger.debug("No valid function declarations found")
+            return None
+
+        # Create Gemini tools format
+        gemini_tools = [{
+            "function_declarations": function_declarations
+        }]
+
+        self.logger.info("Successfully converted %d OpenAI tools to Gemini format", len(function_declarations))
+        self.logger.debug("Final Gemini tools format: %s", gemini_tools)
+        return gemini_tools
     
     
     async def chat_completions_create(self, model: str, messages: list, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
@@ -185,6 +306,16 @@ class GeminiProvider(Provider):
                 config_kwargs["stop_sequences"] = [stop_seq]
             elif isinstance(stop_seq, list):
                 config_kwargs["stop_sequences"] = stop_seq
+        # Handle tools parameter - convert OpenAI format to Gemini format
+        if "tools" in kwargs:
+            openai_tools = kwargs.pop("tools")
+            self.logger.debug("Original OpenAI tools: %s", openai_tools)
+            gemini_tools = self._convert_tools_definition(openai_tools)
+            if gemini_tools:
+                config_kwargs["tools"] = gemini_tools
+                self.logger.info("Added converted tools to config")
+                self.logger.debug("Converted tools config: %s", gemini_tools)
+
         # (Ignore any remaining kwargs that are not applicable for now)
         # Create config object if any config parameters were specified
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
@@ -192,38 +323,74 @@ class GeminiProvider(Provider):
         history_msgs = []
         last_user_message = None
         if messages:
-            # Assume the last message is the user prompt we want to answer
+            self.logger.debug("Processing %d messages, last message role: %s", len(messages), messages[-1]["role"])
+
+            # Handle different conversation scenarios
             if messages[-1]["role"] == "user":
+                # Standard case: last message is from user
                 last_user_message = messages[-1]["content"]
                 convo_history = messages[:-1]
-            else:
-                # If last message is not user (edge case), treat all as history
+                self.logger.debug("Found user message as last message: %s", last_user_message[:100] if last_user_message else "None")
+            elif messages[-1]["role"] in ["tool", "assistant"]:
+                # Agent scenario: last message is tool result or assistant message
+                # We need to continue the conversation based on the tool results
+                # Include all messages as history and send a continuation prompt
                 convo_history = messages
-                last_user_message = None
+                # Use "continue" as it's a well-documented Gemini pattern for conversation continuation
+                last_user_message = "continue"
+                self.logger.debug("Last message is %s, using 'continue' prompt", messages[-1]["role"])
+            else:
+                # Other cases: treat all as history with empty continuation
+                convo_history = messages
+                last_user_message = ""  # Empty message to continue conversation
+                self.logger.debug("Last message is not user (role: %s), treating as continuation", messages[-1]["role"])
             # Convert history messages to Content objects
             for msg in convo_history:
                 role = msg["role"]
-                if role not in ("user", "assistant"):
-                    # Skip any non-user/assistant (e.g., system already handled)
+
+                # Handle different message types
+                if role == "system":
+                    # System messages are already handled separately
                     continue
-                # Map AISuite role to Gemini role (Gemini expects "user" or "model")
-                gemini_role = "model" if role == "assistant" else "user"
-                part = types.Part.from_text(text=msg["content"])
-                history_msgs.append(types.Content(role=gemini_role, parts=[part]))
+                elif role == "tool":
+                    # Tool messages should be treated as user messages in Gemini
+                    # Format tool result for Gemini understanding
+                    tool_content = f"Tool result: {msg['content']}"
+                    if "tool_call_id" in msg:
+                        tool_content = f"Tool result (ID: {msg['tool_call_id']}): {msg['content']}"
+                    part = types.Part.from_text(text=tool_content)
+                    history_msgs.append(types.Content(role="user", parts=[part]))
+                    self.logger.debug("Added tool message as user message: %s", tool_content[:100])
+                elif role in ("user", "assistant"):
+                    # Map AISuite role to Gemini role (Gemini expects "user" or "model")
+                    gemini_role = "model" if role == "assistant" else "user"
+                    part = types.Part.from_text(text=msg["content"])
+                    history_msgs.append(types.Content(role=gemini_role, parts=[part]))
+                else:
+                    # Skip unknown message types
+                    self.logger.debug("Skipping unknown message type: %s", role)
+                    continue
         # Create a new chat session with history and config (if any)
         chat = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
         if last_user_message is None:
             # No user prompt to send (no completion to generate)
+            self.logger.warning("No user message found, cannot generate completion")
             return None
+
+        self.logger.debug("Sending message to Gemini: %s", last_user_message[:100] if last_user_message else "Empty message")
         # Send the last user message and get response (streaming or full)
         if stream:
             # Reset streaming tool calls state
             self._streaming_tool_calls = {}
+            self.logger.debug("Starting streaming mode, tool calls state reset")
 
             # Streaming response: return a generator yielding ChatCompletionResponse objects
             async def stream_generator():
                 response_id = None  # We'll use the first valid chunk's id for all chunks
+                chunk_count = 0
                 for chunk in chat.send_message_stream(last_user_message):
+                    chunk_count += 1
+                    self.logger.debug("Processing chunk #%d", chunk_count)
                     if response_id is None:
                         potential_id = getattr(chunk, 'response_id', None)
                         if potential_id is not None:
@@ -236,22 +403,45 @@ class GeminiProvider(Provider):
                     tool_calls = None
 
                     if chunk.candidates: # Ensure candidates exist
-                        for part in chunk.candidates[0].content.parts:
+                        self.logger.debug("Processing chunk with %d parts", len(chunk.candidates[0].content.parts))
+                        for i, part in enumerate(chunk.candidates[0].content.parts):
+                            self.logger.debug("Part %d: type=%s, has_thought=%s, has_function_call=%s, has_text=%s",
+                                            i, type(part).__name__, getattr(part, 'thought', False),
+                                            hasattr(part, 'function_call'), getattr(part, 'text', None) is not None)
+
                             # Check if the part is a thought and has text
                             if getattr(part, 'thought', False) and getattr(part, 'text', None):
+                                self.logger.debug("Found reasoning content: %s...", part.text[:100])
                                 reasoning_text_parts.append(part.text)
                             # Check if the part is a function call
                             elif hasattr(part, 'function_call') and part.function_call:
-                                tool_calls = self._process_gemini_function_call(part.function_call)
+                                self.logger.info("Found function call: %s", part.function_call.name)
+                                self.logger.debug("Function call args: %s", getattr(part.function_call, 'args', 'No args'))
+                                # Create a mock delta object for consistency with other providers
+                                mock_delta = type('MockDelta', (), {
+                                    'function_call': part.function_call
+                                })()
+                                tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
+                                self.logger.debug("Converted tool calls: %s", tool_calls)
                             # Else, if it's not a thought but has text, it's regular content
                             elif getattr(part, 'text', None):
+                                self.logger.debug("Found text content: %s...", part.text[:50])
                                 content_text_parts.append(part.text)
+                            else:
+                                self.logger.debug("Unknown part type or empty part")
+                    else:
+                        self.logger.debug("No candidates in chunk")
 
                     if reasoning_text_parts:
                         current_chunk_reasoning = "".join(reasoning_text_parts)
 
                     if content_text_parts:
                         current_chunk_text = "".join(content_text_parts)
+
+                    self.logger.debug("Yielding chunk - content: %s, tool_calls: %s, reasoning: %s",
+                                    bool(current_chunk_text), bool(tool_calls), bool(current_chunk_reasoning))
+                    if tool_calls:
+                        self.logger.info("Tool calls in yield: %s", [tc.function.name for tc in tool_calls])
 
                     yield ChatCompletionResponse(
                         choices=[
@@ -278,45 +468,44 @@ class GeminiProvider(Provider):
             response = chat.send_message(message=last_user_message)
             return GeminiMessageConverter.from_gemini_response(response)  # The response object with .text, .candidates, etc.
     
-    def chat_create(self, model: str, messages: list = None, **kwargs):
-        """Create a persistent chat session (ChatSession) for multi-turn conversations."""
-        model_id = model
-        # Separate system message for config if provided in messages
-        config_kwargs = {}
-        history_msgs = []
-        if messages:
-            if messages and messages[0].get("role") == "system":
-                config_kwargs["system_instruction"] = messages[0]["content"]
-                messages = messages[1:]
-            # We can also extract generation params from kwargs for config (reuse logic)
-        # Merge any generation params into config (reusing logic from chat_completions_create)
-        if "max_tokens" in kwargs or "max_output_tokens" in kwargs:
-            max_toks = kwargs.pop("max_output_tokens", None) or kwargs.pop("max_tokens", None)
-            config_kwargs["max_output_tokens"] = max_toks
-        for param in ["temperature", "top_p", "top_k", "candidate_count",
-                      "presence_penalty", "frequency_penalty", "seed"]:
-            if param in kwargs:
-                config_kwargs[param] = kwargs.pop(param)
-        if "stop_sequences" in kwargs or "stop" in kwargs:
-            stop_seq = kwargs.pop("stop_sequences", None) or kwargs.pop("stop", None)
-            if stop_seq:
-                config_kwargs["stop_sequences"] = [stop_seq] if isinstance(stop_seq, str) else stop_seq
-        config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
-        # Convert any provided conversation messages to Content objects for history
-        if messages:
-            for msg in messages:
-                if msg["role"] in ("user", "assistant"):
-                    # Map AISuite role to Gemini role (Gemini expects "user" or "model")
-                    gemini_role = "model" if msg["role"] == "assistant" else "user"
-                    part = types.Part.from_text(text=msg["content"])
-                    history_msgs.append(types.Content(role=gemini_role, parts=[part]))
-        # Create and return the chat session object
-        chat_session = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
-        return chat_session
 
-    def _process_gemini_function_call(self, function_call):
+
+    def _accumulate_and_convert_tool_calls(self, delta):
         """
-        Process Gemini function call and convert to framework format.
+        Accumulate tool call chunks and convert to unified format when complete.
+
+        For Gemini, function calls are typically complete in a single chunk,
+        but we maintain the same interface as other providers for consistency.
+
+        Args:
+            delta: The delta object from streaming response (mock object for Gemini)
+
+        Returns:
+            List of converted tool calls if any are complete, None otherwise
+        """
+        self.logger.debug("_accumulate_and_convert_tool_calls called with delta type: %s", type(delta).__name__)
+        self.logger.debug("Delta has function_call: %s", hasattr(delta, 'function_call'))
+        self.logger.debug("Delta has tool_calls: %s", hasattr(delta, 'tool_calls'))
+
+        # Check if delta has function_call (Gemini format)
+        if hasattr(delta, 'function_call') and delta.function_call:
+            self.logger.debug("Processing Gemini function_call format")
+            result = self._process_gemini_function_call_direct(delta.function_call)
+            self.logger.debug("Function call processing result: %s", result)
+            return result
+
+        # Check if delta has tool_calls (standard format, for future compatibility)
+        if not hasattr(delta, 'tool_calls') or not delta.tool_calls:
+            self.logger.debug("No tool_calls found, returning None")
+            return None
+
+        # Standard tool_calls processing (for future Gemini API changes)
+        self.logger.debug("Processing standard tool_calls format")
+        return self._process_standard_tool_calls(delta.tool_calls)
+
+    def _process_gemini_function_call_direct(self, function_call):
+        """
+        Process Gemini function call directly (current Gemini format).
 
         Args:
             function_call: Gemini function call object
@@ -324,24 +513,124 @@ class GeminiProvider(Provider):
         Returns:
             List of converted tool calls if complete, None otherwise
         """
+        self.logger.debug("_process_gemini_function_call_direct called with: %s", function_call)
+        self.logger.debug("Function call type: %s", type(function_call).__name__)
+
         if not function_call:
+            self.logger.debug("Function call is None or empty")
             return None
 
         try:
+            self.logger.debug("Function call name: %s", getattr(function_call, 'name', 'NO_NAME'))
+            self.logger.debug("Function call has args: %s", hasattr(function_call, 'args'))
+            if hasattr(function_call, 'args'):
+                self.logger.debug("Function call args: %s", function_call.args)
+
             # Gemini function calls are typically complete in a single chunk
             function = Function(
                 name=function_call.name,
                 arguments=json.dumps(function_call.args) if hasattr(function_call, 'args') else "{}"
             )
+            self.logger.debug("Created Function object: name=%s, arguments=%s", function.name, function.arguments)
 
             tool_call_obj = ChatCompletionMessageToolCall(
                 id=f"call_{function_call.name}_{hash(str(function_call.args)) % 10000}",  # Generate a unique ID
                 function=function,
                 type="function"
             )
+            self.logger.debug("Created tool call object: id=%s, type=%s", tool_call_obj.id, tool_call_obj.type)
 
-            return [tool_call_obj]
+            result = [tool_call_obj]
+            self.logger.info("Successfully processed Gemini function call: %s", function_call.name)
+            self.logger.debug("Returning tool calls: %s", result)
+            return result
 
-        except Exception:
-            # If there's any error processing the function call, return None
+        except Exception as e:
+            # Log the error for debugging
+            self.logger.error("Error processing Gemini function call: %s", e)
+            import traceback
+            self.logger.debug("Traceback: %s", traceback.format_exc())
             return None
+
+    def _process_standard_tool_calls(self, tool_calls):
+        """
+        Process standard tool_calls format (for future compatibility).
+
+        This method handles the standard streaming tool_calls format,
+        similar to OpenAI and other providers.
+
+        Args:
+            tool_calls: List of tool call delta objects
+
+        Returns:
+            List of converted tool calls if any are complete, None otherwise
+        """
+        if not tool_calls:
+            return None
+
+        # Accumulate tool call chunks (similar to other providers)
+        for tool_call_delta in tool_calls:
+            index = getattr(tool_call_delta, 'index', 0)
+
+            # Initialize tool call accumulator if not exists
+            if index not in self._streaming_tool_calls:
+                self._streaming_tool_calls[index] = {
+                    "id": "",
+                    "type": "function",
+                    "function": {
+                        "name": "",
+                        "arguments": ""
+                    }
+                }
+
+            tool_call = self._streaming_tool_calls[index]
+
+            # Accumulate id
+            if hasattr(tool_call_delta, 'id') and tool_call_delta.id:
+                tool_call["id"] += tool_call_delta.id
+
+            # Accumulate function data
+            if hasattr(tool_call_delta, 'function') and tool_call_delta.function:
+                if hasattr(tool_call_delta.function, 'name') and tool_call_delta.function.name:
+                    tool_call["function"]["name"] += tool_call_delta.function.name
+
+                if hasattr(tool_call_delta.function, 'arguments') and tool_call_delta.function.arguments:
+                    tool_call["function"]["arguments"] += tool_call_delta.function.arguments
+
+            # Set type if provided
+            if hasattr(tool_call_delta, 'type') and tool_call_delta.type:
+                tool_call["type"] = tool_call_delta.type
+
+        # Check for complete tool calls and convert them
+        complete_tool_calls = []
+        for index, tool_call_data in list(self._streaming_tool_calls.items()):
+            if (tool_call_data["id"] and
+                tool_call_data["function"]["name"] and
+                tool_call_data["function"]["arguments"]):
+
+                try:
+                    # Try to parse arguments as JSON to ensure completeness
+                    json.loads(tool_call_data["function"]["arguments"])
+
+                    # Convert to framework format
+                    function = Function(
+                        name=tool_call_data["function"]["name"],
+                        arguments=tool_call_data["function"]["arguments"]
+                    )
+
+                    tool_call_obj = ChatCompletionMessageToolCall(
+                        id=tool_call_data["id"],
+                        function=function,
+                        type="function"
+                    )
+
+                    complete_tool_calls.append(tool_call_obj)
+
+                    # Remove completed tool call from accumulator
+                    del self._streaming_tool_calls[index]
+
+                except json.JSONDecodeError:
+                    # Arguments are not complete yet, continue accumulating
+                    continue
+
+        return complete_tool_calls if complete_tool_calls else None
