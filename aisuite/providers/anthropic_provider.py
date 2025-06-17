@@ -60,10 +60,18 @@ class AnthropicMessageConverter:
         role = None
         reasoning_content = None
 
+        # Handle content_block_start for tool_use (captures id and name)
+        if (hasattr(chunk, 'content_block') and chunk.content_block and
+            hasattr(chunk.content_block, 'type') and chunk.content_block.type == "tool_use"):
+            # Initialize tool call with id and name from content_block_start
+            if provider:
+                provider._initialize_tool_call_from_content_block(chunk.content_block, getattr(chunk, 'index', 0))
+            role = "assistant"
+
         # Handle text delta
-        if (hasattr(chunk, 'delta') and chunk.delta and
-            hasattr(chunk.delta, 'type') and chunk.delta.type == "text_delta" and
-            hasattr(chunk.delta, 'text') and chunk.delta.text):
+        elif (hasattr(chunk, 'delta') and chunk.delta and
+              hasattr(chunk.delta, 'type') and chunk.delta.type == "text_delta" and
+              hasattr(chunk.delta, 'text') and chunk.delta.text):
             content = chunk.delta.text
             role = "assistant"
 
@@ -81,14 +89,6 @@ class AnthropicMessageConverter:
             # This is part of tool input streaming
             if provider:
                 tool_calls = provider._accumulate_anthropic_tool_calls(chunk)
-            role = "assistant" if tool_calls else None
-
-        # Handle complete tool use blocks
-        elif (hasattr(chunk, 'content_block') and chunk.content_block and
-              hasattr(chunk.content_block, 'type') and chunk.content_block.type == "tool_use"):
-            # Complete tool use block
-            if provider:
-                tool_calls = provider._process_anthropic_tool_use(chunk.content_block)
             role = "assistant" if tool_calls else None
 
         # Handle other delta types
@@ -345,6 +345,24 @@ class AnthropicProvider(Provider):
 
         return kwargs
 
+    def _initialize_tool_call_from_content_block(self, content_block, index):
+        """
+        Initialize tool call from content_block_start event.
+
+        Args:
+            content_block: The tool_use content block containing id and name
+            index: The index of the content block
+        """
+        if not content_block or not hasattr(content_block, 'type') or content_block.type != "tool_use":
+            return
+
+        # Initialize tool call accumulator with id and name from content_block_start
+        self._streaming_tool_calls[index] = {
+            "id": getattr(content_block, 'id', ''),
+            "name": getattr(content_block, 'name', ''),
+            "input": ""
+        }
+
     def _accumulate_anthropic_tool_calls(self, chunk):
         """
         Accumulate tool call chunks from Anthropic fine-grained streaming.
@@ -361,7 +379,8 @@ class AnthropicProvider(Provider):
         # Get the tool use index from the chunk
         index = getattr(chunk, 'index', 0)
 
-        # Initialize tool call accumulator if not exists
+        # Tool call should already be initialized by _initialize_tool_call_from_content_block
+        # If not, initialize with empty values (fallback)
         if index not in self._streaming_tool_calls:
             self._streaming_tool_calls[index] = {
                 "id": "",
