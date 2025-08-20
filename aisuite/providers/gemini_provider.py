@@ -350,7 +350,7 @@ class GeminiProvider(Provider):
                     content_text_parts = []
                     tool_calls = None
 
-                    if chunk.candidates: # Ensure candidates exist
+                    if chunk.candidates and chunk.candidates[0].content.parts: # Ensure candidates and parts exist
                         for part in chunk.candidates[0].content.parts:
                             # Check if the part is a thought and has text
                             if getattr(part, 'thought', False) and getattr(part, 'text', None):
