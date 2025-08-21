@@ -291,11 +291,10 @@ class GeminiProvider(Provider):
                 convo_history = messages[:-1]
             elif messages[-1]["role"] in ["tool", "assistant"]:
                 # Agent scenario: last message is tool result or assistant message
-                # We need to continue the conversation based on the tool results
-                # Include all messages as history and send a continuation prompt
+                # According to Gemini API docs, we should include all messages as history
+                # and let the model continue naturally without adding "continue"
                 convo_history = messages
-                # Use "continue" as it's a well-documented Gemini pattern for conversation continuation
-                last_user_message = "continue"
+                last_user_message = None  # No additional user message needed
             else:
                 # Other cases: treat all as history with empty continuation
                 convo_history = messages
@@ -309,26 +308,258 @@ class GeminiProvider(Provider):
                     # System messages are already handled separately
                     continue
                 elif role == "tool":
-                    # Tool messages should be treated as user messages in Gemini
-                    # Format tool result for Gemini understanding
-                    tool_content = f"Tool result: {msg['content']}"
+                    # Tool messages should use function response format for Gemini
+                    # Create proper function response part
                     if "tool_call_id" in msg:
-                        tool_content = f"Tool result (ID: {msg['tool_call_id']}): {msg['content']}"
-                    part = types.Part.from_text(text=tool_content)
-                    history_msgs.append(types.Content(role="user", parts=[part]))
+                        # Extract function name from tool_call_id if possible
+                        # Format: call_function_name_hash -> function_name
+                        tool_call_id = msg["tool_call_id"]
+                        function_name = "unknown_function"
+                        if tool_call_id.startswith("call_"):
+                            parts = tool_call_id.split("_")
+                            if len(parts) >= 3:
+                                function_name = "_".join(parts[1:-1])  # Everything between "call_" and the hash
+
+                        # Create function response part
+                        function_response_part = types.Part.from_function_response(
+                            name=function_name,
+                            response={"result": msg["content"]}
+                        )
+                        history_msgs.append(types.Content(role="user", parts=[function_response_part]))
+                    else:
+                        # Fallback to text format if no tool_call_id
+                        tool_content = f"Tool result: {msg['content']}"
+                        part = types.Part.from_text(text=tool_content)
+                        history_msgs.append(types.Content(role="user", parts=[part]))
                 elif role in ("user", "assistant"):
                     # Map AISuite role to Gemini role (Gemini expects "user" or "model")
                     gemini_role = "model" if role == "assistant" else "user"
-                    part = types.Part.from_text(text=msg["content"])
-                    history_msgs.append(types.Content(role=gemini_role, parts=[part]))
+
+                    # Handle tool calls in assistant messages
+                    if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                        # Assistant message with tool calls - convert to function call parts
+                        parts = []
+
+                        # Add text content if present
+                        if msg.get("content"):
+                            parts.append(types.Part.from_text(text=msg["content"]))
+
+                        # Add function calls
+                        for tool_call in msg["tool_calls"]:
+                            if tool_call.get("type") == "function" and "function" in tool_call:
+                                func = tool_call["function"]
+                                # Parse arguments if they're a string
+                                args = func.get("arguments", "{}")
+                                if isinstance(args, str):
+                                    try:
+                                        import json
+                                        args = json.loads(args)
+                                    except json.JSONDecodeError:
+                                        args = {}
+
+                                # Create function call part
+                                function_call_part = types.Part.from_function_call(
+                                    name=func["name"],
+                                    args=args
+                                )
+                                parts.append(function_call_part)
+
+                        if parts:
+                            history_msgs.append(types.Content(role=gemini_role, parts=parts))
+                    else:
+                        # Regular text message
+                        if msg.get("content"):
+                            part = types.Part.from_text(text=msg["content"])
+                            history_msgs.append(types.Content(role=gemini_role, parts=[part]))
                 else:
                     # Skip unknown message types
                     continue
         # Create a new chat session with history and config (if any)
         chat = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
+
+        # Handle case where we don't need to send a new user message
         if last_user_message is None:
-            # No user prompt to send (no completion to generate)
-            return None
+            # For agent scenarios where the last message is a tool result or assistant message,
+            # we can use the model's generate_content method directly with the full conversation
+            if stream:
+                # For streaming, we need to handle this differently
+                # Use the client's models.generate_content_stream method
+                contents = []
+                for msg in messages:
+                    role = msg["role"]
+                    if role == "system":
+                        continue  # Already handled in config
+                    elif role == "tool":
+                        # Use function response format
+                        if "tool_call_id" in msg:
+                            tool_call_id = msg["tool_call_id"]
+                            function_name = "unknown_function"
+                            if tool_call_id.startswith("call_"):
+                                parts = tool_call_id.split("_")
+                                if len(parts) >= 3:
+                                    function_name = "_".join(parts[1:-1])
+
+                            function_response_part = types.Part.from_function_response(
+                                name=function_name,
+                                response={"result": msg["content"]}
+                            )
+                            contents.append(types.Content(role="user", parts=[function_response_part]))
+                        else:
+                            tool_content = f"Tool result: {msg['content']}"
+                            part = types.Part.from_text(text=tool_content)
+                            contents.append(types.Content(role="user", parts=[part]))
+                    elif role in ("user", "assistant"):
+                        gemini_role = "model" if role == "assistant" else "user"
+
+                        if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                            parts = []
+                            if msg.get("content"):
+                                parts.append(types.Part.from_text(text=msg["content"]))
+
+                            for tool_call in msg["tool_calls"]:
+                                if tool_call.get("type") == "function" and "function" in tool_call:
+                                    func = tool_call["function"]
+                                    args = func.get("arguments", "{}")
+                                    if isinstance(args, str):
+                                        try:
+                                            import json
+                                            args = json.loads(args)
+                                        except json.JSONDecodeError:
+                                            args = {}
+
+                                    function_call_part = types.Part.from_function_call(
+                                        name=func["name"],
+                                        args=args
+                                    )
+                                    parts.append(function_call_part)
+
+                            if parts:
+                                contents.append(types.Content(role=gemini_role, parts=parts))
+                        else:
+                            if msg.get("content"):
+                                part = types.Part.from_text(text=msg["content"])
+                                contents.append(types.Content(role=gemini_role, parts=[part]))
+
+                # Use streaming generation
+                async def stream_generator():
+                    response_id = None
+                    for chunk in self.client.models.generate_content_stream(
+                        model=model_id,
+                        contents=contents,
+                        config=config
+                    ):
+                        if response_id is None:
+                            potential_id = getattr(chunk, 'response_id', None)
+                            if potential_id is not None:
+                                response_id = potential_id
+
+                        current_chunk_text = ""
+                        current_chunk_reasoning = None
+                        reasoning_text_parts = []
+                        content_text_parts = []
+                        tool_calls = None
+
+                        if chunk.candidates and chunk.candidates[0].content.parts:
+                            for part in chunk.candidates[0].content.parts:
+                                if getattr(part, 'thought', False) and getattr(part, 'text', None):
+                                    reasoning_text_parts.append(part.text)
+                                elif hasattr(part, 'function_call') and part.function_call:
+                                    mock_delta = type('MockDelta', (), {
+                                        'function_call': part.function_call
+                                    })()
+                                    tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
+                                elif getattr(part, 'text', None):
+                                    content_text_parts.append(part.text)
+
+                        if reasoning_text_parts:
+                            current_chunk_reasoning = "".join(reasoning_text_parts)
+
+                        if content_text_parts:
+                            current_chunk_text = "".join(content_text_parts)
+
+                        yield ChatCompletionResponse(
+                            choices=[
+                                StreamChoice(
+                                    index=0,
+                                    delta=ChoiceDelta(
+                                        content=current_chunk_text if current_chunk_text else None,
+                                        role="assistant" if current_chunk_text or tool_calls else None,
+                                        tool_calls=tool_calls,
+                                        reasoning_content=current_chunk_reasoning
+                                    ),
+                                    finish_reason=None
+                                )
+                            ],
+                            metadata={
+                                'id': response_id,
+                                'created': None,
+                                'model': model_id
+                            }
+                        )
+                return stream_generator()
+            else:
+                # For non-streaming, use generate_content directly
+                contents = []
+                for msg in messages:
+                    role = msg["role"]
+                    if role == "system":
+                        continue  # Already handled in config
+                    elif role == "tool":
+                        if "tool_call_id" in msg:
+                            tool_call_id = msg["tool_call_id"]
+                            function_name = "unknown_function"
+                            if tool_call_id.startswith("call_"):
+                                parts = tool_call_id.split("_")
+                                if len(parts) >= 3:
+                                    function_name = "_".join(parts[1:-1])
+
+                            function_response_part = types.Part.from_function_response(
+                                name=function_name,
+                                response={"result": msg["content"]}
+                            )
+                            contents.append(types.Content(role="user", parts=[function_response_part]))
+                        else:
+                            tool_content = f"Tool result: {msg['content']}"
+                            part = types.Part.from_text(text=tool_content)
+                            contents.append(types.Content(role="user", parts=[part]))
+                    elif role in ("user", "assistant"):
+                        gemini_role = "model" if role == "assistant" else "user"
+
+                        if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                            parts = []
+                            if msg.get("content"):
+                                parts.append(types.Part.from_text(text=msg["content"]))
+
+                            for tool_call in msg["tool_calls"]:
+                                if tool_call.get("type") == "function" and "function" in tool_call:
+                                    func = tool_call["function"]
+                                    args = func.get("arguments", "{}")
+                                    if isinstance(args, str):
+                                        try:
+                                            import json
+                                            args = json.loads(args)
+                                        except json.JSONDecodeError:
+                                            args = {}
+
+                                    function_call_part = types.Part.from_function_call(
+                                        name=func["name"],
+                                        args=args
+                                    )
+                                    parts.append(function_call_part)
+
+                            if parts:
+                                contents.append(types.Content(role=gemini_role, parts=parts))
+                        else:
+                            if msg.get("content"):
+                                part = types.Part.from_text(text=msg["content"])
+                                contents.append(types.Content(role=gemini_role, parts=[part]))
+
+                response = self.client.models.generate_content(
+                    model=model_id,
+                    contents=contents,
+                    config=config
+                )
+                return GeminiMessageConverter.from_gemini_response(response)
 
         # Send the last user message and get response (streaming or full)
         if stream:
