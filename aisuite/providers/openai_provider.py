@@ -56,6 +56,13 @@ class OpenaiProvider(Provider):
             prepared_kwargs.pop('reasoning_effort', None)
             return prepared_kwargs
 
+        # For o3 models, remove unsupported parameters
+        if model.startswith('o3') or model.startswith('o3-'):
+            # o3 models don't support max_tokens, use max_completion_tokens instead
+            if 'max_tokens' in prepared_kwargs:
+                max_tokens_value = prepared_kwargs.pop('max_tokens')
+                prepared_kwargs['max_completion_tokens'] = max_tokens_value
+
         # Handle reasoning parameters for supported models
         if 'reasoning' in kwargs:
             reasoning = kwargs['reasoning']
@@ -92,44 +99,78 @@ class OpenaiProvider(Provider):
             # Reset streaming tool calls state
             self._streaming_tool_calls = {}
 
+            # 清理messages参数，移除ReasoningContent对象
+            cleaned_messages = []
+            for i, msg in enumerate(messages):
+                if isinstance(msg, dict):
+                    cleaned_msg = msg.copy()
+                    # 移除reasoning_content字段，因为OpenAI API不需要它作为输入
+                    if 'reasoning_content' in cleaned_msg:
+                        cleaned_msg.pop('reasoning_content')
+                    cleaned_messages.append(cleaned_msg)
+                else:
+                    # 如果是Message对象，转换为字典并移除reasoning_content
+                    if hasattr(msg, 'model_dump'):
+                        cleaned_msg = msg.model_dump()
+                        if 'reasoning_content' in cleaned_msg:
+                            cleaned_msg.pop('reasoning_content')
+                        cleaned_messages.append(cleaned_msg)
+                    else:
+                        cleaned_messages.append(msg)
             response = await self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=cleaned_messages,  # 使用清理后的messages
                 stream=True,
                 **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
             async def stream_generator():
                 async for chunk in response:
                     if chunk.choices:
-                            yield ChatCompletionResponse(
-                                choices=[
-                                    StreamChoice(
-                                        index=choice.index,
-                                        delta=ChoiceDelta(
-                                            content=choice.delta.content,
-                                            role=choice.delta.role,
-                                            tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
-                                            reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # 流式时保持原始格式
-                                        ),
-                                        finish_reason=choice.finish_reason
-                                    )
-                                    for choice in chunk.choices
-                                ],
-                                metadata={
-                                    'id': chunk.id,
-                                    'created': chunk.created,
-                                    'model': chunk.model
-                                }
-                            )
+                        yield ChatCompletionResponse(
+                            choices=[
+                                StreamChoice(
+                                    index=choice.index,
+                                    delta=ChoiceDelta(
+                                        content=choice.delta.content,
+                                        role=choice.delta.role,
+                                        tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
+                                        reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # 流式时保持原始格式
+                                    ),
+                                    finish_reason=choice.finish_reason
+                                )
+                                for choice in chunk.choices
+                            ],
+                            metadata={
+                                'id': chunk.id,
+                                'created': chunk.created,
+                                'model': chunk.model
+                            }
+                        )
             return stream_generator()
         else:
+            # 对于非流式调用，也需要清理messages
+            cleaned_messages = []
+            for i, msg in enumerate(messages):
+                if isinstance(msg, dict):
+                    cleaned_msg = msg.copy()
+                    if 'reasoning_content' in cleaned_msg:
+                        cleaned_msg.pop('reasoning_content')
+                    cleaned_messages.append(cleaned_msg)
+                else:
+                    if hasattr(msg, 'model_dump'):
+                        cleaned_msg = msg.model_dump()
+                        if 'reasoning_content' in cleaned_msg:
+                            cleaned_msg.pop('reasoning_content')
+                        cleaned_messages.append(cleaned_msg)
+                    else:
+                        cleaned_messages.append(msg)
+
             response = await self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=cleaned_messages,  # 使用清理后的messages
                 stream=False,
                 **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
-
             return ChatCompletionResponse(
                 choices=[
                     Choice(
