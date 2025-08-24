@@ -31,7 +31,61 @@ class OpenaiProvider(Provider):
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
 
+    def _supports_reasoning(self, model: str) -> bool:
+        """Check if the model supports reasoning parameters."""
+        # o1 series models support reasoning_effort
+        if model.startswith('o1-'):
+            return True
+        # o3 series models support reasoning_effort (including o3, o3-mini, etc.)
+        if model.startswith('o3') or model.startswith('o3-'):
+            return True
+        # GPT-5 series models support reasoning parameter
+        if model.startswith('gpt-5'):
+            return True
+        # Regular GPT models (gpt-4o, gpt-4, etc.) do not support reasoning
+        return False
+
+    def _prepare_reasoning_kwargs(self, model: str, kwargs: dict) -> dict:
+        """Prepare reasoning-related kwargs based on model type."""
+        prepared_kwargs = kwargs.copy()
+
+        # If model doesn't support reasoning, remove reasoning-related parameters
+        if not self._supports_reasoning(model):
+            # Remove reasoning parameters that would cause API errors
+            prepared_kwargs.pop('reasoning', None)
+            prepared_kwargs.pop('reasoning_effort', None)
+            return prepared_kwargs
+
+        # Handle reasoning parameters for supported models
+        if 'reasoning' in kwargs:
+            reasoning = kwargs['reasoning']
+            if model.startswith('gpt-5'):
+                # GPT-5 uses reasoning parameter with effort field
+                prepared_kwargs['reasoning'] = reasoning
+            elif model.startswith('o1-') or model.startswith('o3') or model.startswith('o3-'):
+                # o1/o3 series use reasoning_effort parameter
+                if isinstance(reasoning, dict) and 'effort' in reasoning:
+                    prepared_kwargs['reasoning_effort'] = reasoning['effort']
+                    prepared_kwargs.pop('reasoning', None)
+                else:
+                    # If reasoning is a string, use it as effort
+                    prepared_kwargs['reasoning_effort'] = reasoning
+                    prepared_kwargs.pop('reasoning', None)
+
+        # Handle reasoning_effort parameter for o1/o3 models
+        if 'reasoning_effort' in kwargs and (model.startswith('o1-') or model.startswith('o3') or model.startswith('o3-')):
+            prepared_kwargs['reasoning_effort'] = kwargs['reasoning_effort']
+
+        # Handle verbosity parameter for GPT-5 models
+        if 'verbosity' in kwargs and model.startswith('gpt-5'):
+            prepared_kwargs['verbosity'] = kwargs['verbosity']
+
+        return prepared_kwargs
+
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
+        # Prepare kwargs based on model capabilities
+        prepared_kwargs = self._prepare_reasoning_kwargs(model, kwargs)
+
         # Any exception raised by OpenAI will be returned to the caller.
         # Maybe we should catch them and raise a custom LLMError.
         if stream:
@@ -42,7 +96,7 @@ class OpenaiProvider(Provider):
                 model=model,
                 messages=messages,
                 stream=True,
-                **kwargs  # Pass any additional arguments to the OpenAI API
+                **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
             async def stream_generator():
                 async for chunk in response:
@@ -73,7 +127,7 @@ class OpenaiProvider(Provider):
                 model=model,
                 messages=messages,
                 stream=False,
-                **kwargs  # Pass any additional arguments to the OpenAI API
+                **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
 
             return ChatCompletionResponse(
