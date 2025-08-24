@@ -5,7 +5,7 @@ from typing import AsyncGenerator, Union
 
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
-from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
+from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
 
 
 class DeepseekProvider(Provider):
@@ -86,7 +86,7 @@ class DeepseekProvider(Provider):
                             role=choice.message.role,
                             tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
                             refusal=None,
-                            reasoning_content=getattr(choice.message, 'reasoning_content', None)
+                            reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
                         ),
                         finish_reason=getattr(choice, 'finish_reason', None)
                     )
@@ -98,6 +98,17 @@ class DeepseekProvider(Provider):
                     "model": model
                 }
             )
+
+    def _convert_reasoning_content(self, reasoning_content):
+        """Convert DeepSeek reasoning_content to ReasoningContent object."""
+        if not reasoning_content:
+            return None
+
+        return ReasoningContent(
+            thinking=reasoning_content,
+            provider="deepseek",
+            raw_data={"reasoning_content": reasoning_content}
+        )
 
     def _accumulate_and_convert_tool_calls(self, delta):
         """

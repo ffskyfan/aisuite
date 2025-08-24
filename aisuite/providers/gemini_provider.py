@@ -2,7 +2,7 @@ import os
 import json
 from typing import AsyncGenerator, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
-from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
+from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
 from aisuite.provider import Provider 
 
 # Import Google GenAI SDK
@@ -102,7 +102,7 @@ class GeminiMessageConverter:
 
             # Combine reasoning parts if any
             if reasoning_text_parts:
-                reasoning_content = "".join(reasoning_text_parts)
+                reasoning_content = self._convert_reasoning_content("".join(reasoning_text_parts), response.candidates[0].content.parts)
 
             # Use combined content text or fallback to response.text
             if content_text_parts:
@@ -135,6 +135,36 @@ class GeminiMessageConverter:
 
 
 class GeminiProvider(Provider):
+
+    def _convert_reasoning_content(self, thinking_text, parts):
+        """Convert Gemini thinking content to ReasoningContent object."""
+        if not thinking_text:
+            return None
+
+        # Extract raw thought parts for reconstruction
+        thought_parts = []
+        for part in parts:
+            if getattr(part, 'thought', False):
+                part_data = {}
+                if hasattr(part, 'model_dump'):
+                    part_data = part.model_dump()
+                elif hasattr(part, 'dict'):
+                    part_data = part.dict()
+                else:
+                    part_data = {
+                        'thought': True,
+                        'text': getattr(part, 'text', '')
+                    }
+                thought_parts.append(part_data)
+
+        return ReasoningContent(
+            thinking=thinking_text,
+            provider="gemini",
+            raw_data={
+                "thought_parts": thought_parts,
+                "thinking_text": thinking_text
+            }
+        )
     def __init__(self, **kwargs):
         """Initialize the Gemini provider with API key and client."""
         api_key = os.environ.get("GEMINI_API_KEY") or kwargs.get("api_key")

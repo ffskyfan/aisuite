@@ -7,7 +7,7 @@ import json
 from typing import AsyncGenerator, Union
 from aisuite.provider import Provider
 from aisuite.framework import ChatCompletionResponse
-from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
+from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
 from aisuite.framework.chat_completion_response import Choice, ChoiceDelta, StreamChoice
 
 # Define a constant for the default max_tokens value
@@ -79,7 +79,19 @@ class AnthropicMessageConverter:
         elif (hasattr(chunk, 'delta') and chunk.delta and
               hasattr(chunk.delta, 'type') and chunk.delta.type == "thinking_delta" and
               hasattr(chunk.delta, 'thinking') and chunk.delta.thinking):
+            # Accumulate thinking content in provider
+            if provider:
+                provider._accumulate_thinking_content(chunk.delta.thinking)
             reasoning_content = chunk.delta.thinking
+            role = "assistant"
+
+        # Handle signature delta (for thinking blocks)
+        elif (hasattr(chunk, 'delta') and chunk.delta and
+              hasattr(chunk.delta, 'type') and chunk.delta.type == "signature_delta" and
+              hasattr(chunk.delta, 'signature') and chunk.delta.signature):
+            # Accumulate signature in provider
+            if provider:
+                provider._accumulate_thinking_signature(chunk.delta.signature)
             role = "assistant"
 
         # Handle tool use delta (fine-grained streaming)
@@ -126,8 +138,17 @@ class AnthropicMessageConverter:
         if msg["role"] == self.ROLE_TOOL:
             return self._create_tool_result_message(msg["tool_call_id"], msg["content"])
         elif msg["role"] == self.ROLE_ASSISTANT and "tool_calls" in msg:
+            reasoning_content = msg.get("reasoning_content")
+
+            # 处理reasoning_content：可能是字符串（旧格式）或ReasoningContent对象（新格式）
+            if reasoning_content:
+                if isinstance(reasoning_content, dict):
+                    reasoning_content = ReasoningContent(**reasoning_content)
+
             return self._create_assistant_tool_message(
-                msg["content"], msg["tool_calls"]
+                msg["content"],
+                msg["tool_calls"],
+                reasoning_content  # 传递 reasoning_content（可能是ReasoningContent对象）
             )
         return {"role": msg["role"], "content": msg["content"]}
 
@@ -136,7 +157,12 @@ class AnthropicMessageConverter:
         if msg.role == self.ROLE_TOOL:
             return self._create_tool_result_message(msg.tool_call_id, msg.content)
         elif msg.role == self.ROLE_ASSISTANT and msg.tool_calls:
-            return self._create_assistant_tool_message(msg.content, msg.tool_calls)
+            reasoning_content = msg.reasoning_content
+            return self._create_assistant_tool_message(
+                msg.content,
+                msg.tool_calls,
+                reasoning_content  # 传递 reasoning_content（ReasoningContent对象）
+            )
         return {"role": msg.role, "content": msg.content}
 
     def _create_tool_result_message(self, tool_call_id, content):
@@ -152,12 +178,19 @@ class AnthropicMessageConverter:
             ],
         }
 
-    def _create_assistant_tool_message(self, content, tool_calls):
+    def _create_assistant_tool_message(self, content, tool_calls, reasoning_content=None):
         """Create an assistant message with tool calls in Anthropic format."""
         message_content = []
+
+        # 1. 如果有ReasoningContent，使用其原始数据重构thinking块
+        if reasoning_content and hasattr(reasoning_content, 'raw_data') and reasoning_content.raw_data:
+            message_content.append(reasoning_content.raw_data)
+
+        # 2. 添加文本内容
         if content:
             message_content.append({"type": "text", "text": content})
 
+        # 3. 添加工具调用
         for tool_call in tool_calls:
             tool_input = (
                 tool_call["function"]["arguments"]
@@ -214,11 +247,34 @@ class AnthropicMessageConverter:
         # Extract thinking content if present
         reasoning_content = None
         text_content = None
-        
+        thinking_block_data = None
+
         for content_block in response.content:
             if hasattr(content_block, 'type'):
                 if content_block.type == "thinking" and hasattr(content_block, 'thinking'):
-                    reasoning_content = content_block.thinking
+                    # 保存完整的thinking块数据
+                    thinking_block_data = {}
+                    if hasattr(content_block, 'model_dump'):
+                        thinking_block_data = content_block.model_dump()
+                    elif hasattr(content_block, 'dict'):
+                        thinking_block_data = content_block.dict()
+                    else:
+                        # 手动构建thinking块数据
+                        thinking_block_data = {
+                            'type': 'thinking',
+                            'thinking': content_block.thinking
+                        }
+                        # 尝试获取signature
+                        if hasattr(content_block, 'signature'):
+                            thinking_block_data['signature'] = content_block.signature
+
+                    # 创建ReasoningContent对象
+                    reasoning_content = ReasoningContent(
+                        thinking=content_block.thinking,
+                        signature=thinking_block_data.get('signature'),
+                        provider="anthropic",
+                        raw_data=thinking_block_data
+                    )
                 elif content_block.type == "text" and hasattr(content_block, 'text'):
                     text_content = content_block.text
 
@@ -254,14 +310,35 @@ class AnthropicMessageConverter:
             )
             
             # Extract thinking content if present
-            reasoning_content = next(
-                (
-                    content.thinking
-                    for content in response.content
-                    if content.type == "thinking" and hasattr(content, 'thinking')
-                ),
-                None,
-            )
+            reasoning_content = None
+            thinking_block_data = None
+
+            for content_block in response.content:
+                if hasattr(content_block, 'type') and content_block.type == "thinking" and hasattr(content_block, 'thinking'):
+                    # 保存完整的thinking块数据
+                    thinking_block_data = {}
+                    if hasattr(content_block, 'model_dump'):
+                        thinking_block_data = content_block.model_dump()
+                    elif hasattr(content_block, 'dict'):
+                        thinking_block_data = content_block.dict()
+                    else:
+                        # 手动构建thinking块数据
+                        thinking_block_data = {
+                            'type': 'thinking',
+                            'thinking': content_block.thinking
+                        }
+                        # 尝试获取signature
+                        if hasattr(content_block, 'signature'):
+                            thinking_block_data['signature'] = content_block.signature
+
+                    # 创建ReasoningContent对象
+                    reasoning_content = ReasoningContent(
+                        thinking=content_block.thinking,
+                        signature=thinking_block_data.get('signature'),
+                        provider="anthropic",
+                        raw_data=thinking_block_data
+                    )
+                    break
 
             return Message(
                 content=text_content or None,
@@ -303,37 +380,60 @@ class AnthropicProvider(Provider):
 
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
+        # Track thinking state for error recovery
+        self._thinking_enabled = False
+        # State for accumulating thinking content
+        self._streaming_thinking = {
+            "thinking": "",
+            "signature": None
+        }
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion using the Anthropic API."""
         kwargs = self._prepare_kwargs(kwargs)
+
+        # Track thinking state for error recovery
+        self._thinking_enabled = "thinking" in kwargs
+
         system_message, converted_messages = self.converter.convert_request(messages)
 
-        if stream:
-            # Reset streaming tool calls state
-            self._streaming_tool_calls = {}
+        try:
+            if stream:
+                # Reset streaming tool calls state
+                self._streaming_tool_calls = {}
+                # Reset thinking accumulation state
+                self._streaming_thinking = {
+                    "thinking": "",
+                    "signature": None
+                }
 
-            response = await self.client.messages.create(
-                model=model,
-                system=system_message,
-                messages=converted_messages,
-                stream=True,
-                **kwargs
-            )
+                response = await self.client.messages.create(
+                    model=model,
+                    system=system_message,
+                    messages=converted_messages,
+                    stream=True,
+                    **kwargs
+                )
 
-            async def stream_generator():
-                async for chunk in response:
-                    yield self.converter.convert_stream_response(chunk, model, self)
+                async def stream_generator():
+                    async for chunk in response:
+                        yield self.converter.convert_stream_response(chunk, model, self)
 
-            return stream_generator()
-        else:
-            response = await self.client.messages.create(
-                model=model, 
-                system=system_message, 
-                messages=converted_messages, 
-                **kwargs
-            )
-            return self.converter.convert_response(response)
+                return stream_generator()
+            else:
+                response = await self.client.messages.create(
+                    model=model,
+                    system=system_message,
+                    messages=converted_messages,
+                    **kwargs
+                )
+                return self.converter.convert_response(response)
+
+        except Exception as e:
+            # Check for thinking blocks related error
+            if "Expected `thinking` or `redacted_thinking`" in str(e):
+                return await self._handle_thinking_error(model, system_message, converted_messages, kwargs, stream)
+            raise
 
     def _prepare_kwargs(self, kwargs):
         """Prepare kwargs for the API call."""
@@ -423,6 +523,62 @@ class AnthropicProvider(Provider):
                     continue
 
         return complete_tool_calls if complete_tool_calls else None
+
+    def _accumulate_thinking_content(self, thinking_text):
+        """Accumulate thinking content from streaming chunks."""
+        self._streaming_thinking["thinking"] += thinking_text
+
+    def _accumulate_thinking_signature(self, signature):
+        """Accumulate signature from streaming chunks."""
+        self._streaming_thinking["signature"] = signature
+
+    def _get_accumulated_thinking(self):
+        """Get accumulated thinking content and reset state."""
+        thinking_data = self._streaming_thinking.copy()
+        # Reset for next stream
+        self._streaming_thinking = {
+            "thinking": "",
+            "signature": None
+        }
+        return thinking_data
+
+    async def _handle_thinking_error(self, model, system_message, converted_messages, kwargs, stream):
+        """Handle thinking blocks related errors with automatic recovery."""
+        # Try to fix message format
+        fixed_messages = self._fix_thinking_messages(converted_messages)
+
+        try:
+            if stream:
+                response = await self.client.messages.create(
+                    model=model,
+                    system=system_message,
+                    messages=fixed_messages,
+                    stream=True,
+                    **kwargs
+                )
+
+                async def stream_generator():
+                    async for chunk in response:
+                        yield self.converter.convert_stream_response(chunk, model, self)
+                return stream_generator()
+            else:
+                response = await self.client.messages.create(
+                    model=model,
+                    system=system_message,
+                    messages=fixed_messages,
+                    **kwargs
+                )
+                return self.converter.convert_response(response)
+        except Exception as retry_error:
+            # 不再回退，直接抛出错误以便调试
+            raise retry_error
+
+    def _fix_thinking_messages(self, messages):
+        """
+        现在有了正确的ReasoningContent机制，不再需要修复thinking块。
+        直接返回原始消息。
+        """
+        return messages
 
     def _process_anthropic_tool_use(self, content_block):
         """
