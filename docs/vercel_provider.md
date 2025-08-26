@@ -147,24 +147,43 @@ if response.choices[0].message.tool_calls:
     print(f"Arguments: {tool_call.function.arguments}")
 ```
 
-### Provider Options
+### Provider Options and Reasoning
 
-You can specify provider routing preferences:
+Vercel AI Gateway supports advanced provider options including reasoning (thinking) capabilities:
 
 ```python
+# Configure reasoning for models that support it
+response = await client.chat.completions.create(
+    model="vercel:openai/gpt-oss-120b",
+    messages=[{"role": "user", "content": "Solve this complex problem step by step"}],
+    extra_body={
+        "providerOptions": {
+            "openai": {
+                "reasoningEffort": "high",
+                "reasoningSummary": "detailed"
+            }
+        }
+    }
+)
+
+# Configure provider routing
 response = await client.chat.completions.create(
     model="vercel:anthropic/claude-sonnet-4",
     messages=[{"role": "user", "content": "Hello"}],
-    # This would require extending the provider to support providerOptions
     extra_body={
         "providerOptions": {
             "gateway": {
                 "order": ["vertex", "anthropic"]  # Try Vertex AI first, then Anthropic
+            },
+            "anthropic": {
+                "thinkingBudget": 0.001  # Set thinking budget for Claude models
             }
         }
     }
 )
 ```
+
+**Note**: While Vercel AI Gateway is OpenAI-compatible, current documentation indicates that reasoning content parameters are not explicitly supported in the OpenAI-compatible API. The provider includes reasoning content handling for compatibility and potential future support, but reasoning functionality may not be available at this time.
 
 ### Image Analysis
 

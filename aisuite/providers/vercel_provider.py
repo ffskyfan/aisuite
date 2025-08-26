@@ -35,9 +35,28 @@ class VercelProvider(Provider):
             # Reset streaming tool calls state
             self._streaming_tool_calls = {}
 
+            # Clean messages parameter, remove ReasoningContent objects (following OpenAI provider pattern)
+            cleaned_messages = []
+            for msg in messages:
+                if isinstance(msg, dict):
+                    cleaned_msg = msg.copy()
+                    # Remove reasoning_content field as Vercel AI Gateway doesn't need it as input
+                    if 'reasoning_content' in cleaned_msg:
+                        cleaned_msg.pop('reasoning_content')
+                    cleaned_messages.append(cleaned_msg)
+                else:
+                    # If it's a Message object, convert to dict and remove reasoning_content
+                    if hasattr(msg, 'model_dump'):
+                        cleaned_msg = msg.model_dump()
+                        if 'reasoning_content' in cleaned_msg:
+                            cleaned_msg.pop('reasoning_content')
+                        cleaned_messages.append(cleaned_msg)
+                    else:
+                        cleaned_messages.append(msg)
+
             response = await self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=cleaned_messages,  # Use cleaned messages
                 stream=True,
                 **kwargs  # Pass any additional arguments to the OpenAI API
             )
@@ -52,7 +71,7 @@ class VercelProvider(Provider):
                                             content=choice.delta.content,
                                             role=choice.delta.role,
                                             tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
-                                            reasoning_content=getattr(choice.delta, 'reasoning_content', None)
+                                            reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # Keep for OpenAI compatibility, though Vercel AI Gateway may not support it yet
                                         ),
                                         finish_reason=choice.finish_reason
                                     )
@@ -66,9 +85,26 @@ class VercelProvider(Provider):
                             )
             return stream_generator()
         else:
+            # For non-streaming calls, also need to clean messages (following OpenAI provider pattern)
+            cleaned_messages = []
+            for msg in messages:
+                if isinstance(msg, dict):
+                    cleaned_msg = msg.copy()
+                    if 'reasoning_content' in cleaned_msg:
+                        cleaned_msg.pop('reasoning_content')
+                    cleaned_messages.append(cleaned_msg)
+                else:
+                    if hasattr(msg, 'model_dump'):
+                        cleaned_msg = msg.model_dump()
+                        if 'reasoning_content' in cleaned_msg:
+                            cleaned_msg.pop('reasoning_content')
+                        cleaned_messages.append(cleaned_msg)
+                    else:
+                        cleaned_messages.append(msg)
+
             response = await self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=cleaned_messages,  # Use cleaned messages
                 stream=False,
                 **kwargs  # Pass any additional arguments to the OpenAI API
             )
@@ -82,7 +118,7 @@ class VercelProvider(Provider):
                             role=choice.message.role,
                             tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
                             refusal=None,
-                            reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
+                            reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))  # Keep for OpenAI compatibility
                         ),
                         finish_reason=getattr(choice, 'finish_reason', None)
                     )
@@ -96,7 +132,13 @@ class VercelProvider(Provider):
             )
 
     def _convert_reasoning_content(self, reasoning_content):
-        """Convert Vercel AI Gateway reasoning_content to ReasoningContent object."""
+        """
+        Convert Vercel AI Gateway reasoning_content to ReasoningContent object.
+
+        Note: As of current documentation review, Vercel AI Gateway's OpenAI-compatible API
+        does not explicitly support reasoning content parameters. However, this method is
+        kept for OpenAI compatibility and potential future support.
+        """
         if not reasoning_content:
             return None
 

@@ -1,38 +1,67 @@
-import openai
 import os
 import json
-from typing import AsyncGenerator, Union
+from typing import Union, AsyncGenerator
+from openai import AsyncOpenAI
 
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
-from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
+from aisuite.framework.message import Message, ReasoningContent, ChatCompletionMessageToolCall, Function
 
 
-class OpenaiProvider(Provider):
+class CloseaiProvider(Provider):
+    """
+    CloseAI provider for aisuite.
+    
+    CloseAI is an OpenAI-compatible API proxy service that provides access to multiple AI models
+    through a unified interface. It supports all OpenAI parameters and automatically handles
+    protocol conversion between different model providers.
+    
+    Key features:
+    - Full OpenAI API compatibility
+    - Multi-model aggregation interface
+    - Automatic protocol conversion (ChatCompletion ↔ Response, Anthropic, Gemini)
+    - Extended timeout support for reasoning models (up to 20 minutes)
+    - Load balancing across multiple accounts
+    
+    Limitations:
+    - Does not support stateful interfaces (file, fine-tune, assistants)
+    - Response API supports stateless usage only
+    """
+
     def __init__(self, **config):
         """
-        Initialize the OpenAI provider with the given configuration.
-        Pass the entire configuration dictionary to the OpenAI client constructor.
+        Initialize the CloseAI provider.
+        
+        Args:
+            api_key (str, optional): CloseAI API key. If not provided, will look for CLOSEAI_API_KEY environment variable.
+            base_url (str, optional): Base URL for CloseAI API. Defaults to https://api.openai-proxy.org/v1
+            **config: Additional configuration passed to AsyncOpenAI client
         """
-        # Ensure API key is provided either in config or via environment variable
-        config.setdefault("api_key", os.getenv("OPENAI_API_KEY"))
-        if not config["api_key"]:
-            raise ValueError(
-                "OpenAI API key is missing. Please provide it in the config or set the OPENAI_API_KEY environment variable."
-            )
-
-        # NOTE: We could choose to remove above lines for api_key since OpenAI will automatically
-        # infer certain values from the environment variables.
-        # Eg: OPENAI_API_KEY, OPENAI_ORG_ID, OPENAI_PROJECT_ID, OPENAI_BASE_URL, etc.
-
-        # Pass the entire config to the OpenAI client constructor
-        self.client = openai.AsyncOpenAI(**config)
-
-        # State for accumulating streaming tool calls
+        # Get API key from config or environment
+        api_key = config.get('api_key') or os.getenv("CLOSEAI_API_KEY")
+        if not api_key:
+            raise ValueError("CloseAI API key is required. Set CLOSEAI_API_KEY environment variable or pass api_key parameter.")
+        
+        # Set base URL - CloseAI uses OpenAI-compatible endpoint
+        base_url = config.get('base_url', 'https://api.openai-proxy.org/v1')
+        
+        # Initialize OpenAI client with CloseAI configuration
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            **{k: v for k, v in config.items() if k not in ['api_key', 'base_url']}
+        )
+        
+        # Track streaming tool calls for accumulation
         self._streaming_tool_calls = {}
 
     def _supports_reasoning(self, model: str) -> bool:
-        """Check if the model supports reasoning parameters."""
+        """
+        Check if the model supports reasoning parameters.
+        
+        CloseAI supports all OpenAI reasoning models and automatically handles
+        protocol conversion for models that require it.
+        """
         # o1 series models support reasoning_effort
         if model.startswith('o1-'):
             return True
@@ -46,7 +75,13 @@ class OpenaiProvider(Provider):
         return False
 
     def _prepare_reasoning_kwargs(self, model: str, kwargs: dict) -> dict:
-        """Prepare reasoning-related kwargs based on model type."""
+        """
+        Prepare reasoning-related kwargs based on model type.
+
+        CloseAI automatically handles protocol conversion and supports reasoning models
+        through ChatCompletion interface. According to CloseAI docs, they automatically
+        convert ChatCompletion requests to Response API for models that need it.
+        """
         prepared_kwargs = kwargs.copy()
 
         # If model doesn't support reasoning, remove reasoning-related parameters
@@ -66,87 +101,47 @@ class OpenaiProvider(Provider):
                 max_tokens_value = prepared_kwargs.pop('max_tokens')
                 prepared_kwargs['max_completion_tokens'] = max_tokens_value
 
-            # GPT-5 has specific parameter restrictions
+            # GPT-5 only supports default temperature (1.0)
             if model.startswith('gpt-5'):
-                # GPT-5 may have temperature restrictions (based on CloseAI findings)
-                # Remove temperature if it's not the default value to avoid potential issues
                 if 'temperature' in prepared_kwargs and prepared_kwargs['temperature'] != 1.0:
-                    # For safety, we'll keep the temperature but add a comment
-                    # OpenAI's GPT-5 may be more flexible than CloseAI's implementation
-                    pass  # Keep temperature for now, but monitor for issues
+                    prepared_kwargs.pop('temperature')  # Remove non-default temperature
 
-        # Handle reasoning parameters for supported models
-        if 'reasoning' in kwargs:
-            reasoning = kwargs['reasoning']
-            if model.startswith('gpt-5'):
-                # GPT-5 uses reasoning parameter with effort field
-                prepared_kwargs['reasoning'] = reasoning
-            elif model.startswith('o1-') or model.startswith('o3') or model.startswith('o3-'):
-                # o1/o3 series use reasoning_effort parameter
-                if isinstance(reasoning, dict) and 'effort' in reasoning:
-                    prepared_kwargs['reasoning_effort'] = reasoning['effort']
-                    prepared_kwargs.pop('reasoning', None)
-                else:
-                    # If reasoning is a string, use it as effort
-                    prepared_kwargs['reasoning_effort'] = reasoning
-                    prepared_kwargs.pop('reasoning', None)
+        # CloseAI handles reasoning models through ChatCompletion interface
+        # Remove reasoning parameters as CloseAI will handle the conversion automatically
+        # The reasoning content will be returned in the standard message format
 
-        # Handle reasoning_effort parameter for o1/o3 models
-        if 'reasoning_effort' in kwargs and (model.startswith('o1-') or model.startswith('o3') or model.startswith('o3-')):
-            prepared_kwargs['reasoning_effort'] = kwargs['reasoning_effort']
-
-        # Handle verbosity parameter for GPT-5 models
-        if 'verbosity' in kwargs and model.startswith('gpt-5'):
-            prepared_kwargs['verbosity'] = kwargs['verbosity']
+        # Remove reasoning parameters that are not supported by ChatCompletion API
+        prepared_kwargs.pop('reasoning', None)
+        prepared_kwargs.pop('reasoning_effort', None)
+        prepared_kwargs.pop('verbosity', None)
 
         return prepared_kwargs
 
-    def _should_use_responses_api(self, model: str, kwargs: dict) -> bool:
-        """
-        Determine if we should use Responses API instead of Chat Completions API.
-
-        According to OpenAI docs, GPT-5 series models work better with Responses API,
-        especially when using reasoning parameters.
-        """
-        # GPT-5 models are recommended to use Responses API
-        if model.startswith('gpt-5'):
-            # Use Responses API if reasoning parameters are present
-            if 'reasoning' in kwargs or 'verbosity' in kwargs:
-                return True
-
-        # For now, only use Responses API for GPT-5 with reasoning
-        # Other models continue to use Chat Completions API
-        return False
-
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
+        """
+        Create chat completions using CloseAI's multi-model aggregation interface.
+        
+        CloseAI automatically handles protocol conversion for different model types,
+        so we can use the standard ChatCompletion interface for all models.
+        """
         # Prepare kwargs based on model capabilities
         prepared_kwargs = self._prepare_reasoning_kwargs(model, kwargs)
-
-        # Check if we should use Responses API instead of Chat Completions API
-        if self._should_use_responses_api(model, prepared_kwargs):
-            # For GPT-5 with reasoning, use Responses API
-            # Note: This is a placeholder for future implementation
-            # For now, we'll fall back to Chat Completions API with a warning
-            # TODO: Implement Responses API support when OpenAI Python SDK supports it
-            pass
-
-        # Any exception raised by OpenAI will be returned to the caller.
-        # Maybe we should catch them and raise a custom LLMError.
+        
         if stream:
             # Reset streaming tool calls state
             self._streaming_tool_calls = {}
 
-            # 清理messages参数，移除ReasoningContent对象
+            # Clean messages parameter, remove ReasoningContent objects
             cleaned_messages = []
-            for i, msg in enumerate(messages):
+            for msg in messages:
                 if isinstance(msg, dict):
                     cleaned_msg = msg.copy()
-                    # 移除reasoning_content字段，因为OpenAI API不需要它作为输入
+                    # Remove reasoning_content field as CloseAI API doesn't need it as input
                     if 'reasoning_content' in cleaned_msg:
                         cleaned_msg.pop('reasoning_content')
                     cleaned_messages.append(cleaned_msg)
                 else:
-                    # 如果是Message对象，转换为字典并移除reasoning_content
+                    # If it's a Message object, convert to dict and remove reasoning_content
                     if hasattr(msg, 'model_dump'):
                         cleaned_msg = msg.model_dump()
                         if 'reasoning_content' in cleaned_msg:
@@ -154,12 +149,14 @@ class OpenaiProvider(Provider):
                         cleaned_messages.append(cleaned_msg)
                     else:
                         cleaned_messages.append(msg)
+
             response = await self.client.chat.completions.create(
                 model=model,
-                messages=cleaned_messages,  # 使用清理后的messages
+                messages=cleaned_messages,  # Use cleaned messages
                 stream=True,
                 **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
+            
             async def stream_generator():
                 async for chunk in response:
                     if chunk.choices:
@@ -171,7 +168,7 @@ class OpenaiProvider(Provider):
                                         content=choice.delta.content,
                                         role=choice.delta.role,
                                         tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
-                                        reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # 流式时保持原始格式
+                                        reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # Keep original format in streaming
                                     ),
                                     finish_reason=choice.finish_reason
                                 )
@@ -185,9 +182,9 @@ class OpenaiProvider(Provider):
                         )
             return stream_generator()
         else:
-            # 对于非流式调用，也需要清理messages
+            # For non-streaming calls, also need to clean messages
             cleaned_messages = []
-            for i, msg in enumerate(messages):
+            for msg in messages:
                 if isinstance(msg, dict):
                     cleaned_msg = msg.copy()
                     if 'reasoning_content' in cleaned_msg:
@@ -204,7 +201,7 @@ class OpenaiProvider(Provider):
 
             response = await self.client.chat.completions.create(
                 model=model,
-                messages=cleaned_messages,  # 使用清理后的messages
+                messages=cleaned_messages,  # Use cleaned messages
                 stream=False,
                 **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
@@ -236,13 +233,13 @@ class OpenaiProvider(Provider):
             )
 
     def _convert_reasoning_content(self, reasoning_content):
-        """Convert OpenAI reasoning_content to ReasoningContent object."""
+        """Convert CloseAI reasoning_content to ReasoningContent object."""
         if not reasoning_content:
             return None
 
         return ReasoningContent(
             thinking=reasoning_content,
-            provider="openai",
+            provider="closeai",
             raw_data={"reasoning_content": reasoning_content}
         )
 
