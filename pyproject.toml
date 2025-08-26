@@ -34,8 +34,9 @@ huggingface = []
 mistral = ["mistralai"]
 ollama = []
 openai = ["openai"]
+vercel = ["openai"]
 watsonx = ["ibm-watsonx-ai"]
-all = ["anthropic", "aws", "cerebras_cloud_sdk", "google", "groq", "mistral", "openai", "cohere", "watsonx"]  # To install all providers
+all = ["anthropic", "aws", "cerebras_cloud_sdk", "google", "groq", "mistral", "openai", "cohere", "watsonx", "vercel"]  # To install all providers
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^3.7.1"
