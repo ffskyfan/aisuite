@@ -38,7 +38,7 @@ pip install aisuite[openai]  # since vercel provider depends on openai
 You need a Vercel AI Gateway API key. Set it as an environment variable:
 
 ```bash
-export VERCEL_AI_GATEWAY_API_KEY="your-api-key-here"
+export AI_GATEWAY_API_KEY="your-api-key-here"
 ```
 
 Or pass it directly in the configuration:
@@ -212,7 +212,7 @@ except Exception as e:
 
 ## Environment Variables
 
-- `VERCEL_AI_GATEWAY_API_KEY`: Your Vercel AI Gateway API key
+- `AI_GATEWAY_API_KEY`: Your Vercel AI Gateway API key
 - `VERCEL_OIDC_TOKEN`: Alternative authentication using OIDC token
 
 ## Notes

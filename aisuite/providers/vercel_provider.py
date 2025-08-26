@@ -15,10 +15,10 @@ class VercelProvider(Provider):
         Pass the entire configuration dictionary to the OpenAI client constructor.
         """
         # Ensure API key is provided either in config or via environment variable
-        config.setdefault("api_key", os.getenv("VERCEL_AI_GATEWAY_API_KEY"))
+        config.setdefault("api_key", os.getenv("AI_GATEWAY_API_KEY"))
         if not config["api_key"]:
             raise ValueError(
-                "Vercel AI Gateway API key is missing. Please provide it in the config or set the VERCEL_AI_GATEWAY_API_KEY environment variable."
+                "AI Gateway API key is missing. Please provide it in the config or set the AI_GATEWAY_API_KEY environment variable."
             )
         config["base_url"] = "https://ai-gateway.vercel.sh/v1"
 
