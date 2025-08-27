@@ -40,7 +40,7 @@ class CloseaiProvider(Provider):
     def __init__(self, **config):
         """
         Initialize the CloseAI provider.
-        
+
         Args:
             api_key (str, optional): CloseAI API key. If not provided, will look for CLOSEAI_API_KEY environment variable.
             base_url (str, optional): Base URL for CloseAI API. Defaults to https://api.openai-proxy.org/v1
@@ -50,19 +50,22 @@ class CloseaiProvider(Provider):
         api_key = config.get('api_key') or os.getenv("CLOSEAI_API_KEY")
         if not api_key:
             raise ValueError("CloseAI API key is required. Set CLOSEAI_API_KEY environment variable or pass api_key parameter.")
-        
+
         # Set base URL - CloseAI uses OpenAI-compatible endpoint
         base_url = config.get('base_url', 'https://api.openai-proxy.org/v1')
-        
+
         # Initialize OpenAI client with CloseAI configuration
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
             **{k: v for k, v in config.items() if k not in ['api_key', 'base_url']}
         )
-        
+
         # Track streaming tool calls for accumulation
         self._streaming_tool_calls = {}
+
+        # Map Responses function_call item.id (fc_*) to call_id (call_*) for next-turn outputs
+        self._responses_tool_call_ids: Dict[str, str] = {}
 
     def _supports_reasoning(self, model: str) -> bool:
         """
@@ -213,20 +216,117 @@ class CloseaiProvider(Provider):
         for msg in messages:
             if isinstance(msg, dict):
                 msg_dict = msg.copy()
-                # For multi-turn context, we don't need to extract reasoning items
-                # Just remove reasoning_content from the message as it's not part of the API input
-                if 'reasoning_content' in msg_dict:
-                    msg_dict.pop('reasoning_content')
+                role = msg_dict.get('role')
 
+                # If this message carries Responses raw output via reasoning_content, append it directly
+                rc = msg_dict.get('reasoning_content')
+                raw_output = None
+                if rc is not None:
+                    try:
+                        if hasattr(rc, 'raw_data') and isinstance(rc.raw_data, dict):
+                            raw_output = rc.raw_data.get('output')
+                        elif isinstance(rc, dict):
+                            raw_output = rc.get('raw_data', {}).get('output')
+                    except Exception:
+                        raw_output = None
+                if raw_output:
+                    # Append the exact previous Responses output items (reasoning/message/function_call, etc.)
+                    input_items.extend(raw_output)
+                    # Do not add a separate assistant message to avoid duplication
+                    continue
+
+                # Convert assistant tool_calls into Responses function_call items (Chat-style)
+                if role == 'assistant' and 'tool_calls' in msg_dict and msg_dict['tool_calls']:
+                    # Preserve assistant textual content if present
+                    text = msg_dict.get('content')
+                    if text:
+                        input_items.append({'role': 'assistant', 'content': text})
+                    # Convert each tool_call
+                    for tc in msg_dict['tool_calls']:
+                        fn = tc.get('function', {})
+                        call_id = tc.get('id')
+                        name = fn.get('name')
+                        arguments = fn.get('arguments', '')
+                        input_items.append({
+                            'type': 'function_call',
+                            'call_id': call_id,
+                            'name': name,
+                            'arguments': arguments
+                        })
+                    continue  # Done with this assistant message
+
+                # Convert tool messages into function_call_output items
+                if role == 'tool':
+                    input_items.append({
+                        'type': 'function_call_output',
+                        'call_id': msg_dict.get('tool_call_id'),
+                        'output': msg_dict.get('content', '')
+                    })
+                    continue
+
+                # Skip function role messages (unsupported)
+                if role == 'function':
+                    continue
+
+                # Remove fields that Responses API doesn't support on message objects
+                for field in ['reasoning_content', 'tool_calls', 'tool_call_id']:
+                    msg_dict.pop(field, None)
                 input_items.append(msg_dict)
+
             else:
                 # Handle Message objects
                 if hasattr(msg, 'model_dump'):
                     msg_dict = msg.model_dump()
-                    if 'reasoning_content' in msg_dict:
-                        msg_dict.pop('reasoning_content')
+                    role = msg_dict.get('role')
+
+                    # If this message carries Responses raw output via reasoning_content, append it directly
+                    rc = msg_dict.get('reasoning_content')
+                    raw_output = None
+                    if rc is not None:
+                        try:
+                            if hasattr(rc, 'raw_data') and isinstance(rc.raw_data, dict):
+                                raw_output = rc.raw_data.get('output')
+                            elif isinstance(rc, dict):
+                                raw_output = rc.get('raw_data', {}).get('output')
+                        except Exception:
+                            raw_output = None
+                    if raw_output:
+                        input_items.extend(raw_output)
+                        continue
+
+                    if role == 'assistant' and 'tool_calls' in msg_dict and msg_dict['tool_calls']:
+                        text = msg_dict.get('content')
+                        if text:
+                            input_items.append({'role': 'assistant', 'content': text})
+                        for tc in msg_dict['tool_calls']:
+                            fn = tc.get('function', {})
+                            call_id = tc.get('id')
+                            name = fn.get('name')
+                            arguments = fn.get('arguments', '')
+                            input_items.append({
+                                'type': 'function_call',
+                                'call_id': call_id,
+                                'name': name,
+                                'arguments': arguments
+                            })
+                        continue
+
+                    if role == 'tool':
+                        input_items.append({
+                            'type': 'function_call_output',
+                            'call_id': msg_dict.get('tool_call_id'),
+                            'output': msg_dict.get('content', '')
+                        })
+                        continue
+
+                    if role == 'function':
+                        continue
+
+                    for field in ['reasoning_content', 'tool_calls', 'tool_call_id']:
+                        msg_dict.pop(field, None)
                     input_items.append(msg_dict)
                 else:
+                    # Fallback: append as-is if not a dict-like message
                     input_items.append(msg)
 
         # Note: For CloseAI, we don't need to manually pass reasoning items
@@ -241,6 +341,9 @@ class CloseaiProvider(Provider):
             responses_kwargs['tools'] = self._convert_tools_for_responses_api(responses_kwargs['tools'])
 
         if stream:
+            # Reset streaming tool calls state for Responses API too
+            self._streaming_tool_calls = {}
+
             # For streaming, we need to handle the response differently
             response = await self.client.responses.create(
                 model=model,
@@ -286,6 +389,9 @@ class CloseaiProvider(Provider):
                         'description': function_def.get('description', ''),
                         'parameters': function_def.get('parameters', {})
                     }
+                    # 透传 strict（若用户提供）
+                    if 'strict' in function_def:
+                        converted_tool['strict'] = function_def['strict']
                     converted_tools.append(converted_tool)
                 else:
                     # Keep as is for other formats
@@ -295,6 +401,66 @@ class CloseaiProvider(Provider):
                 converted_tools.append(tool)
 
         return converted_tools
+
+    def _accumulate_responses_tool_calls(self, chunk) -> Optional[List[ChatCompletionMessageToolCall]]:
+        """
+        Accumulate tool call arguments from Responses API streaming events.
+
+        This handles response.function_call_arguments.delta events and builds up
+        the complete tool call arguments incrementally.
+        """
+        if not hasattr(chunk, 'item_id') or not hasattr(chunk, 'delta'):
+            return None
+
+        item_id = chunk.item_id
+        delta = chunk.delta
+
+        # Initialize tool call data if not exists
+        if item_id not in self._streaming_tool_calls:
+            # We need to get the function name from a previous event
+            # For now, we'll initialize with placeholder and update later
+            self._streaming_tool_calls[item_id] = {
+                "id": item_id,
+                "type": "function",
+                "function": {
+                    "name": "",  # Will be filled from response.output_item.added
+                    "arguments": ""
+                }
+            }
+
+        # Accumulate arguments
+        self._streaming_tool_calls[item_id]["function"]["arguments"] += delta
+
+        # Don't return anything yet - wait for completion
+        return None
+
+    def _handle_responses_output_item_added(self, chunk) -> None:
+        """
+        Handle response.output_item.added events to extract function names.
+        """
+        if (hasattr(chunk, 'item') and
+            hasattr(chunk.item, 'type') and
+            chunk.item.type == 'function_call' and
+            hasattr(chunk.item, 'name')):
+
+            # Get function name and ID
+            item_name = chunk.item.name
+            item_id = getattr(chunk.item, 'id', None)
+
+            # Initialize or update tool call data
+            if item_id:
+                if item_id not in self._streaming_tool_calls:
+                    self._streaming_tool_calls[item_id] = {
+                        "id": item_id,
+                        "type": "function",
+                        "function": {
+                            "name": item_name,
+                            "arguments": ""
+                        }
+                    }
+                else:
+                    # Update existing entry with function name
+                    self._streaming_tool_calls[item_id]["function"]["name"] = item_name
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """
@@ -343,7 +509,7 @@ class CloseaiProvider(Provider):
                 stream=True,
                 **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
-            
+
             async def stream_generator():
                 async for chunk in response:
                     if chunk.choices:
@@ -502,43 +668,147 @@ class CloseaiProvider(Provider):
     def _convert_responses_stream_chunk(self, chunk) -> ChatCompletionResponse:
         """
         Convert Responses API streaming chunk to ChatCompletionResponse format.
+
+        Based on OpenAI Responses API streaming documentation:
+        - response.created: Response started
+        - response.output_text.delta: Text content delta (key event for content)
+        - response.function_call_arguments.delta: Function call arguments delta
+        - response.completed: Response finished
         """
         content = None
         reasoning_content = None
         finish_reason = None
+        role = None
+        tool_calls = None
 
-        # Extract content from streaming chunk
-        if hasattr(chunk, 'output') and chunk.output:
-            for item in chunk.output:
-                if hasattr(item, 'type'):
-                    if item.type == 'message' and hasattr(item, 'content'):
-                        for content_item in item.content:
-                            if hasattr(content_item, 'type') and content_item.type == 'output_text':
-                                content = content_item.text
-                                break
-                    elif item.type == 'reasoning' and hasattr(item, 'summary'):
-                        reasoning_text = ""
-                        for summary_item in item.summary:
-                            if hasattr(summary_item, 'text'):
-                                reasoning_text += summary_item.text
-                        if reasoning_text:
-                            reasoning_content = reasoning_text
+        # Handle different event types based on official documentation
+        chunk_type = getattr(chunk, 'type', None)
 
+        if chunk_type == 'response.output_text.delta':
+            # Text delta event - contains the actual content increments
+            if hasattr(chunk, 'delta'):
+                content = chunk.delta
+                role = "assistant"
+
+        elif chunk_type == 'response.output_item.added':
+            # Output item added - set role for message items and handle function calls
+            if hasattr(chunk, 'item'):
+                item = chunk.item
+                if hasattr(item, 'role'):
+                    role = item.role
+                elif hasattr(item, 'type') and item.type == 'message':
+                    role = "assistant"
+                elif hasattr(item, 'type') and item.type == 'function_call':
+                    # Handle function call item added
+                    self._handle_responses_output_item_added(chunk)
+                    role = "assistant"
+
+        elif chunk_type == 'response.function_call_arguments.delta':
+            # Function call arguments delta - handle tool calls streaming
+            if hasattr(chunk, 'delta') and hasattr(chunk, 'item_id'):
+                # Accumulate function call arguments for Responses API
+                tool_calls = self._accumulate_responses_tool_calls(chunk)
+                if tool_calls:
+                    # Return accumulated tool calls when complete
+                    return ChatCompletionResponse(
+                        choices=[
+                            StreamChoice(
+                                index=0,
+                                delta=ChoiceDelta(
+                                    content=None,
+                                    role="assistant",
+                                    tool_calls=tool_calls,
+                                    reasoning_content=None
+                                ),
+                                finish_reason=None
+                            )
+                        ],
+                        metadata={
+                            'id': getattr(chunk, 'response_id', None),
+                            'created': getattr(chunk, 'created', None),
+                            'model': getattr(chunk, 'model', None)
+                        }
+                    )
+
+        elif chunk_type == 'response.function_call_arguments.done':
+            # Function call arguments completed - finalize tool call
+            if hasattr(chunk, 'item_id') and hasattr(chunk, 'arguments'):
+                # Force completion of this tool call
+                item_id = chunk.item_id
+                if item_id in self._streaming_tool_calls:
+                    tool_call_data = self._streaming_tool_calls[item_id]
+                    tool_call_data["function"]["arguments"] = chunk.arguments
+
+                    # Convert to final format
+                    try:
+                        mock_tool_call = type('MockToolCall', (), {
+                            'id': tool_call_data["id"],
+                            'type': tool_call_data["type"],
+                            'function': type('MockFunction', (), {
+                                'name': tool_call_data["function"]["name"],
+                                'arguments': tool_call_data["function"]["arguments"]
+                            })()
+                        })()
+
+                        converted = self._convert_tool_calls([mock_tool_call])
+                        if converted:
+                            # Remove completed tool call
+                            del self._streaming_tool_calls[item_id]
+
+                            return ChatCompletionResponse(
+                                choices=[
+                                    StreamChoice(
+                                        index=0,
+                                        delta=ChoiceDelta(
+                                            content=None,
+                                            role="assistant",
+                                            tool_calls=converted,
+                                            reasoning_content=None
+                                        ),
+                                        finish_reason=None
+                                    )
+                                ],
+                                metadata={
+                                    'id': getattr(chunk, 'response_id', None),
+                                    'created': getattr(chunk, 'created', None),
+                                    'model': getattr(chunk, 'model', None)
+                                }
+                            )
+                    except Exception as e:
+                        # If conversion fails, clean up and continue
+                        if item_id in self._streaming_tool_calls:
+                            del self._streaming_tool_calls[item_id]
+
+        elif chunk_type == 'response.output_item.done':
+            # Output item completed
+            if hasattr(chunk, 'item') and hasattr(chunk.item, 'status'):
+                if chunk.item.status == 'completed':
+                    finish_reason = 'stop'
+
+        elif chunk_type in ['response.completed', 'response.done']:
+            # Response completed
+            finish_reason = 'stop'
+
+        elif chunk_type == 'error':
+            # Error occurred
+            finish_reason = 'error'
+
+        # Return streaming chunk - only include non-None values to avoid overwriting
         return ChatCompletionResponse(
             choices=[
                 StreamChoice(
                     index=0,
                     delta=ChoiceDelta(
                         content=content,
-                        role="assistant",
-                        tool_calls=None,
+                        role=role,
+                        tool_calls=tool_calls,
                         reasoning_content=reasoning_content
                     ),
                     finish_reason=finish_reason
                 )
             ],
             metadata={
-                'id': getattr(chunk, 'id', None),
+                'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'item_id', None),
                 'created': getattr(chunk, 'created', None),
                 'model': getattr(chunk, 'model', None)
             }
