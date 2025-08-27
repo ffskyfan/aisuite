@@ -392,6 +392,14 @@ class CloseaiProvider(Provider):
                     # 透传 strict（若用户提供）
                     if 'strict' in function_def:
                         converted_tool['strict'] = function_def['strict']
+                        # 若 strict 为 True，自动补充 additionalProperties=false 以满足严格模式要求
+                        try:
+                            params = converted_tool.get('parameters') or {}
+                            if function_def['strict'] and isinstance(params, dict) and 'additionalProperties' not in params:
+                                params['additionalProperties'] = False
+                                converted_tool['parameters'] = params
+                        except Exception:
+                            pass
                     converted_tools.append(converted_tool)
                 else:
                     # Keep as is for other formats
