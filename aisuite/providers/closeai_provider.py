@@ -373,15 +373,14 @@ class CloseaiProvider(Provider):
         """
         Convert tools from Chat Completions format to Responses API format.
 
-        Based on the error, Responses API still needs the 'type' field but with different structure.
-        Let's try to keep the original format but ensure all required fields are present.
+        Responses API expects tools in a flattened format without the nested 'function' structure.
         """
         converted_tools = []
-
+        
         for tool in tools:
             if isinstance(tool, dict):
                 if tool.get('type') == 'function' and 'function' in tool:
-                    # Keep the original format but ensure all required fields
+                    # Flatten the structure for Responses API
                     function_def = tool['function']
                     converted_tool = {
                         'type': 'function',
@@ -389,17 +388,9 @@ class CloseaiProvider(Provider):
                         'description': function_def.get('description', ''),
                         'parameters': function_def.get('parameters', {})
                     }
-                    # 透传 strict（若用户提供）
+                    # Pass through strict mode if present
                     if 'strict' in function_def:
                         converted_tool['strict'] = function_def['strict']
-                        # 若 strict 为 True，自动补充 additionalProperties=false 以满足严格模式要求
-                        try:
-                            params = converted_tool.get('parameters') or {}
-                            if function_def['strict'] and isinstance(params, dict) and 'additionalProperties' not in params:
-                                params['additionalProperties'] = False
-                                converted_tool['parameters'] = params
-                        except Exception:
-                            pass
                     converted_tools.append(converted_tool)
                 else:
                     # Keep as is for other formats
@@ -407,7 +398,7 @@ class CloseaiProvider(Provider):
             else:
                 # Non-dict tool, keep as is
                 converted_tools.append(tool)
-
+        
         return converted_tools
 
     def _accumulate_responses_tool_calls(self, chunk) -> Optional[List[ChatCompletionMessageToolCall]]:
@@ -612,11 +603,12 @@ class CloseaiProvider(Provider):
                 if hasattr(item, 'type'):
                     if item.type == 'message':
                         # Extract message content if we don't have it yet
-                        if not message_content and hasattr(item, 'content') and item.content:
+                        if hasattr(item, 'content') and item.content:
                             for content_item in item.content:
                                 if hasattr(content_item, 'type') and content_item.type == 'output_text':
-                                    message_content = content_item.text
-                                    break
+                                    if hasattr(content_item, 'text'):
+                                        message_content = content_item.text
+                                        break
                         # Get finish reason
                         if hasattr(item, 'status'):
                             finish_reason = "stop" if item.status == "completed" else "incomplete"
@@ -651,6 +643,10 @@ class CloseaiProvider(Provider):
                                 }
                             )
 
+        # Ensure content is never None for compatibility
+        if message_content is None:
+            message_content = ""
+        
         return ChatCompletionResponse(
             choices=[
                 Choice(
@@ -658,7 +654,7 @@ class CloseaiProvider(Provider):
                     message=Message(
                         content=message_content,
                         role="assistant",
-                        tool_calls=None,  # TODO: Handle tool calls in Responses API
+                        tool_calls=self._extract_tool_calls_from_responses(response),
                         refusal=None,
                         reasoning_content=reasoning_content
                     ),
@@ -986,6 +982,32 @@ class CloseaiProvider(Provider):
 
         return complete_tool_calls if complete_tool_calls else None
 
+    def _extract_tool_calls_from_responses(self, response) -> Optional[List[ChatCompletionMessageToolCall]]:
+        """Extract tool calls from Responses API response."""
+        tool_calls = []
+        
+        if hasattr(response, 'output') and response.output:
+            for item in response.output:
+                if hasattr(item, 'type') and item.type == 'function_call':
+                    # Extract function call details
+                    call_id = getattr(item, 'id', None) or getattr(item, 'call_id', None)
+                    name = getattr(item, 'name', None)
+                    arguments = getattr(item, 'arguments', '')
+                    
+                    if call_id and name:
+                        function = Function(
+                            name=name,
+                            arguments=arguments
+                        )
+                        tool_call_obj = ChatCompletionMessageToolCall(
+                            id=call_id,
+                            function=function,
+                            type="function"
+                        )
+                        tool_calls.append(tool_call_obj)
+        
+        return tool_calls if tool_calls else None
+    
     def _convert_tool_calls(self, tool_calls):
         """Convert tool calls to the framework's format."""
         if not tool_calls:

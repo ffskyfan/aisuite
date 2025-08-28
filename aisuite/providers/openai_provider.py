@@ -257,8 +257,23 @@ class OpenaiProvider(Provider):
                 stream=False,
                 **responses_kwargs
             )
-            # 非流式：直接用 output_text + 备选解析
+            # 非流式：提取content和reasoning
             content = getattr(resp, 'output_text', None)
+            reasoning_content = None
+            
+            # 提取reasoning content
+            if hasattr(resp, 'reasoning_items') and resp.reasoning_items:
+                reasoning_content = ReasoningContent(
+                    thinking="[推理内容已加密，暂未提供摘要]",
+                    provider="openai",
+                    raw_data={
+                        'reasoning_items': resp.reasoning_items,
+                        'output': resp.output if hasattr(resp, 'output') else None,
+                        'response_id': getattr(resp, 'id', None)
+                    }
+                )
+            
+            # 更完整的content提取
             if not content and hasattr(resp, 'output') and resp.output:
                 for item in resp.output:
                     if getattr(item, 'type', None) == 'message' and getattr(item, 'content', None):
@@ -268,9 +283,20 @@ class OpenaiProvider(Provider):
                                 break
                         if content:
                             break
+            
+            # 确保content不为None（GPT-5有时返回None）
+            if content is None:
+                content = ""
+            
             return ChatCompletionResponse(
                 choices=[
-                    Choice(index=0, message=Message(content=content, role='assistant', tool_calls=None, refusal=None, reasoning_content=None), finish_reason='stop')
+                    Choice(index=0, message=Message(
+                        content=content, 
+                        role='assistant', 
+                        tool_calls=None, 
+                        refusal=None, 
+                        reasoning_content=reasoning_content
+                    ), finish_reason='stop')
                 ],
                 metadata={'id': getattr(resp, 'id', None), 'model': getattr(resp, 'model', None)}
             )

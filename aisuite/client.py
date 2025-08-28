@@ -1,6 +1,9 @@
 from .provider import ProviderFactory
 import os
+import asyncio
+import inspect
 from .utils.tools import Tools
+from .framework.message_normalizer import MessageNormalizer
 
 
 class Client:
@@ -82,6 +85,98 @@ class Chat:
 class Completions:
     def __init__(self, client: "Client"):
         self.client = client
+        self._loop = None
+    
+    def _get_event_loop(self):
+        """Get or create an event loop for running async code"""
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're already in an async context, we can't use run_until_complete
+            return None
+        except RuntimeError:
+            # No running loop, we can create one
+            if self._loop is None:
+                self._loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._loop)
+            return self._loop
+    
+    def _run_async(self, coro):
+        """Run an async coroutine synchronously"""
+        loop = self._get_event_loop()
+        if loop is None:
+            # We're already in an async context, can't run synchronously
+            # This should be handled by making the entire create method async
+            raise RuntimeError("Cannot run async provider in existing event loop. Use async client instead.")
+        return loop.run_until_complete(coro)
+    
+    def _wrap_async_generator(self, async_gen):
+        """Wrap an async generator to make it synchronously iterable"""
+        import asyncio
+        
+        # Create a new event loop for this generator if needed
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're in an async context already, can't wrap
+            raise RuntimeError("Cannot wrap async generator in existing event loop")
+        except RuntimeError:
+            # No running loop, we can create one
+            loop = asyncio.new_event_loop()
+            
+        class AsyncGenWrapper:
+            def __init__(self, agen, loop):
+                self.agen = agen
+                self.loop = loop
+                
+            def __iter__(self):
+                return self
+                
+            def __next__(self):
+                try:
+                    # Run the async generator's __anext__ method synchronously
+                    coro = self.agen.__anext__()
+                    chunk = self.loop.run_until_complete(coro)
+                    return chunk
+                except StopAsyncIteration:
+                    raise StopIteration
+                    
+        return AsyncGenWrapper(async_gen, loop)
+    
+    def _wrap_streaming_coroutine(self, coro):
+        """Wrap a coroutine that returns an async generator for streaming"""
+        import asyncio
+        
+        # Get or create event loop
+        try:
+            loop = asyncio.get_running_loop()
+            raise RuntimeError("Cannot wrap streaming coroutine in existing event loop")
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            
+        class StreamingCoroutineWrapper:
+            def __init__(self, coro, loop):
+                self.coro = coro
+                self.loop = loop
+                self.async_gen = None
+                
+            def __iter__(self):
+                return self
+                
+            def __next__(self):
+                if self.async_gen is None:
+                    # First call - await the coroutine to get the async generator
+                    async def get_generator():
+                        return await self.coro
+                    self.async_gen = self.loop.run_until_complete(get_generator())
+                    
+                try:
+                    # Get next item from the async generator
+                    coro = self.async_gen.__anext__()
+                    chunk = self.loop.run_until_complete(coro)
+                    return chunk
+                except StopAsyncIteration:
+                    raise StopIteration
+                    
+        return StreamingCoroutineWrapper(coro, loop)
 
     def _extract_thinking_content(self, response):
         """
@@ -152,6 +247,11 @@ class Completions:
         while turns < max_turns:
             # Make the API call
             response = provider.chat_completions_create(model_name, messages, **kwargs)
+            
+            # Handle async providers
+            if inspect.iscoroutine(response):
+                response = self._run_async(response)
+            
             response = self._extract_thinking_content(response)
 
             # Store intermediate response
@@ -226,6 +326,9 @@ class Completions:
         if not provider:
             raise ValueError(f"Could not load provider for '{provider_key}'.")
 
+        # Normalize messages for the target provider/model (use full model string for better detection)
+        normalized_messages = MessageNormalizer.normalize_messages(messages, model)
+
         # Extract tool-related parameters
         max_turns = kwargs.pop("max_turns", None)
         tools = kwargs.get("tools", None)
@@ -235,13 +338,30 @@ class Completions:
             return self._tool_runner(
                 provider,
                 model_name,
-                messages.copy(),
+                normalized_messages.copy(),
                 tools,
                 max_turns,
             )
 
         # Default behavior without tool execution
         # Delegate the chat completion to the correct provider's implementation
-        return provider.chat_completions_create(model_name, messages, stream=stream, **kwargs)
+        result = provider.chat_completions_create(model_name, normalized_messages, stream=stream, **kwargs)
+        
+        
+        # Check if result is a coroutine (async function)
+        if inspect.iscoroutine(result):
+            if stream:
+                # For streaming, we need special handling
+                # The coroutine, when awaited, returns an async generator
+                return self._wrap_streaming_coroutine(result)
+            else:
+                # Non-streaming, run the coroutine normally
+                result = self._run_async(result)
+        # Check if result is already an async generator
+        elif inspect.isasyncgen(result):
+            # Create a wrapper that converts async generator to sync
+            return self._wrap_async_generator(result)
+        
+        return result
         #return self._extract_thinking_content(response)
 
