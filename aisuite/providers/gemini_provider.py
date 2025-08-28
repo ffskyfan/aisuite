@@ -261,9 +261,64 @@ class GeminiProvider(Provider):
 
         return gemini_tools
     
+    def _preprocess_messages_for_gemini(self, messages: list) -> list:
+        """
+        Preprocess messages to ensure compatibility with Gemini's strict message ordering requirements.
+        
+        Gemini requires that function calls (assistant messages with tool_calls) must come 
+        immediately after either:
+        - A user message
+        - A tool/function response message
+        
+        This method reorganizes messages to meet these requirements when switching from other models.
+        """
+        if not messages:
+            return messages
+        
+        processed = []
+        i = 0
+        
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get("role")
+            
+            # Check if this is a problematic sequence: assistant (without tool_calls) -> user
+            if (role == "assistant" and 
+                "tool_calls" not in msg and 
+                i + 1 < len(messages) and 
+                messages[i + 1].get("role") == "user"):
+                
+                # Look ahead to see if there's a tool interaction pattern
+                # If the previous message was a tool response, we might need to consolidate
+                if i > 0 and messages[i - 1].get("role") == "tool":
+                    # This is a pattern: tool -> assistant (summary) -> user
+                    # We can merge the assistant summary into the next user message
+                    next_user = messages[i + 1].copy()
+                    assistant_content = msg.get("content", "")
+                    
+                    # Add context about the previous assistant response
+                    if assistant_content:
+                        # Prepend the assistant's summary to the user message
+                        original_content = next_user.get("content", "")
+                        next_user["content"] = f"[Assistant's previous response: {assistant_content}]\n\n{original_content}"
+                    
+                    # Skip the problematic assistant message
+                    i += 1  # Skip assistant
+                    processed.append(next_user)
+                    i += 1  # Move past user message
+                    continue
+            
+            # For other messages, add them as-is
+            processed.append(msg)
+            i += 1
+        
+        return processed
     
     async def chat_completions_create(self, model: str, messages: list, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion (single-turn or streaming) using a Gemini model."""
+        # Preprocess messages to ensure Gemini compatibility
+        messages = self._preprocess_messages_for_gemini(messages)
+        
         # Determine if streaming
         stream = kwargs.get("stream", False)
         if "stream" in kwargs:
