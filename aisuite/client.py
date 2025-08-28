@@ -348,19 +348,36 @@ class Completions:
         result = provider.chat_completions_create(model_name, normalized_messages, stream=stream, **kwargs)
         
         
-        # Check if result is a coroutine (async function)
+        # Check if we're in an async context first
+        try:
+            asyncio.get_running_loop()
+            is_async_context = True
+        except RuntimeError:
+            is_async_context = False
+        
+        # Handle coroutines
         if inspect.iscoroutine(result):
-            if stream:
-                # For streaming, we need special handling
-                # The coroutine, when awaited, returns an async generator
-                return self._wrap_streaming_coroutine(result)
+            if is_async_context:
+                # We're in an async context, return the coroutine as-is
+                # The caller will handle the await
+                return result
             else:
-                # Non-streaming, run the coroutine normally
-                result = self._run_async(result)
-        # Check if result is already an async generator
+                # We're not in an async context, need to wrap/run
+                if stream:
+                    # For streaming, we need special handling
+                    # The coroutine, when awaited, returns an async generator
+                    return self._wrap_streaming_coroutine(result)
+                else:
+                    # Non-streaming, run the coroutine normally
+                    result = self._run_async(result)
+        # Handle async generators
         elif inspect.isasyncgen(result):
-            # Create a wrapper that converts async generator to sync
-            return self._wrap_async_generator(result)
+            if is_async_context:
+                # In async context, return as-is
+                return result
+            else:
+                # In sync context, wrap it
+                return self._wrap_async_generator(result)
         
         return result
         #return self._extract_thinking_content(response)
