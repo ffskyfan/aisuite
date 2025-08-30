@@ -12,7 +12,7 @@ from google.genai import types
 class GeminiMessageConverter:
 
     @staticmethod
-    def to_gemini_request(self, conversation):
+    def to_gemini_request(conversation):
         """
         Convert AISuite conversation (list of messages) to Gemini API request format.
         """
@@ -102,7 +102,7 @@ class GeminiMessageConverter:
 
             # Combine reasoning parts if any
             if reasoning_text_parts:
-                reasoning_content = self._convert_reasoning_content("".join(reasoning_text_parts), response.candidates[0].content.parts)
+                reasoning_content = "".join(reasoning_text_parts)
 
             # Use combined content text or fallback to response.text
             if content_text_parts:
@@ -313,54 +313,15 @@ class GeminiProvider(Provider):
             i += 1
         
         return processed
-    
+
+
+
     async def chat_completions_create(self, model: str, messages: list, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion (single-turn or streaming) using a Gemini model."""
-
-        # 添加日志：记录原始输入消息
-        print(f"[GEMINI_DEBUG] ===== 原始输入消息 =====")
-        print(f"[GEMINI_DEBUG] 消息数量: {len(messages)}")
-        for i, msg in enumerate(messages):
-            role = msg.get('role', 'unknown')
-            content = msg.get('content', '')
-            tool_calls = msg.get('tool_calls')
-            tool_call_id = msg.get('tool_call_id')
-            reasoning_content = msg.get('reasoning_content')
-
-            print(f"[GEMINI_DEBUG] 消息[{i}]: role={role}")
-            print(f"[GEMINI_DEBUG]   content: {content[:100]}{'...' if len(str(content)) > 100 else ''}")
-            if tool_calls:
-                print(f"[GEMINI_DEBUG]   tool_calls: {len(tool_calls)} 个")
-                for j, tc in enumerate(tool_calls):
-                    tc_id = tc.get('id', 'no_id') if isinstance(tc, dict) else getattr(tc, 'id', 'no_id')
-                    tc_name = tc.get('function', {}).get('name', 'no_name') if isinstance(tc, dict) else getattr(tc, 'function', {}).get('name', 'no_name')
-                    print(f"[GEMINI_DEBUG]     [{j}] id={tc_id}, name={tc_name}")
-            if tool_call_id:
-                print(f"[GEMINI_DEBUG]   tool_call_id: {tool_call_id}")
-            if reasoning_content:
-                print(f"[GEMINI_DEBUG]   reasoning_content: 存在")
-        print(f"[GEMINI_DEBUG] ========================")
 
         # Preprocess messages to ensure Gemini compatibility
         messages = self._preprocess_messages_for_gemini(messages)
 
-        # 添加日志：记录预处理后的消息
-        print(f"[GEMINI_DEBUG] ===== 预处理后消息 =====")
-        print(f"[GEMINI_DEBUG] 消息数量: {len(messages)}")
-        for i, msg in enumerate(messages):
-            role = msg.get('role', 'unknown')
-            content = msg.get('content', '')
-            tool_calls = msg.get('tool_calls')
-            tool_call_id = msg.get('tool_call_id')
-
-            print(f"[GEMINI_DEBUG] 消息[{i}]: role={role}")
-            print(f"[GEMINI_DEBUG]   content: {content[:100]}{'...' if len(str(content)) > 100 else ''}")
-            if tool_calls:
-                print(f"[GEMINI_DEBUG]   tool_calls: {len(tool_calls)} 个")
-            if tool_call_id:
-                print(f"[GEMINI_DEBUG]   tool_call_id: {tool_call_id}")
-        print(f"[GEMINI_DEBUG] ========================")
-        
         # Determine if streaming
         stream = kwargs.get("stream", False)
         if "stream" in kwargs:
@@ -502,23 +463,7 @@ class GeminiProvider(Provider):
                     # Skip unknown message types
                     continue
 
-        # 添加日志：记录转换为 Gemini 格式后的消息
-        print(f"[GEMINI_DEBUG] ===== 转换为Gemini格式后 =====")
-        print(f"[GEMINI_DEBUG] history_msgs数量: {len(history_msgs)}")
-        print(f"[GEMINI_DEBUG] last_user_message: {last_user_message}")
-        for i, content in enumerate(history_msgs):
-            print(f"[GEMINI_DEBUG] Content[{i}]: role={content.role}")
-            print(f"[GEMINI_DEBUG]   parts数量: {len(content.parts)}")
-            for j, part in enumerate(content.parts):
-                if hasattr(part, 'text') and part.text:
-                    print(f"[GEMINI_DEBUG]     Part[{j}]: text={part.text[:100]}{'...' if len(part.text) > 100 else ''}")
-                elif hasattr(part, 'function_call') and part.function_call:
-                    print(f"[GEMINI_DEBUG]     Part[{j}]: function_call={part.function_call.name}")
-                elif hasattr(part, 'function_response') and part.function_response:
-                    print(f"[GEMINI_DEBUG]     Part[{j}]: function_response={part.function_response.name}")
-                else:
-                    print(f"[GEMINI_DEBUG]     Part[{j}]: 其他类型")
-        print(f"[GEMINI_DEBUG] ========================")
+
 
         # Create a new chat session with history and config (if any)
         chat = self.client.chats.create(model=model_id, config=config, history=history_msgs if history_msgs else None)
@@ -586,22 +531,9 @@ class GeminiProvider(Provider):
                                 part = types.Part.from_text(text=msg["content"])
                                 contents.append(types.Content(role=gemini_role, parts=[part]))
 
-                # 添加日志：记录流式处理的 contents
-                print(f"[GEMINI_DEBUG] ===== 流式处理Contents =====")
-                print(f"[GEMINI_DEBUG] contents数量: {len(contents)}")
-                for i, content in enumerate(contents):
-                    print(f"[GEMINI_DEBUG] Content[{i}]: role={content.role}")
-                    print(f"[GEMINI_DEBUG]   parts数量: {len(content.parts)}")
-                    for j, part in enumerate(content.parts):
-                        if hasattr(part, 'text') and part.text:
-                            print(f"[GEMINI_DEBUG]     Part[{j}]: text={part.text[:100]}{'...' if len(part.text) > 100 else ''}")
-                        elif hasattr(part, 'function_call') and part.function_call:
-                            print(f"[GEMINI_DEBUG]     Part[{j}]: function_call={part.function_call.name}")
-                        elif hasattr(part, 'function_response') and part.function_response:
-                            print(f"[GEMINI_DEBUG]     Part[{j}]: function_response={part.function_response.name}")
-                        else:
-                            print(f"[GEMINI_DEBUG]     Part[{j}]: 其他类型")
-                print(f"[GEMINI_DEBUG] ========================")
+
+
+
 
                 # Use streaming generation
                 async def stream_generator():
@@ -717,22 +649,9 @@ class GeminiProvider(Provider):
                                 part = types.Part.from_text(text=msg["content"])
                                 contents.append(types.Content(role=gemini_role, parts=[part]))
 
-                # 添加日志：记录非流式处理的 contents
-                print(f"[GEMINI_DEBUG] ===== 非流式处理Contents =====")
-                print(f"[GEMINI_DEBUG] contents数量: {len(contents)}")
-                for i, content in enumerate(contents):
-                    print(f"[GEMINI_DEBUG] Content[{i}]: role={content.role}")
-                    print(f"[GEMINI_DEBUG]   parts数量: {len(content.parts)}")
-                    for j, part in enumerate(content.parts):
-                        if hasattr(part, 'text') and part.text:
-                            print(f"[GEMINI_DEBUG]     Part[{j}]: text={part.text[:100]}{'...' if len(part.text) > 100 else ''}")
-                        elif hasattr(part, 'function_call') and part.function_call:
-                            print(f"[GEMINI_DEBUG]     Part[{j}]: function_call={part.function_call.name}")
-                        elif hasattr(part, 'function_response') and part.function_response:
-                            print(f"[GEMINI_DEBUG]     Part[{j}]: function_response={part.function_response.name}")
-                        else:
-                            print(f"[GEMINI_DEBUG]     Part[{j}]: 其他类型")
-                print(f"[GEMINI_DEBUG] ========================")
+
+
+
 
                 response = self.client.models.generate_content(
                     model=model_id,
