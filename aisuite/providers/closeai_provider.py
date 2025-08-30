@@ -6,6 +6,7 @@ from openai import AsyncOpenAI
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ReasoningContent, ChatCompletionMessageToolCall, Function
+from aisuite.framework.stop_reason import stop_reason_manager
 
 
 class CloseaiProvider(Provider):
@@ -66,6 +67,47 @@ class CloseaiProvider(Provider):
 
         # Map Responses function_call item.id (fc_*) to call_id (call_*) for next-turn outputs
         self._responses_tool_call_ids: Dict[str, str] = {}
+
+    def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
+        """Create StopInfo from OpenAI-compatible finish_reason."""
+        if not finish_reason:
+            return None
+
+        # Analyze choice data to determine content presence
+        has_content = False
+        content_length = 0
+        tool_calls_count = 0
+
+        if choice_data:
+            # Check message content
+            message = choice_data.get("message") or choice_data.get("delta")
+            if message:
+                content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else None)
+                if content:
+                    has_content = True
+                    content_length = len(content)
+
+                # Check tool calls
+                tool_calls = getattr(message, "tool_calls", None) or (message.get("tool_calls") if isinstance(message, dict) else None)
+                if tool_calls:
+                    tool_calls_count = len(tool_calls)
+                    if tool_calls_count > 0:
+                        has_content = True  # Tool calls count as content
+
+        metadata = {
+            "has_content": has_content,
+            "content_length": content_length,
+            "tool_calls_count": tool_calls_count,
+            "finish_reason": finish_reason,
+            "model": model,
+            "provider": "closeai"
+        }
+
+        # Use OpenAI mapping since CloseAI is OpenAI-compatible, but preserve CloseAI provider identity
+        stop_info = stop_reason_manager.map_stop_reason("openai", finish_reason, metadata)
+        # Override provider in metadata to correctly identify as CloseAI
+        stop_info.metadata["provider"] = "closeai"
+        return stop_info
 
     def _supports_reasoning(self, model: str) -> bool:
         """
@@ -512,20 +554,29 @@ class CloseaiProvider(Provider):
             async def stream_generator():
                 async for chunk in response:
                     if chunk.choices:
+                        # Create choices with stop_info
+                        choices = []
+                        for choice in chunk.choices:
+                            # Create stop_info if finish_reason is present
+                            stop_info = None
+                            if choice.finish_reason:
+                                choice_data = {"delta": choice.delta}
+                                stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
+
+                            choices.append(StreamChoice(
+                                index=choice.index,
+                                delta=ChoiceDelta(
+                                    content=choice.delta.content,
+                                    role=choice.delta.role,
+                                    tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
+                                    reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # Keep original format in streaming
+                                ),
+                                finish_reason=choice.finish_reason,
+                                stop_info=stop_info
+                            ))
+
                         yield ChatCompletionResponse(
-                            choices=[
-                                StreamChoice(
-                                    index=choice.index,
-                                    delta=ChoiceDelta(
-                                        content=choice.delta.content,
-                                        role=choice.delta.role,
-                                        tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
-                                        reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # Keep original format in streaming
-                                    ),
-                                    finish_reason=choice.finish_reason
-                                )
-                                for choice in chunk.choices
-                            ],
+                            choices=choices,
                             metadata={
                                 'id': chunk.id,
                                 'created': chunk.created,
@@ -557,21 +608,28 @@ class CloseaiProvider(Provider):
                 stream=False,
                 **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
+            # Create choices with stop_info
+            choices = []
+            for choice in response.choices:
+                # Create stop_info
+                choice_data = {"message": choice.message}
+                stop_info = self._create_stop_info(choice.finish_reason, choice_data, response.model)
+
+                choices.append(Choice(
+                    index=choice.index,
+                    message=Message(
+                        content=choice.message.content,
+                        role=choice.message.role,
+                        tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
+                        refusal=None,
+                        reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
+                    ),
+                    finish_reason=choice.finish_reason,
+                    stop_info=stop_info
+                ))
+
             return ChatCompletionResponse(
-                choices=[
-                    Choice(
-                        index=choice.index,
-                        message=Message(
-                            content=choice.message.content,
-                            role=choice.message.role,
-                            tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
-                            refusal=None,
-                            reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
-                        ),
-                        finish_reason=choice.finish_reason
-                    )
-                    for choice in response.choices
-                ],
+                choices=choices,
                 metadata={
                     "id": response.id,
                     "created": response.created,
@@ -646,7 +704,16 @@ class CloseaiProvider(Provider):
         # Ensure content is never None for compatibility
         if message_content is None:
             message_content = ""
-        
+
+        # Create stop_info for Responses API
+        choice_data = {
+            "message": {
+                "content": message_content,
+                "tool_calls": self._extract_tool_calls_from_responses(response)
+            }
+        }
+        stop_info = self._create_stop_info(finish_reason, choice_data, getattr(response, 'model', None))
+
         return ChatCompletionResponse(
             choices=[
                 Choice(
@@ -658,7 +725,8 @@ class CloseaiProvider(Provider):
                         refusal=None,
                         reasoning_content=reasoning_content
                     ),
-                    finish_reason=finish_reason
+                    finish_reason=finish_reason,
+                    stop_info=stop_info
                 )
             ],
             metadata={
@@ -724,7 +792,8 @@ class CloseaiProvider(Provider):
                                     tool_calls=tool_calls,
                                     reasoning_content=None
                                 ),
-                                finish_reason=None
+                                finish_reason=None,
+                                stop_info=None  # No stop_info for intermediate tool call chunks
                             )
                         ],
                         metadata={
@@ -769,7 +838,8 @@ class CloseaiProvider(Provider):
                                             tool_calls=converted,
                                             reasoning_content=None
                                         ),
-                                        finish_reason=None
+                                        finish_reason=None,
+                                        stop_info=None  # No stop_info for intermediate tool call chunks
                                     )
                                 ],
                                 metadata={
@@ -797,6 +867,17 @@ class CloseaiProvider(Provider):
             # Error occurred
             finish_reason = 'error'
 
+        # Create stop_info if finish_reason is present
+        stop_info = None
+        if finish_reason:
+            choice_data = {
+                "delta": {
+                    "content": content,
+                    "tool_calls": tool_calls
+                }
+            }
+            stop_info = self._create_stop_info(finish_reason, choice_data, getattr(chunk, 'model', None))
+
         # Return streaming chunk - only include non-None values to avoid overwriting
         return ChatCompletionResponse(
             choices=[
@@ -808,7 +889,8 @@ class CloseaiProvider(Provider):
                         tool_calls=tool_calls,
                         reasoning_content=reasoning_content
                     ),
-                    finish_reason=finish_reason
+                    finish_reason=finish_reason,
+                    stop_info=stop_info
                 )
             ],
             metadata={

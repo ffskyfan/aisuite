@@ -34,7 +34,11 @@ class StopReason(Enum):
     # Safety/Content
     SAFETY_REFUSAL = "safety_refusal"       # Safety refusal
     CONTENT_FILTER = "content_filter"       # Content filtered
-    
+    LANGUAGE_UNSUPPORTED = "language_unsupported"  # Unsupported language
+
+    # Tool/Function Call Issues
+    TOOL_CALL_ERROR = "tool_call_error"     # Tool call error
+
     # Error
     ERROR = "error"                         # Model/request error
     UNKNOWN = "unknown"                     # Unknown reason
@@ -125,13 +129,13 @@ class AnthropicStopMapper(ProviderStopMapper):
 
 class OpenAIStopMapper(ProviderStopMapper):
     """OpenAI stop reason mapper"""
-    
+
     def __init__(self):
         super().__init__("openai")
-    
+
     def map_stop_reason(self, original_reason: str, metadata: Dict[str, Any]) -> StopInfo:
-        """Map OpenAI stop reasons to standardized format"""
-        
+        """Map OpenAI finish_reason to standardized format"""
+
         if original_reason == "stop":
             return self._create_stop_info(
                 StopReason.COMPLETE, original_reason, metadata
@@ -142,14 +146,14 @@ class OpenAIStopMapper(ProviderStopMapper):
                 StopReason.LENGTH_LIMIT, original_reason, metadata
             )
 
-        elif original_reason in ["function_call", "tool_calls"]:
+        elif original_reason in ["tool_calls", "function_call"]:
             return self._create_stop_info(
                 StopReason.TOOL_CALL, original_reason, metadata
             )
 
         elif original_reason == "content_filter":
             return self._create_stop_info(
-                StopReason.CONTENT_FILTER, original_reason, metadata
+                StopReason.SAFETY_REFUSAL, original_reason, metadata
             )
 
         else:
@@ -157,6 +161,60 @@ class OpenAIStopMapper(ProviderStopMapper):
             return self._create_stop_info(
                 StopReason.UNKNOWN, original_reason, metadata
             )
+
+
+class GeminiStopMapper(ProviderStopMapper):
+    """Google Gemini stop reason mapper"""
+
+    def __init__(self):
+        super().__init__("gemini")
+
+    def map_stop_reason(self, original_reason: str, metadata: Dict[str, Any]) -> StopInfo:
+        """Map Gemini finish_reason to standardized format"""
+
+        if original_reason == "STOP":
+            return self._create_stop_info(
+                StopReason.COMPLETE, original_reason, metadata
+            )
+
+        elif original_reason == "MAX_TOKENS":
+            return self._create_stop_info(
+                StopReason.LENGTH_LIMIT, original_reason, metadata
+            )
+
+        elif original_reason in ["SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"]:
+            return self._create_stop_info(
+                StopReason.SAFETY_REFUSAL, original_reason, metadata
+            )
+
+        elif original_reason == "RECITATION":
+            return self._create_stop_info(
+                StopReason.CONTENT_FILTER, original_reason, metadata
+            )
+
+        elif original_reason == "LANGUAGE":
+            return self._create_stop_info(
+                StopReason.LANGUAGE_UNSUPPORTED, original_reason, metadata
+            )
+
+        elif original_reason in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"]:
+            return self._create_stop_info(
+                StopReason.TOOL_CALL_ERROR, original_reason, metadata
+            )
+
+        elif original_reason in ["OTHER", "FINISH_REASON_UNSPECIFIED"]:
+            return self._create_stop_info(
+                StopReason.UNKNOWN, original_reason, metadata
+            )
+
+        else:
+            logger.warning(f"Unknown Gemini stop reason: {original_reason}")
+            return self._create_stop_info(
+                StopReason.UNKNOWN, original_reason, metadata
+            )
+
+
+
 
 
 class StopReasonManager:
@@ -170,6 +228,7 @@ class StopReasonManager:
         """Register default provider mappers"""
         self.register_mapper("anthropic", AnthropicStopMapper())
         self.register_mapper("openai", OpenAIStopMapper())
+        self.register_mapper("gemini", GeminiStopMapper())
     
     def register_mapper(self, provider_name: str, mapper: ProviderStopMapper):
         """Register a provider-specific mapper"""

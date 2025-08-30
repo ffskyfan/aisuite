@@ -3,7 +3,8 @@ import json
 from typing import AsyncGenerator, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
-from aisuite.provider import Provider 
+from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.provider import Provider
 
 # Import Google GenAI SDK
 from google import genai
@@ -108,6 +109,32 @@ class GeminiMessageConverter:
             if content_text_parts:
                 content = "".join(content_text_parts)
 
+        # Get finish_reason for stop_info creation
+        finish_reason = response.candidates[0].finish_reason if response.candidates else None
+
+        # Create stop_info (we need to import stop_reason_manager at the top level)
+        stop_info = None
+        if finish_reason:
+            choice_data = {
+                "content": {
+                    "parts": [{"text": content}] if content else []
+                }
+            }
+            # Add tool calls to choice_data if present
+            if tool_calls:
+                choice_data["content"]["parts"].extend([{"functionCall": tc} for tc in tool_calls])
+
+            # Import stop_reason_manager here to avoid circular imports
+            from aisuite.framework.stop_reason import stop_reason_manager
+            stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, {
+                "has_content": bool(content or tool_calls),
+                "content_length": len(content) if content else 0,
+                "tool_calls_count": len(tool_calls) if tool_calls else 0,
+                "finish_reason": finish_reason,
+                "model": response.model_version,
+                "provider": "gemini"
+            })
+
         # 创建 ChatCompletionResponse 对象
         return ChatCompletionResponse(
             choices=[
@@ -120,7 +147,8 @@ class GeminiMessageConverter:
                         refusal=None,
                         reasoning_content=reasoning_content
                     ),  # 使用 Message 对象包装响应内容
-                    finish_reason=response.candidates[0].finish_reason if response.candidates else None
+                    finish_reason=finish_reason,
+                    stop_info=stop_info
                 )
             ],
             metadata={
@@ -175,6 +203,42 @@ class GeminiProvider(Provider):
 
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
+
+    def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
+        """Create StopInfo from Gemini finish_reason."""
+        if not finish_reason:
+            return None
+
+        # Analyze choice data to determine content presence
+        has_content = False
+        content_length = 0
+        tool_calls_count = 0
+
+        if choice_data:
+            # Check content from Gemini candidate
+            content = choice_data.get("content")
+            if content:
+                # Gemini content has parts array
+                parts = content.get("parts", [])
+                for part in parts:
+                    if part.get("text"):
+                        has_content = True
+                        content_length += len(part.get("text", ""))
+                    elif part.get("functionCall"):
+                        tool_calls_count += 1
+                        has_content = True  # Tool calls count as content
+
+        metadata = {
+            "has_content": has_content,
+            "content_length": content_length,
+            "tool_calls_count": tool_calls_count,
+            "finish_reason": finish_reason,
+            "model": model,
+            "provider": "gemini"
+        }
+
+        # Map Gemini finish_reason to standard StopReason
+        return stop_reason_manager.map_stop_reason("gemini", finish_reason, metadata)
 
 
 
@@ -572,6 +636,24 @@ class GeminiProvider(Provider):
                         if content_text_parts:
                             current_chunk_text = "".join(content_text_parts)
 
+                        # Check for finish_reason in chunk
+                        finish_reason = None
+                        stop_info = None
+                        if chunk.candidates and chunk.candidates[0].finish_reason:
+                            finish_reason = chunk.candidates[0].finish_reason
+                            # Create stop_info for final chunk
+                            choice_data = {
+                                "content": {
+                                    "parts": []
+                                }
+                            }
+                            if current_chunk_text:
+                                choice_data["content"]["parts"].append({"text": current_chunk_text})
+                            if tool_calls:
+                                choice_data["content"]["parts"].extend([{"functionCall": tc} for tc in tool_calls])
+
+                            stop_info = self._create_stop_info(finish_reason, choice_data, model_id)
+
                         yield ChatCompletionResponse(
                             choices=[
                                 StreamChoice(
@@ -582,7 +664,8 @@ class GeminiProvider(Provider):
                                         tool_calls=tool_calls,
                                         reasoning_content=current_chunk_reasoning
                                     ),
-                                    finish_reason=None
+                                    finish_reason=finish_reason,
+                                    stop_info=stop_info
                                 )
                             ],
                             metadata={
@@ -702,6 +785,24 @@ class GeminiProvider(Provider):
                     if content_text_parts:
                         current_chunk_text = "".join(content_text_parts)
 
+                    # Check for finish_reason in chunk
+                    finish_reason = None
+                    stop_info = None
+                    if chunk.candidates and chunk.candidates[0].finish_reason:
+                        finish_reason = chunk.candidates[0].finish_reason
+                        # Create stop_info for final chunk
+                        choice_data = {
+                            "content": {
+                                "parts": []
+                            }
+                        }
+                        if current_chunk_text:
+                            choice_data["content"]["parts"].append({"text": current_chunk_text})
+                        if tool_calls:
+                            choice_data["content"]["parts"].extend([{"functionCall": tc} for tc in tool_calls])
+
+                        stop_info = self._create_stop_info(finish_reason, choice_data, model_id)
+
                     yield ChatCompletionResponse(
                         choices=[
                             StreamChoice(
@@ -712,7 +813,8 @@ class GeminiProvider(Provider):
                                     tool_calls=tool_calls,
                                     reasoning_content=current_chunk_reasoning
                                 ),
-                                finish_reason=None  # Gemini doesn't provide per-chunk finish reason
+                                finish_reason=finish_reason,
+                                stop_info=stop_info
                             )
                         ],
                         metadata={

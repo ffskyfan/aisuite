@@ -6,9 +6,19 @@ from typing import AsyncGenerator, Union, List, Dict, Any
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
+from aisuite.framework.stop_reason import stop_reason_manager
 
 
 class OpenaiProvider(Provider):
+    # OpenAI finish_reason mapping to standard StopReason
+    FINISH_REASON_MAPPING = {
+        "stop": "complete",
+        "length": "length_limit",
+        "tool_calls": "tool_call",
+        "function_call": "tool_call",  # Legacy function call
+        "content_filter": "safety_refusal",
+    }
+
     def __init__(self, **config):
         """
         Initialize the OpenAI provider with the given configuration.
@@ -32,6 +42,45 @@ class OpenaiProvider(Provider):
         self._streaming_tool_calls = {}
         # Map Responses function_call item.id (fc_*) -> call_id (call_*) for streaming tool calls
         self._responses_tool_call_ids: Dict[str, str] = {}
+
+    def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
+        """Create StopInfo from OpenAI finish_reason."""
+        if not finish_reason:
+            return None
+
+        # Analyze choice data to determine content presence
+        has_content = False
+        content_length = 0
+        tool_calls_count = 0
+
+        if choice_data:
+            # Check message content
+            message = choice_data.get("message") or choice_data.get("delta")
+            if message:
+                content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else None)
+                if content:
+                    has_content = True
+                    content_length = len(content)
+
+                # Check tool calls
+                tool_calls = getattr(message, "tool_calls", None) or (message.get("tool_calls") if isinstance(message, dict) else None)
+                if tool_calls:
+                    tool_calls_count = len(tool_calls)
+                    if tool_calls_count > 0:
+                        has_content = True  # Tool calls count as content
+
+        metadata = {
+            "has_content": has_content,
+            "content_length": content_length,
+            "tool_calls_count": tool_calls_count,
+            "finish_reason": finish_reason,
+            "model": model,
+            "provider": "openai"
+        }
+
+        # Map OpenAI finish_reason to standard StopReason
+        mapped_reason = self.FINISH_REASON_MAPPING.get(finish_reason, finish_reason)
+        return stop_reason_manager.map_stop_reason("openai", finish_reason, metadata)
 
     def _supports_reasoning(self, model: str) -> bool:
         """Check if the model supports reasoning parameters."""
@@ -374,20 +423,29 @@ class OpenaiProvider(Provider):
             async def stream_generator():
                 async for chunk in response:
                     if chunk.choices:
+                        # Create choices with stop_info
+                        choices = []
+                        for choice in chunk.choices:
+                            # Create stop_info if finish_reason is present
+                            stop_info = None
+                            if choice.finish_reason:
+                                choice_data = {"delta": choice.delta}
+                                stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
+
+                            choices.append(StreamChoice(
+                                index=choice.index,
+                                delta=ChoiceDelta(
+                                    content=choice.delta.content,
+                                    role=choice.delta.role,
+                                    tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
+                                    reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # 流式时保持原始格式
+                                ),
+                                finish_reason=choice.finish_reason,
+                                stop_info=stop_info
+                            ))
+
                         yield ChatCompletionResponse(
-                            choices=[
-                                StreamChoice(
-                                    index=choice.index,
-                                    delta=ChoiceDelta(
-                                        content=choice.delta.content,
-                                        role=choice.delta.role,
-                                        tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
-                                        reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # 流式时保持原始格式
-                                    ),
-                                    finish_reason=choice.finish_reason
-                                )
-                                for choice in chunk.choices
-                            ],
+                            choices=choices,
                             metadata={
                                 'id': chunk.id,
                                 'created': chunk.created,
@@ -419,21 +477,28 @@ class OpenaiProvider(Provider):
                 stream=False,
                 **prepared_kwargs  # Use prepared kwargs that are compatible with the model
             )
+            # Create choices with stop_info
+            choices = []
+            for choice in response.choices:
+                # Create stop_info
+                choice_data = {"message": choice.message}
+                stop_info = self._create_stop_info(choice.finish_reason, choice_data, response.model)
+
+                choices.append(Choice(
+                    index=choice.index,
+                    message=Message(
+                        content=choice.message.content,
+                        role=choice.message.role,
+                        tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
+                        refusal=None,
+                        reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
+                    ),
+                    finish_reason=choice.finish_reason,
+                    stop_info=stop_info
+                ))
+
             return ChatCompletionResponse(
-                choices=[
-                    Choice(
-                        index=choice.index,
-                        message=Message(
-                            content=choice.message.content,
-                            role=choice.message.role,
-                            tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
-                            refusal=None,
-                            reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
-                        ),
-                        finish_reason=choice.finish_reason
-                    )
-                    for choice in response.choices
-                ],
+                choices=choices,
                 metadata={
                     "id": response.id,
                     "created": response.created,
