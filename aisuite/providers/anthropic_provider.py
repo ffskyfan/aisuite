@@ -4,11 +4,22 @@
 
 import anthropic
 import json
+import logging
 from typing import AsyncGenerator, Union
 from aisuite.provider import Provider
 from aisuite.framework import ChatCompletionResponse
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
 from aisuite.framework.chat_completion_response import Choice, ChoiceDelta, StreamChoice
+from aisuite.framework.stop_reason import stop_reason_manager
+
+# 设置专门的logger用于调试stop reason
+anthropic_logger = logging.getLogger("anthropic_stop_reason")
+anthropic_logger.setLevel(logging.INFO)
+if not anthropic_logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('[STOP_REASON] %(message)s')
+    handler.setFormatter(formatter)
+    anthropic_logger.addHandler(handler)
 
 # Define a constant for the default max_tokens value
 DEFAULT_MAX_TOKENS = 4096
@@ -41,91 +52,192 @@ class AnthropicMessageConverter:
         message = self._get_message(response)
         finish_reason = self._get_finish_reason(response)
         usage = self._get_usage_stats(response)
-        
+
+        # Create enhanced stop info for non-streaming response
+        stop_info = self._create_stop_info_from_response(response)
+
         # 创建Choice对象并添加到列表中
         normalized_response.choices.append(Choice(
             index=0,
             message=message,
-            finish_reason=finish_reason
+            finish_reason=finish_reason,
+            stop_info=stop_info
         ))
-        
+
         # 设置使用量统计
         normalized_response.metadata['usage'] = usage
         return normalized_response
         
     def convert_stream_response(self, chunk, model, provider=None):
         """Convert a streaming response chunk from Anthropic to the framework's format."""
+
         content = ""
         tool_calls = None
         role = None
         reasoning_content = None
+        finish_reason = None
+        stop_info = None
 
-        # Handle content_block_start for tool_use (captures id and name)
-        if (hasattr(chunk, 'content_block') and chunk.content_block and
-            hasattr(chunk.content_block, 'type') and chunk.content_block.type == "tool_use"):
-            # Initialize tool call with id and name from content_block_start
-            if provider:
-                provider._initialize_tool_call_from_content_block(chunk.content_block, getattr(chunk, 'index', 0))
-            role = "assistant"
+        # 获取chunk类型
+        chunk_type = getattr(chunk, 'type', 'unknown')
 
-        # Handle text delta
-        elif (hasattr(chunk, 'delta') and chunk.delta and
-              hasattr(chunk.delta, 'type') and chunk.delta.type == "text_delta" and
-              hasattr(chunk.delta, 'text') and chunk.delta.text):
-            content = chunk.delta.text
-            role = "assistant"
+        # Handle Claude-specific state events that should not be passed downstream
+        if chunk_type in ["message_start", "content_block_stop", "message_stop", "ping"]:
+            return None  # Filter out Claude-specific state events
 
-        # Handle thinking delta (reasoning content)
-        elif (hasattr(chunk, 'delta') and chunk.delta and
-              hasattr(chunk.delta, 'type') and chunk.delta.type == "thinking_delta" and
-              hasattr(chunk.delta, 'thinking') and chunk.delta.thinking):
-            # Accumulate thinking content in provider
-            if provider:
-                provider._accumulate_thinking_content(chunk.delta.thinking)
-            reasoning_content = chunk.delta.thinking
-            role = "assistant"
+        # Handle content_block_start event
+        elif chunk_type == "content_block_start":
+            if (hasattr(chunk, 'content_block') and chunk.content_block and
+                hasattr(chunk.content_block, 'type')):
+                block_type = chunk.content_block.type
 
-        # Handle signature delta (for thinking blocks)
-        elif (hasattr(chunk, 'delta') and chunk.delta and
-              hasattr(chunk.delta, 'type') and chunk.delta.type == "signature_delta" and
-              hasattr(chunk.delta, 'signature') and chunk.delta.signature):
-            # Accumulate signature in provider
-            if provider:
-                provider._accumulate_thinking_signature(chunk.delta.signature)
-            role = "assistant"
+                if block_type == "tool_use":
+                    # Initialize tool call with id and name from content_block_start
+                    if provider:
+                        provider._initialize_tool_call_from_content_block(chunk.content_block, getattr(chunk, 'index', 0))
+                    # Don't pass this event downstream, just initialize internal state
+                    return None
+                elif block_type in ["text", "thinking"]:
+                    # These are content block starts, filter them out
+                    # The actual content will come in content_block_delta events
+                    return None
 
-        # Handle tool use delta (fine-grained streaming)
-        elif (hasattr(chunk, 'delta') and chunk.delta and
-              hasattr(chunk.delta, 'type') and chunk.delta.type == "input_json_delta" and
-              hasattr(chunk.delta, 'partial_json')):
-            # This is part of tool input streaming
-            if provider:
-                tool_calls = provider._accumulate_anthropic_tool_calls(chunk)
-            role = "assistant" if tool_calls else None
+        # Handle content_block_delta event
+        elif chunk_type == "content_block_delta":
+            if hasattr(chunk, 'delta') and chunk.delta:
+                delta_type = getattr(chunk.delta, 'type', 'unknown')
 
-        # Handle other delta types
-        elif hasattr(chunk, 'delta') and chunk.delta:
-            role = "assistant"
+                # Handle text delta
+                if (delta_type == "text_delta" and
+                    hasattr(chunk.delta, 'text') and chunk.delta.text):
+                    content = chunk.delta.text
+                    role = "assistant"
 
-        return ChatCompletionResponse(
-            choices=[
-                StreamChoice(
-                    index=0,
-                    delta=ChoiceDelta(
-                        content=content if content else None,
-                        role=role,
-                        tool_calls=tool_calls,
-                        reasoning_content=reasoning_content
-                    ),
-                    finish_reason=self._get_finish_reason(chunk) if hasattr(chunk, 'stop_reason') else None
-                )
-            ],
-            metadata={
-                'id': getattr(chunk, 'id', None),
-                'created': None,  # Anthropic doesn't provide timestamp in chunks
-                'model': model
-            }
-        )
+                    # Track content in provider state
+                    if provider:
+                        provider._stream_has_content = True
+                        provider._stream_content_length += len(content)
+
+                # Handle thinking delta (reasoning content)
+                elif (delta_type == "thinking_delta" and
+                      hasattr(chunk.delta, 'thinking') and chunk.delta.thinking):
+                    # Accumulate thinking content in provider
+                    if provider:
+                        provider._accumulate_thinking_content(chunk.delta.thinking)
+                        provider._stream_reasoning_length += len(chunk.delta.thinking)
+                    reasoning_content = chunk.delta.thinking
+                    role = "assistant"
+
+                # Handle signature delta (for thinking blocks)
+                elif (delta_type == "signature_delta" and
+                      hasattr(chunk.delta, 'signature') and chunk.delta.signature):
+                    # Accumulate signature in provider
+                    if provider:
+                        provider._accumulate_thinking_signature(chunk.delta.signature)
+                    # Don't pass signature deltas downstream
+                    return None
+
+                # Handle tool use delta (fine-grained streaming)
+                elif (delta_type == "input_json_delta" and
+                      hasattr(chunk.delta, 'partial_json')):
+                    # This is part of tool input streaming
+                    if provider:
+                        tool_calls = provider._accumulate_anthropic_tool_calls(chunk)
+                        if tool_calls:
+                            provider._stream_tool_calls_count = len(tool_calls)
+                    role = "assistant" if tool_calls else None
+
+                else:
+                    return None  # Filter out unknown delta types
+
+        # Handle message_delta event
+        elif chunk_type == "message_delta":
+            if hasattr(chunk, 'delta') and chunk.delta:
+                if hasattr(chunk.delta, 'stop_reason'):
+                    original_stop_reason = chunk.delta.stop_reason
+                    finish_reason = self._get_finish_reason(chunk.delta)
+
+                    # Create enhanced stop info using stream-wide statistics
+                    metadata = {
+                        "has_content": provider._stream_has_content if provider else bool(content),
+                        "content_length": provider._stream_content_length if provider else 0,
+                        "tool_calls_count": provider._stream_tool_calls_count if provider else 0,
+                        "reasoning_content_length": provider._stream_reasoning_length if provider else 0,
+                        "chunk_type": chunk_type,
+                        "model": model
+                    }
+
+                    stop_info = stop_reason_manager.map_stop_reason(
+                        "anthropic", original_stop_reason, metadata
+                    )
+
+                    anthropic_logger.info(f"Stop Reason: {original_stop_reason} -> {stop_info.reason.value} (has_content: {metadata.get('has_content', False)})")
+                    anthropic_logger.info(f"[PROVIDER] Created stop_info object: {stop_info}")
+
+        # Handle error event
+        elif chunk_type == "error":
+            anthropic_logger.debug(f"CHUNK: error={getattr(chunk, 'error', 'unknown')}")
+            # Create error stop info
+            error_msg = getattr(chunk, 'error', 'unknown')
+            stop_info = stop_reason_manager.map_stop_reason(
+                "anthropic", "error", {"error_message": error_msg, "model": model}
+            )
+
+            return ChatCompletionResponse(
+                choices=[
+                    StreamChoice(
+                        index=0,
+                        delta=ChoiceDelta(content=None, role=None),
+                        finish_reason="error",
+                        stop_info=stop_info
+                    )
+                ],
+                metadata={
+                    'id': getattr(chunk, 'id', None),
+                    'error': error_msg,
+                    'model': model
+                }
+            )
+
+        # Handle unknown event types
+        else:
+            anthropic_logger.debug(f"CHUNK: unknown_type={chunk_type}")
+            return None  # Filter out unknown event types
+
+        # Only pass downstream events that have actual content or important state changes
+        if content or tool_calls or reasoning_content or finish_reason:
+            anthropic_logger.debug(f"RESULT: content={bool(content)}, tools={len(tool_calls) if tool_calls else 0}, reasoning={bool(reasoning_content)}, finish={finish_reason}")
+
+            # Log stop_info transmission
+            if stop_info:
+                anthropic_logger.info(f"[PROVIDER] Transmitting stop_info to downstream: {stop_info.reason.value}")
+            else:
+                anthropic_logger.info(f"[PROVIDER] No stop_info to transmit")
+
+            return ChatCompletionResponse(
+                choices=[
+                    StreamChoice(
+                        index=0,
+                        delta=ChoiceDelta(
+                            content=content if content else None,
+                            role=role,
+                            tool_calls=tool_calls,
+                            reasoning_content=reasoning_content
+                        ),
+                        finish_reason=finish_reason,
+                        stop_info=stop_info  # Enhanced stop information
+                    )
+                ],
+                metadata={
+                    'id': getattr(chunk, 'id', None),
+                    'created': None,  # Anthropic doesn't provide timestamp in chunks
+                    'model': model
+                }
+            )
+        else:
+            # No meaningful content to pass downstream
+            anthropic_logger.debug(f"CHUNK: filtered_empty_content")
+            return None
 
     def _convert_single_message(self, msg):
         """Convert a single message to Anthropic format."""
@@ -228,6 +340,34 @@ class AnthropicMessageConverter:
     def _get_finish_reason(self, response):
         """Get the normalized finish reason."""
         return self.FINISH_REASON_MAPPING.get(response.stop_reason, "stop")
+
+    def _create_stop_info_from_response(self, response):
+        """Create StopInfo from non-streaming response."""
+        # Analyze response content to determine if it has content
+        has_content = False
+        content_length = 0
+        tool_calls_count = 0
+        reasoning_length = 0
+
+        if hasattr(response, 'content') and response.content:
+            for content_block in response.content:
+                if hasattr(content_block, 'type'):
+                    if content_block.type == 'text' and hasattr(content_block, 'text'):
+                        has_content = True
+                        content_length += len(content_block.text)
+                    elif content_block.type == 'tool_use':
+                        tool_calls_count += 1
+
+        metadata = {
+            "has_content": has_content,
+            "content_length": content_length,
+            "tool_calls_count": tool_calls_count,
+            "reasoning_content_length": reasoning_length,
+            "response_type": "non_streaming"
+        }
+
+        original_stop_reason = getattr(response, 'stop_reason', 'end_turn')
+        return stop_reason_manager.map_stop_reason("anthropic", original_stop_reason, metadata)
 
     def _get_usage_stats(self, response):
         """Get the usage statistics."""
@@ -388,6 +528,12 @@ class AnthropicProvider(Provider):
             "signature": None
         }
 
+        # State for tracking content across streaming session
+        self._stream_has_content = False
+        self._stream_content_length = 0
+        self._stream_tool_calls_count = 0
+        self._stream_reasoning_length = 0
+
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion using the Anthropic API."""
         kwargs = self._prepare_kwargs(kwargs)
@@ -396,6 +542,8 @@ class AnthropicProvider(Provider):
         self._thinking_enabled = "thinking" in kwargs
 
         system_message, converted_messages = self.converter.convert_request(messages)
+
+
 
         try:
             if stream:
@@ -406,6 +554,11 @@ class AnthropicProvider(Provider):
                     "thinking": "",
                     "signature": None
                 }
+                # Reset content tracking state
+                self._stream_has_content = False
+                self._stream_content_length = 0
+                self._stream_tool_calls_count = 0
+                self._stream_reasoning_length = 0
 
                 response = await self.client.messages.create(
                     model=model,
@@ -416,8 +569,15 @@ class AnthropicProvider(Provider):
                 )
 
                 async def stream_generator():
+                    chunk_count = 0
+                    yielded_count = 0
                     async for chunk in response:
-                        yield self.converter.convert_stream_response(chunk, model, self)
+                        chunk_count += 1
+                        result = self.converter.convert_stream_response(chunk, model, self)
+                        if result is not None:  # Only yield non-None results
+                            yielded_count += 1
+                            yield result
+                    anthropic_logger.debug(f"STREAM_END: total_chunks={chunk_count}, yielded={yielded_count}")
 
                 return stream_generator()
             else:
@@ -430,6 +590,7 @@ class AnthropicProvider(Provider):
                 return self.converter.convert_response(response)
 
         except Exception as e:
+            anthropic_logger.error(f"Error in chat_completions_create: {e}")
             # Check for thinking blocks related error
             if "Expected `thinking` or `redacted_thinking`" in str(e):
                 return await self._handle_thinking_error(model, system_message, converted_messages, kwargs, stream)
@@ -514,6 +675,7 @@ class AnthropicProvider(Provider):
                     )
 
                     complete_tool_calls.append(tool_call_obj)
+                    anthropic_logger.debug(f"TOOL_COMPLETE: {tool_call_data['name']}")
 
                     # Remove completed tool call from accumulator
                     del self._streaming_tool_calls[idx]
