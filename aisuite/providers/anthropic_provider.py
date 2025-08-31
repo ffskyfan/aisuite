@@ -257,6 +257,7 @@ class AnthropicMessageConverter:
                 if isinstance(reasoning_content, dict):
                     reasoning_content = ReasoningContent(**reasoning_content)
 
+
             return self._create_assistant_tool_message(
                 msg["content"],
                 msg["tool_calls"],
@@ -323,7 +324,6 @@ class AnthropicMessageConverter:
                     "input": json.loads(tool_input),
                 }
             )
-
         return {"role": self.ROLE_ASSISTANT, "content": message_content}
 
     def _extract_system_message(self, messages):
@@ -545,6 +545,19 @@ class AnthropicProvider(Provider):
 
 
 
+        # Fix thinking blocks proactively when thinking is enabled
+        # This MUST be done before API call to prevent errors and resource waste
+        if self._thinking_enabled:
+            converted_messages = self._fix_thinking_messages(converted_messages)
+
+            # If thinking was disabled during fix due to incompatible messages,
+            # remove thinking from kwargs to ensure consistency
+            if not self._thinking_enabled:
+                anthropic_logger.info("Thinking was automatically disabled due to incompatible messages")
+                kwargs = kwargs.copy()
+                kwargs.pop("thinking", None)
+
+
         try:
             if stream:
                 # Reset streaming tool calls state
@@ -591,9 +604,8 @@ class AnthropicProvider(Provider):
 
         except Exception as e:
             anthropic_logger.error(f"Error in chat_completions_create: {e}")
-            # Check for thinking blocks related error
-            if "Expected `thinking` or `redacted_thinking`" in str(e):
-                return await self._handle_thinking_error(model, system_message, converted_messages, kwargs, stream)
+            # Do not retry - this would cause resource waste
+            # All message fixes should be done before the first API call
             raise
 
     def _prepare_kwargs(self, kwargs):
@@ -704,43 +716,102 @@ class AnthropicProvider(Provider):
         }
         return thinking_data
 
-    async def _handle_thinking_error(self, model, system_message, converted_messages, kwargs, stream):
-        """Handle thinking blocks related errors with automatic recovery."""
-        # Try to fix message format
-        fixed_messages = self._fix_thinking_messages(converted_messages)
 
-        try:
-            if stream:
-                response = await self.client.messages.create(
-                    model=model,
-                    system=system_message,
-                    messages=fixed_messages,
-                    stream=True,
-                    **kwargs
-                )
-
-                async def stream_generator():
-                    async for chunk in response:
-                        yield self.converter.convert_stream_response(chunk, model, self)
-                return stream_generator()
-            else:
-                response = await self.client.messages.create(
-                    model=model,
-                    system=system_message,
-                    messages=fixed_messages,
-                    **kwargs
-                )
-                return self.converter.convert_response(response)
-        except Exception as retry_error:
-            # 不再回退，直接抛出错误以便调试
-            raise retry_error
 
     def _fix_thinking_messages(self, messages):
         """
-        现在有了正确的ReasoningContent机制，不再需要修复thinking块。
-        直接返回原始消息。
+        Fix messages to ensure proper thinking blocks when thinking is enabled.
+
+        Based on Claude documentation:
+        - When thinking is enabled, final assistant message with tool_use must start with thinking block
+        - Thinking blocks must be preserved during tool use for reasoning continuity
+        - Only thinking blocks with signature (from Claude) are valid
+
+        Strategy:
+        1. Remove thinking blocks without signature (from other models)
+        2. Keep thinking blocks with signature (from Claude)
+        3. Find the actual final assistant message and ensure it has thinking if it has tool_use
         """
-        return messages
+        if not self._thinking_enabled:
+            return messages
+
+        fixed_messages = []
+
+        # First pass: clean up all messages and find valid thinking blocks
+        valid_thinking_blocks = []
+
+        for i, message in enumerate(messages):
+            if (isinstance(message, dict) and
+                message.get("role") == "assistant" and
+                isinstance(message.get("content"), list)):
+
+                content_blocks = message["content"]
+
+                # Step 1: Filter out thinking blocks without signature
+                filtered_blocks = []
+                for block in content_blocks:
+                    if block.get("type") in ["thinking", "redacted_thinking"]:
+                        # Only keep thinking blocks that have a signature (from Claude)
+                        if "signature" in block or "data" in block:  # data for redacted_thinking
+                            anthropic_logger.debug("Keeping Claude-generated thinking block with signature")
+                            filtered_blocks.append(block)
+                            # Also collect for potential reuse
+                            valid_thinking_blocks.append(block.copy())
+                        else:
+                            anthropic_logger.debug("Removing thinking block without signature (from other model)")
+                            # Skip this block - it's from another model
+                    else:
+                        filtered_blocks.append(block)
+
+                # Create the cleaned message
+                if filtered_blocks != content_blocks:
+                    fixed_message = message.copy()
+                    fixed_message["content"] = filtered_blocks
+                    fixed_messages.append(fixed_message)
+                else:
+                    fixed_messages.append(message)
+            else:
+                fixed_messages.append(message)
+
+        # Second pass: find the actual final assistant message and fix it if needed
+        final_assistant_index = -1
+        for i in range(len(fixed_messages) - 1, -1, -1):
+            if fixed_messages[i].get("role") == "assistant":
+                final_assistant_index = i
+                break
+
+        if final_assistant_index >= 0:
+            final_assistant = fixed_messages[final_assistant_index]
+            if isinstance(final_assistant.get("content"), list):
+                content = final_assistant["content"]
+                has_tool_use = any(block.get("type") == "tool_use" for block in content)
+                has_valid_thinking = any(
+                    block.get("type") in ["thinking", "redacted_thinking"]
+                    for block in content
+                )
+
+                # If final assistant has tool_use but no thinking, fix it
+                if has_tool_use and not has_valid_thinking:
+                    if valid_thinking_blocks:
+                        # Use the most recent valid thinking block
+                        thinking_block = valid_thinking_blocks[-1]
+                        anthropic_logger.info(
+                            f"Moving valid thinking block to final assistant message (index {final_assistant_index})"
+                        )
+                        new_content = [thinking_block] + content
+                        fixed_messages[final_assistant_index] = {
+                            **final_assistant,
+                            "content": new_content
+                        }
+                    else:
+                        anthropic_logger.warning(
+                            "No valid thinking blocks found - disabling thinking to prevent API errors"
+                        )
+                        # Disable thinking to prevent API errors
+                        self._thinking_enabled = False
+                        return messages
+
+        return fixed_messages
 
     def _process_anthropic_tool_use(self, content_block):
         """

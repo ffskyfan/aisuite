@@ -1,6 +1,7 @@
 import openai
 import os
 import json
+import hashlib
 from typing import AsyncGenerator, Union, List, Dict, Any
 
 from aisuite.provider import Provider, LLMError
@@ -18,6 +19,9 @@ class OpenaiProvider(Provider):
         "function_call": "tool_call",  # Legacy function call
         "content_filter": "safety_refusal",
     }
+
+    # OpenAI tool_call ID maximum length limit
+    TOOL_CALL_ID_MAX_LENGTH = 40
 
     def __init__(self, **config):
         """
@@ -81,6 +85,123 @@ class OpenaiProvider(Provider):
         # Map OpenAI finish_reason to standard StopReason
         mapped_reason = self.FINISH_REASON_MAPPING.get(finish_reason, finish_reason)
         return stop_reason_manager.map_stop_reason("openai", finish_reason, metadata)
+
+    def _truncate_tool_call_id(self, original_id: str) -> str:
+        """
+        Truncate tool_call ID to meet OpenAI's length requirement.
+        Uses MD5 hash for consistent results within a single request.
+
+        Args:
+            original_id: The original tool_call ID
+
+        Returns:
+            Truncated ID that meets OpenAI's requirements
+        """
+        if len(original_id) <= self.TOOL_CALL_ID_MAX_LENGTH:
+            return original_id
+
+        # Use MD5 hash to generate a consistent short ID
+        hash_obj = hashlib.md5(original_id.encode('utf-8'))
+        return hash_obj.hexdigest()[:self.TOOL_CALL_ID_MAX_LENGTH]
+
+    def _process_tool_calls_for_openai(self, tool_calls: List[Dict[str, Any]], id_mapping: Dict[str, str]) -> List[Dict[str, Any]]:
+        """
+        Process tool_calls to ensure IDs meet OpenAI's length requirements.
+
+        Args:
+            tool_calls: List of tool_call dictionaries
+            id_mapping: Dictionary to store original_id -> truncated_id mapping
+
+        Returns:
+            Processed tool_calls with truncated IDs
+        """
+        if not tool_calls:
+            return tool_calls
+
+        processed_tool_calls = []
+        for tc in tool_calls:
+            tc_copy = tc.copy()
+            if 'id' in tc_copy and tc_copy['id']:
+                original_id = tc_copy['id']
+                truncated_id = self._truncate_tool_call_id(original_id)
+                tc_copy['id'] = truncated_id
+                # Store mapping for later restoration
+                id_mapping[truncated_id] = original_id
+            processed_tool_calls.append(tc_copy)
+
+        return processed_tool_calls
+
+    def _clean_messages_for_openai(self, messages: List[Union[Dict, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """
+        Clean messages for OpenAI API, handling both reasoning_content removal and tool_call ID truncation.
+
+        Args:
+            messages: List of messages to clean
+
+        Returns:
+            Tuple of (cleaned_messages, id_mapping) where id_mapping maps truncated_id -> original_id
+        """
+        cleaned_messages = []
+        id_mapping = {}  # truncated_id -> original_id
+
+        for msg in messages:
+            if isinstance(msg, dict):
+                cleaned_msg = msg.copy()
+            else:
+                # Convert Message object to dict
+                if hasattr(msg, 'model_dump'):
+                    cleaned_msg = msg.model_dump()
+                else:
+                    cleaned_msg = msg
+
+            # Remove reasoning_content field (existing logic)
+            if 'reasoning_content' in cleaned_msg:
+                cleaned_msg.pop('reasoning_content')
+
+            # Process tool_calls in assistant messages
+            if cleaned_msg.get('role') == 'assistant' and cleaned_msg.get('tool_calls'):
+                cleaned_msg['tool_calls'] = self._process_tool_calls_for_openai(
+                    cleaned_msg['tool_calls'], id_mapping
+                )
+
+            # Process tool_call_id in tool messages
+            elif cleaned_msg.get('role') == 'tool' and cleaned_msg.get('tool_call_id'):
+                original_id = cleaned_msg['tool_call_id']
+                truncated_id = self._truncate_tool_call_id(original_id)
+                cleaned_msg['tool_call_id'] = truncated_id
+                # Store mapping for later restoration
+                id_mapping[truncated_id] = original_id
+
+            cleaned_messages.append(cleaned_msg)
+
+        return cleaned_messages, id_mapping
+
+    def _restore_tool_call_ids(self, tool_calls: List[ChatCompletionMessageToolCall], id_mapping: Dict[str, str]) -> List[ChatCompletionMessageToolCall]:
+        """
+        Restore original tool_call IDs in the response.
+
+        Args:
+            tool_calls: List of tool_call objects from OpenAI response
+            id_mapping: Dictionary mapping truncated_id -> original_id
+
+        Returns:
+            Tool calls with restored original IDs
+        """
+        if not tool_calls or not id_mapping:
+            return tool_calls
+
+        restored_tool_calls = []
+        for tc in tool_calls:
+            # Create a new tool call with restored ID
+            original_id = id_mapping.get(tc.id, tc.id)
+            restored_tc = ChatCompletionMessageToolCall(
+                id=original_id,
+                function=tc.function,
+                type=tc.type
+            )
+            restored_tool_calls.append(restored_tc)
+
+        return restored_tool_calls
 
     def _supports_reasoning(self, model: str) -> bool:
         """Check if the model supports reasoning parameters."""
@@ -396,24 +517,8 @@ class OpenaiProvider(Provider):
             # Reset streaming tool calls state
             self._streaming_tool_calls = {}
 
-            # 清理messages参数，移除ReasoningContent对象
-            cleaned_messages = []
-            for i, msg in enumerate(messages):
-                if isinstance(msg, dict):
-                    cleaned_msg = msg.copy()
-                    # 移除reasoning_content字段，因为OpenAI API不需要它作为输入
-                    if 'reasoning_content' in cleaned_msg:
-                        cleaned_msg.pop('reasoning_content')
-                    cleaned_messages.append(cleaned_msg)
-                else:
-                    # 如果是Message对象，转换为字典并移除reasoning_content
-                    if hasattr(msg, 'model_dump'):
-                        cleaned_msg = msg.model_dump()
-                        if 'reasoning_content' in cleaned_msg:
-                            cleaned_msg.pop('reasoning_content')
-                        cleaned_messages.append(cleaned_msg)
-                    else:
-                        cleaned_messages.append(msg)
+            # Clean messages for OpenAI API (remove reasoning_content and truncate tool_call IDs)
+            cleaned_messages, id_mapping = self._clean_messages_for_openai(messages)
             response = await self.client.chat.completions.create(
                 model=model,
                 messages=cleaned_messages,  # 使用清理后的messages
@@ -432,12 +537,17 @@ class OpenaiProvider(Provider):
                                 choice_data = {"delta": choice.delta}
                                 stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
 
+                            # Process tool calls and restore original IDs
+                            accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
+                            if accumulated_tool_calls and id_mapping:
+                                accumulated_tool_calls = self._restore_tool_call_ids(accumulated_tool_calls, id_mapping)
+
                             choices.append(StreamChoice(
                                 index=choice.index,
                                 delta=ChoiceDelta(
                                     content=choice.delta.content,
                                     role=choice.delta.role,
-                                    tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
+                                    tool_calls=accumulated_tool_calls,
                                     reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # 流式时保持原始格式
                                 ),
                                 finish_reason=choice.finish_reason,
@@ -454,22 +564,8 @@ class OpenaiProvider(Provider):
                         )
             return stream_generator()
         else:
-            # 对于非流式调用，也需要清理messages
-            cleaned_messages = []
-            for i, msg in enumerate(messages):
-                if isinstance(msg, dict):
-                    cleaned_msg = msg.copy()
-                    if 'reasoning_content' in cleaned_msg:
-                        cleaned_msg.pop('reasoning_content')
-                    cleaned_messages.append(cleaned_msg)
-                else:
-                    if hasattr(msg, 'model_dump'):
-                        cleaned_msg = msg.model_dump()
-                        if 'reasoning_content' in cleaned_msg:
-                            cleaned_msg.pop('reasoning_content')
-                        cleaned_messages.append(cleaned_msg)
-                    else:
-                        cleaned_messages.append(msg)
+            # Clean messages for OpenAI API (remove reasoning_content and truncate tool_call IDs)
+            cleaned_messages, id_mapping = self._clean_messages_for_openai(messages)
 
             response = await self.client.chat.completions.create(
                 model=model,
@@ -484,12 +580,19 @@ class OpenaiProvider(Provider):
                 choice_data = {"message": choice.message}
                 stop_info = self._create_stop_info(choice.finish_reason, choice_data, response.model)
 
+                # Convert and restore tool calls
+                converted_tool_calls = None
+                if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
+                    converted_tool_calls = self._convert_tool_calls(choice.message.tool_calls)
+                    if converted_tool_calls and id_mapping:
+                        converted_tool_calls = self._restore_tool_call_ids(converted_tool_calls, id_mapping)
+
                 choices.append(Choice(
                     index=choice.index,
                     message=Message(
                         content=choice.message.content,
                         role=choice.message.role,
-                        tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
+                        tool_calls=converted_tool_calls,
                         refusal=None,
                         reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
                     ),
