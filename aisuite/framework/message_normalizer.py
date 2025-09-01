@@ -5,6 +5,7 @@ Handles format conversion and field cleaning between different providers
 
 from typing import Dict, List, Any, Optional, Union
 from ..framework.message import Message, ReasoningContent
+from ..framework.cache_config import CacheConfig, CacheType
 
 class MessageNormalizer:
     """Normalizes messages for cross-provider compatibility"""
@@ -17,11 +18,11 @@ class MessageNormalizer:
     
     # Provider-specific field mappings
     PROVIDER_FIELD_MAP = {
-        'gpt-5': {
-            'remove_fields': ['refusal'],  # GPT-5 Response API doesn't accept these
-            'preserve_reasoning': True
+        'openai': {
+            'remove_fields': ['refusal'],  # Some OpenAI models don't accept these
+            'preserve_reasoning': True  # GPT-5 can preserve reasoning
         },
-        'claude': {
+        'anthropic': {
             'remove_fields': [],
             'preserve_reasoning': False  # Claude handles reasoning differently
         },
@@ -31,39 +32,136 @@ class MessageNormalizer:
         }
     }
     
+    # Provider cache support configuration
+    PROVIDER_CACHE_SUPPORT = {
+        'anthropic': {  # 使用正确的provider名称
+            'supported': True,
+            'field_name': 'cache_control',
+            'format': lambda config: {
+                "type": "ephemeral",
+                "ttl": str(config.get('ttl', '5m')).replace('CacheTTL.', '').replace('MINUTES_5', '5m').replace('HOURS_1', '1h')
+            } if config.get('type') in ['ephemeral', CacheType.EPHEMERAL, 'CacheType.EPHEMERAL'] else None,
+            'min_tokens': {
+                'claude-3-opus': 1024,
+                'claude-3-5-sonnet': 2048,
+                'claude-3-7-sonnet': 2048,
+                'claude-3-haiku': 2048,
+            }
+        },
+        'openai': {
+            'supported': False,  # OpenAI (包括GPT-3/4/5) has automatic caching
+            'auto_cache': True
+        },
+        'gemini': {
+            'supported': False,  # Gemini has automatic caching
+            'auto_cache': True
+        },
+        'google': {  # Google provider的别名
+            'supported': False,  # Google Gemini has automatic caching
+            'auto_cache': True
+        },
+        'deepseek': {
+            'supported': False,  # DeepSeek has automatic caching
+            'auto_cache': True
+        },
+        'default': {
+            'supported': False
+        }
+    }
+    
     @staticmethod
     def detect_provider_type(model: str) -> str:
-        """Detect provider type from model string"""
+        """
+        Detect provider type from model string
+        Returns the actual provider name, not the model name
+        """
         model_lower = model.lower()
         
-        # Check for GPT-5 (most specific first)
-        if 'gpt-5' in model_lower:
-            return 'gpt-5'
-        # Check for Claude/Anthropic
-        elif 'claude' in model_lower or 'anthropic' in model_lower:
-            return 'claude'
-        # Check for Gemini
+        # Extract provider from "provider:model" format if present
+        if ':' in model:
+            provider_part = model.split(':')[0].lower()
+            # Direct provider mapping
+            if provider_part in ['anthropic', 'claude']:
+                return 'anthropic'
+            elif provider_part in ['openai', 'closeai', 'vercel']:
+                return 'openai'  # All these use OpenAI-compatible APIs
+            elif provider_part in ['google', 'gemini']:
+                return 'gemini'
+            elif provider_part == 'deepseek':
+                return 'deepseek'
+        
+        # Fallback to model name detection for backward compatibility
+        # Check for Claude/Anthropic models
+        if 'claude' in model_lower or 'anthropic' in model_lower:
+            return 'anthropic'
+        # Check for OpenAI models (including GPT-3/4/5)
+        elif any(x in model_lower for x in ['gpt-3', 'gpt-4', 'gpt-5', 'openai']):
+            return 'openai'
+        # Check for Gemini/Google models
         elif 'gemini' in model_lower or 'google' in model_lower:
             return 'gemini'
         # Check for DeepSeek
         elif 'deepseek' in model_lower:
             return 'deepseek'
-        # Check for GPT-4 or other OpenAI models
-        elif 'gpt-4' in model_lower or 'gpt-3' in model_lower or 'openai' in model_lower:
-            return 'openai'
-        # Check for CloseAI (can be various models)
-        elif 'closeai' in model_lower:
-            # Further check the actual model after the colon
-            parts = model.split(':')
-            if len(parts) > 1:
-                actual_model = parts[1].lower()
-                if 'gpt-5' in actual_model:
-                    return 'gpt-5'
-                elif 'gpt-4' in actual_model or 'gpt-3' in actual_model:
-                    return 'openai'
-            return 'openai'  # Default for closeai
         else:
             return 'default'
+    
+    @classmethod
+    def _convert_cache_config(cls, cache_config: Any, target_provider: str, model_name: str = None) -> Optional[Dict]:
+        """
+        Convert unified cache configuration to provider-specific format
+        
+        Args:
+            cache_config: CacheConfig object or dictionary
+            target_provider: Target provider
+            model_name: Model name (for minimum token requirements)
+        
+        Returns:
+            Provider-specific cache configuration, or None if not supported
+        """
+        if not cache_config:
+            return None
+            
+        # Get provider configuration
+        provider_config = cls.PROVIDER_CACHE_SUPPORT.get(target_provider, {})
+        
+        # If provider doesn't support cache marking, return None
+        if not provider_config.get('supported', False):
+            return None
+            
+        # Convert CacheConfig object to dictionary
+        if isinstance(cache_config, CacheConfig):
+            config_dict = cache_config.to_dict()
+        else:
+            config_dict = cache_config
+            
+        # Use provider's format function
+        formatter = provider_config.get('format')
+        if formatter:
+            return formatter(config_dict)
+            
+        return None
+    
+    @classmethod
+    def _apply_cache_marking(cls, message: Dict, target_provider: str, model_name: str = None) -> Dict:
+        """Apply cache marking to message based on provider requirements"""
+        # Check for _cache field
+        cache_config = message.pop('_cache', None)
+        
+        if not cache_config:
+            return message
+            
+        # Convert cache configuration
+        provider_cache = cls._convert_cache_config(cache_config, target_provider, model_name)
+        
+        if provider_cache:
+            # Get provider's field name
+            provider_config = cls.PROVIDER_CACHE_SUPPORT.get(target_provider, {})
+            field_name = provider_config.get('field_name')
+            if field_name:
+                message[field_name] = provider_cache
+        
+        return message
     
     @classmethod
     def normalize_message(cls, message: Union[Dict, Message], target_provider: str = None) -> Dict[str, Any]:
@@ -166,10 +264,11 @@ class MessageNormalizer:
         preserve_reasoning = provider_config.get('preserve_reasoning', False)
         
         # ALWAYS remove these fields that cause compatibility issues
-        # reasoning_content should NEVER be passed to any provider except GPT-5
+        # reasoning_content should NEVER be passed to any provider except certain OpenAI models
         always_remove = {'refusal', 'reasoning_content'}
-        if target_provider == 'gpt-5':
-            always_remove = {'refusal'}  # GPT-5 can handle reasoning_content
+        # OpenAI provider with certain models can handle reasoning_content
+        if target_provider == 'openai' and preserve_reasoning:
+            always_remove = {'refusal'}  # Some OpenAI models can handle reasoning_content
         
         for key, value in msg_dict.items():
             # Skip None values except for content
@@ -184,10 +283,10 @@ class MessageNormalizer:
             if key in fields_to_remove:
                 continue
             
-            # Handle reasoning content specially - NEVER pass to non-GPT-5 providers
+            # Handle reasoning content specially - NEVER pass to non-OpenAI providers
             if key == 'reasoning_content':
-                # Only preserve for GPT-5, remove for all others
-                if target_provider == 'gpt-5' and preserve_reasoning and value:
+                # Only preserve for OpenAI models that support it
+                if target_provider == 'openai' and preserve_reasoning and value:
                     cleaned[key] = value
                 # Skip for all other providers - this is redundant but explicit
                 continue
@@ -227,10 +326,22 @@ class MessageNormalizer:
         normalized = []
         
         for msg in messages:
-            # Skip system messages and user messages (usually don't have compatibility issues)
-            if isinstance(msg, dict) and msg.get('role') in ['system', 'user', 'tool']:
-                normalized.append(msg)
+            # Always normalize messages (including system, user, tool) to handle cache marking
+            if isinstance(msg, dict):
+                # Apply cache marking if present
+                normalized_msg = msg.copy()
+                normalized_msg = cls._apply_cache_marking(normalized_msg, target_provider, target_model)
+                
+                # For assistant messages, also apply other normalizations
+                if normalized_msg.get('role') == 'assistant':
+                    normalized_msg = cls.normalize_message(normalized_msg, target_provider)
+                else:
+                    # For non-assistant messages, just ensure required fields
+                    normalized_msg = cls._ensure_required_fields(normalized_msg)
+                    
+                normalized.append(normalized_msg)
             else:
+                # Non-dict messages go through full normalization
                 normalized.append(cls.normalize_message(msg, target_provider))
         
         return normalized
