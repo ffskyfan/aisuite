@@ -46,6 +46,11 @@ class OpenaiProvider(Provider):
         self._streaming_tool_calls = {}
         # Map Responses function_call item.id (fc_*) -> call_id (call_*) for streaming tool calls
         self._responses_tool_call_ids: Dict[str, str] = {}
+        
+        # Track accumulated content for streaming responses
+        # Used to provide accurate metadata in stop_info
+        self._stream_content_length = 0
+        self._stream_tool_calls_count = 0
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from OpenAI finish_reason."""
@@ -389,8 +394,10 @@ class OpenaiProvider(Provider):
             responses_kwargs['tools'] = self._convert_tools_for_responses_api(responses_kwargs['tools'])
 
         if stream:
-            # 重置流式工具积累状态
+            # 重置流式状态
             self._streaming_tool_calls = {}
+            self._stream_content_length = 0
+            self._stream_tool_calls_count = 0
             response = await self.client.responses.create(
                 model=model,
                 input=input_items,
@@ -401,6 +408,9 @@ class OpenaiProvider(Provider):
                 async for chunk in response:
                     ctype = getattr(chunk, 'type', None)
                     if ctype == 'response.output_text.delta' and hasattr(chunk, 'delta'):
+                        # Accumulate content length
+                        if chunk.delta:
+                            self._stream_content_length += len(chunk.delta)
                         yield ChatCompletionResponse(
                             choices=[StreamChoice(index=0, delta=ChoiceDelta(content=chunk.delta, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
                             metadata={'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'id', None), 'model': getattr(chunk, 'model', None)}
@@ -410,13 +420,25 @@ class OpenaiProvider(Provider):
                         mock_delta = type('MockDelta', (), {'tool_calls': [type('MTC', (), {'index': getattr(chunk, 'output_index', 0), 'id': chunk.item_id, 'function': type('MF', (), {'arguments': chunk.delta, 'name': ''})(), 'type': 'function'})()]})()
                         tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
                         if tool_calls:
+                            # Accumulate tool calls count
+                            self._stream_tool_calls_count += len(tool_calls)
                             yield ChatCompletionResponse(
                                 choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=tool_calls, reasoning_content=None), finish_reason=None)],
                                 metadata={'id': getattr(chunk, 'response_id', None), 'model': getattr(chunk, 'model', None)}
                             )
                     elif ctype in ['response.completed', 'response.done']:
+                        # Create accurate stop_info with accumulated metadata
+                        metadata = {
+                            "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                            "content_length": self._stream_content_length,
+                            "tool_calls_count": self._stream_tool_calls_count,
+                            "finish_reason": 'stop',
+                            "model": getattr(chunk, 'model', None),
+                            "provider": "openai"
+                        }
+                        stop_info = stop_reason_manager.map_stop_reason("openai", 'stop', metadata)
                         yield ChatCompletionResponse(
-                            choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role=None, tool_calls=None, reasoning_content=None), finish_reason='stop')],
+                            choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role=None, tool_calls=None, reasoning_content=None), finish_reason='stop', stop_info=stop_info)],
                             metadata={'id': getattr(chunk, 'response_id', None), 'model': getattr(chunk, 'model', None)}
                         )
             return stream_gen()
@@ -514,8 +536,10 @@ class OpenaiProvider(Provider):
         # Any exception raised by OpenAI will be returned to the caller.
         # Maybe we should catch them and raise a custom LLMError.
         if stream:
-            # Reset streaming tool calls state
+            # Reset streaming state
             self._streaming_tool_calls = {}
+            self._stream_content_length = 0
+            self._stream_tool_calls_count = 0
 
             # Clean messages for OpenAI API (remove reasoning_content and truncate tool_call IDs)
             cleaned_messages, id_mapping = self._clean_messages_for_openai(messages)
@@ -531,16 +555,34 @@ class OpenaiProvider(Provider):
                         # Create choices with stop_info
                         choices = []
                         for choice in chunk.choices:
-                            # Create stop_info if finish_reason is present
-                            stop_info = None
-                            if choice.finish_reason:
-                                choice_data = {"delta": choice.delta}
-                                stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
-
+                            # Accumulate content and tool calls for accurate metadata
+                            if choice.delta.content:
+                                self._stream_content_length += len(choice.delta.content)
+                            
                             # Process tool calls and restore original IDs
                             accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
                             if accumulated_tool_calls and id_mapping:
                                 accumulated_tool_calls = self._restore_tool_call_ids(accumulated_tool_calls, id_mapping)
+                            if accumulated_tool_calls:
+                                self._stream_tool_calls_count += len(accumulated_tool_calls)
+                            
+                            # Create stop_info if finish_reason is present
+                            stop_info = None
+                            if choice.finish_reason:
+                                # Use accumulated values for final stop_info
+                                if choice.finish_reason == 'stop':
+                                    metadata = {
+                                        "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                                        "content_length": self._stream_content_length,
+                                        "tool_calls_count": self._stream_tool_calls_count,
+                                        "finish_reason": choice.finish_reason,
+                                        "model": chunk.model,
+                                        "provider": "openai"
+                                    }
+                                    stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
+                                else:
+                                    choice_data = {"delta": choice.delta}
+                                    stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
 
                             choices.append(StreamChoice(
                                 index=choice.index,

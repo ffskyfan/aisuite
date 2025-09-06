@@ -32,6 +32,11 @@ class DeepseekProvider(Provider):
 
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
+        
+        # Track accumulated content for streaming responses
+        # Used to provide accurate metadata in stop_info
+        self._stream_content_length = 0
+        self._stream_tool_calls_count = 0
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from OpenAI-compatible finish_reason."""
@@ -78,8 +83,10 @@ class DeepseekProvider(Provider):
         # Any exception raised by OpenAI will be returned to the caller.
         # Maybe we should catch them and raise a custom LLMError.
         if stream:
-            # Reset streaming tool calls state
+            # Reset streaming state
             self._streaming_tool_calls = {}
+            self._stream_content_length = 0
+            self._stream_tool_calls_count = 0
 
             response = await self.client.chat.completions.create(
                 model=model,
@@ -93,18 +100,39 @@ class DeepseekProvider(Provider):
                         # Create choices with stop_info
                         choices = []
                         for choice in chunk.choices:
+                            # Accumulate content and tool calls for accurate metadata
+                            if choice.delta.content:
+                                self._stream_content_length += len(choice.delta.content)
+                            
+                            accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
+                            if accumulated_tool_calls:
+                                self._stream_tool_calls_count += len(accumulated_tool_calls)
+                            
                             # Create stop_info if finish_reason is present
                             stop_info = None
                             if choice.finish_reason:
-                                choice_data = {"delta": choice.delta}
-                                stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
+                                # Use accumulated values for final stop_info
+                                if choice.finish_reason == 'stop':
+                                    metadata = {
+                                        "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                                        "content_length": self._stream_content_length,
+                                        "tool_calls_count": self._stream_tool_calls_count,
+                                        "finish_reason": choice.finish_reason,
+                                        "model": chunk.model,
+                                        "provider": "deepseek"
+                                    }
+                                    stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
+                                    stop_info.metadata["provider"] = "deepseek"
+                                else:
+                                    choice_data = {"delta": choice.delta}
+                                    stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
 
                             choices.append(StreamChoice(
                                 index=choice.index,
                                 delta=ChoiceDelta(
                                     content=choice.delta.content,
                                     role=choice.delta.role,
-                                    tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
+                                    tool_calls=accumulated_tool_calls,
                                     reasoning_content=getattr(choice.delta, 'reasoning_content', None)
                                 ),
                                 finish_reason=choice.finish_reason,

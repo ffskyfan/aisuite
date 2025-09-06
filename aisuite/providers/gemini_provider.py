@@ -203,6 +203,11 @@ class GeminiProvider(Provider):
 
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
+        
+        # Track accumulated content for streaming responses
+        # Used to provide accurate metadata in stop_info
+        self._stream_content_length = 0
+        self._stream_tool_calls_count = 0
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from Gemini finish_reason."""
@@ -537,6 +542,11 @@ class GeminiProvider(Provider):
             # For agent scenarios where the last message is a tool result or assistant message,
             # we can use the model's generate_content method directly with the full conversation
             if stream:
+                # Reset streaming state
+                self._streaming_tool_calls = {}
+                self._stream_content_length = 0
+                self._stream_tool_calls_count = 0
+                
                 # For streaming, we need to handle this differently
                 # Use the client's models.generate_content_stream method
                 contents = []
@@ -635,24 +645,28 @@ class GeminiProvider(Provider):
 
                         if content_text_parts:
                             current_chunk_text = "".join(content_text_parts)
+                            # Accumulate content length for accurate stop_info metadata
+                            self._stream_content_length += len(current_chunk_text)
+                        
+                        # Accumulate tool calls count
+                        if tool_calls:
+                            self._stream_tool_calls_count += len(tool_calls)
 
                         # Check for finish_reason in chunk
                         finish_reason = None
                         stop_info = None
                         if chunk.candidates and chunk.candidates[0].finish_reason:
                             finish_reason = chunk.candidates[0].finish_reason
-                            # Create stop_info for final chunk
-                            choice_data = {
-                                "content": {
-                                    "parts": []
-                                }
+                            # Use accumulated values for accurate stop_info metadata
+                            metadata = {
+                                "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                                "content_length": self._stream_content_length,
+                                "tool_calls_count": self._stream_tool_calls_count,
+                                "finish_reason": finish_reason,
+                                "model": model_id,
+                                "provider": "gemini"
                             }
-                            if current_chunk_text:
-                                choice_data["content"]["parts"].append({"text": current_chunk_text})
-                            if tool_calls:
-                                choice_data["content"]["parts"].extend([{"functionCall": tc} for tc in tool_calls])
-
-                            stop_info = self._create_stop_info(finish_reason, choice_data, model_id)
+                            stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, metadata)
 
                         yield ChatCompletionResponse(
                             choices=[
@@ -745,8 +759,10 @@ class GeminiProvider(Provider):
 
         # Send the last user message and get response (streaming or full)
         if stream:
-            # Reset streaming tool calls state
+            # Reset streaming state
             self._streaming_tool_calls = {}
+            self._stream_content_length = 0
+            self._stream_tool_calls_count = 0
 
             # Streaming response: return a generator yielding ChatCompletionResponse objects
             async def stream_generator():
@@ -784,24 +800,28 @@ class GeminiProvider(Provider):
 
                     if content_text_parts:
                         current_chunk_text = "".join(content_text_parts)
+                        # Accumulate content length for accurate stop_info metadata
+                        self._stream_content_length += len(current_chunk_text)
+                    
+                    # Accumulate tool calls count
+                    if tool_calls:
+                        self._stream_tool_calls_count += len(tool_calls)
 
                     # Check for finish_reason in chunk
                     finish_reason = None
                     stop_info = None
                     if chunk.candidates and chunk.candidates[0].finish_reason:
                         finish_reason = chunk.candidates[0].finish_reason
-                        # Create stop_info for final chunk
-                        choice_data = {
-                            "content": {
-                                "parts": []
-                            }
+                        # Use accumulated values for accurate stop_info metadata
+                        metadata = {
+                            "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                            "content_length": self._stream_content_length,
+                            "tool_calls_count": self._stream_tool_calls_count,
+                            "finish_reason": finish_reason,
+                            "model": model_id,
+                            "provider": "gemini"
                         }
-                        if current_chunk_text:
-                            choice_data["content"]["parts"].append({"text": current_chunk_text})
-                        if tool_calls:
-                            choice_data["content"]["parts"].extend([{"functionCall": tc} for tc in tool_calls])
-
-                        stop_info = self._create_stop_info(finish_reason, choice_data, model_id)
+                        stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, metadata)
 
                     yield ChatCompletionResponse(
                         choices=[

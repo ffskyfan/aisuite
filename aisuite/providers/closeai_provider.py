@@ -67,6 +67,11 @@ class CloseaiProvider(Provider):
 
         # Map Responses function_call item.id (fc_*) to call_id (call_*) for next-turn outputs
         self._responses_tool_call_ids: Dict[str, str] = {}
+        
+        # Track accumulated content for streaming responses
+        # Used to provide accurate metadata in stop_info
+        self._stream_content_length = 0
+        self._stream_tool_calls_count = 0
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from OpenAI-compatible finish_reason."""
@@ -383,8 +388,10 @@ class CloseaiProvider(Provider):
             responses_kwargs['tools'] = self._convert_tools_for_responses_api(responses_kwargs['tools'])
 
         if stream:
-            # Reset streaming tool calls state for Responses API too
+            # Reset streaming state for Responses API
             self._streaming_tool_calls = {}
+            self._stream_content_length = 0
+            self._stream_tool_calls_count = 0
 
             # For streaming, we need to handle the response differently
             response = await self.client.responses.create(
@@ -522,8 +529,10 @@ class CloseaiProvider(Provider):
         prepared_kwargs = self._prepare_reasoning_kwargs(model, kwargs, use_responses_api=False)
 
         if stream:
-            # Reset streaming tool calls state
+            # Reset streaming state
             self._streaming_tool_calls = {}
+            self._stream_content_length = 0
+            self._stream_tool_calls_count = 0
 
             # Clean messages parameter, remove ReasoningContent objects
             cleaned_messages = []
@@ -557,18 +566,40 @@ class CloseaiProvider(Provider):
                         # Create choices with stop_info
                         choices = []
                         for choice in chunk.choices:
+                            # Accumulate content and tool calls for accurate metadata
+                            if choice.delta.content:
+                                self._stream_content_length += len(choice.delta.content)
+                            
+                            accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
+                            if accumulated_tool_calls:
+                                self._stream_tool_calls_count += len(accumulated_tool_calls)
+                            
                             # Create stop_info if finish_reason is present
                             stop_info = None
                             if choice.finish_reason:
-                                choice_data = {"delta": choice.delta}
-                                stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
+                                # Use accumulated values for final stop_info
+                                if choice.finish_reason == 'stop':
+                                    metadata = {
+                                        "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                                        "content_length": self._stream_content_length,
+                                        "tool_calls_count": self._stream_tool_calls_count,
+                                        "finish_reason": choice.finish_reason,
+                                        "model": chunk.model,
+                                        "provider": "closeai"
+                                    }
+                                    from aisuite.framework.stop_reason import stop_reason_manager
+                                    stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
+                                    stop_info.metadata["provider"] = "closeai"
+                                else:
+                                    choice_data = {"delta": choice.delta}
+                                    stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
 
                             choices.append(StreamChoice(
                                 index=choice.index,
                                 delta=ChoiceDelta(
                                     content=choice.delta.content,
                                     role=choice.delta.role,
-                                    tool_calls=self._accumulate_and_convert_tool_calls(choice.delta),
+                                    tool_calls=accumulated_tool_calls,
                                     reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # Keep original format in streaming
                                 ),
                                 finish_reason=choice.finish_reason,
@@ -761,6 +792,9 @@ class CloseaiProvider(Provider):
             if hasattr(chunk, 'delta'):
                 content = chunk.delta
                 role = "assistant"
+                # Accumulate content length for accurate stop_info metadata
+                if content:
+                    self._stream_content_length += len(content)
 
         elif chunk_type == 'response.output_item.added':
             # Output item added - set role for message items and handle function calls
@@ -827,6 +861,8 @@ class CloseaiProvider(Provider):
                         if converted:
                             # Remove completed tool call
                             del self._streaming_tool_calls[item_id]
+                            # Increment tool calls count for accurate stop_info metadata
+                            self._stream_tool_calls_count += 1
 
                             return ChatCompletionResponse(
                                 choices=[
@@ -854,13 +890,14 @@ class CloseaiProvider(Provider):
                             del self._streaming_tool_calls[item_id]
 
         elif chunk_type == 'response.output_item.done':
-            # Output item completed
-            if hasattr(chunk, 'item') and hasattr(chunk.item, 'status'):
-                if chunk.item.status == 'completed':
-                    finish_reason = 'stop'
+            # Output item completed - this is NOT the end of the entire response
+            # Each tool call or message item will have its own done event
+            # We should NOT set finish_reason here to avoid premature stop
+            pass
 
         elif chunk_type in ['response.completed', 'response.done']:
-            # Response completed
+            # Response completed - this is the REAL end of the entire response
+            # Only set finish_reason when the entire response is complete
             finish_reason = 'stop'
 
         elif chunk_type == 'error':
@@ -870,13 +907,30 @@ class CloseaiProvider(Provider):
         # Create stop_info if finish_reason is present
         stop_info = None
         if finish_reason:
-            choice_data = {
-                "delta": {
-                    "content": content,
-                    "tool_calls": tool_calls
+            # For the final stop_info, use accumulated values to reflect the entire response
+            if finish_reason == 'stop' and chunk_type in ['response.completed', 'response.done']:
+                # Override with accumulated metadata for accurate representation
+                metadata = {
+                    "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                    "content_length": self._stream_content_length,
+                    "tool_calls_count": self._stream_tool_calls_count,
+                    "finish_reason": finish_reason,
+                    "model": getattr(chunk, 'model', None),
+                    "provider": "closeai"
                 }
-            }
-            stop_info = self._create_stop_info(finish_reason, choice_data, getattr(chunk, 'model', None))
+                from aisuite.framework.stop_reason import stop_reason_manager
+                stop_info = stop_reason_manager.map_stop_reason("openai", finish_reason, metadata)
+                # Override provider in metadata to correctly identify as CloseAI
+                stop_info.metadata["provider"] = "closeai"
+            else:
+                # For non-final or error cases, use standard approach
+                choice_data = {
+                    "delta": {
+                        "content": content,
+                        "tool_calls": tool_calls
+                    }
+                }
+                stop_info = self._create_stop_info(finish_reason, choice_data, getattr(chunk, 'model', None))
 
         # Return streaming chunk - only include non-None values to avoid overwriting
         return ChatCompletionResponse(
