@@ -69,11 +69,15 @@ class GeminiMessageConverter:
         content = response.text
         reasoning_content = None
 
-        if response.candidates and response.candidates[0].content.parts:
+        candidate = response.candidates[0] if response.candidates else None
+        candidate_content = getattr(candidate, "content", None)
+        candidate_parts = getattr(candidate_content, "parts", None)
+
+        if candidate_parts:
             reasoning_text_parts = []
             content_text_parts = []
 
-            for part in response.candidates[0].content.parts:
+            for part in candidate_parts:
                 # Check if the part is a thought and has text
                 if getattr(part, 'thought', False) and getattr(part, 'text', None):
                     reasoning_text_parts.append(part.text)
@@ -628,8 +632,12 @@ class GeminiProvider(Provider):
                         content_text_parts = []
                         tool_calls = None
 
-                        if chunk.candidates and chunk.candidates[0].content.parts:
-                            for part in chunk.candidates[0].content.parts:
+                        candidate = chunk.candidates[0] if chunk.candidates else None
+                        candidate_content = getattr(candidate, "content", None)
+                        candidate_parts = getattr(candidate_content, "parts", None)
+
+                        if candidate_parts:
+                            for part in candidate_parts:
                                 if getattr(part, 'thought', False) and getattr(part, 'text', None):
                                     reasoning_text_parts.append(part.text)
                                 elif hasattr(part, 'function_call') and part.function_call:
@@ -779,8 +787,12 @@ class GeminiProvider(Provider):
                     content_text_parts = []
                     tool_calls = None
 
-                    if chunk.candidates and chunk.candidates[0].content.parts: # Ensure candidates and parts exist
-                        for part in chunk.candidates[0].content.parts:
+                    candidate = chunk.candidates[0] if chunk.candidates else None
+                    candidate_content = getattr(candidate, "content", None)
+                    candidate_parts = getattr(candidate_content, "parts", None)
+
+                    if candidate_parts: # Ensure candidates and parts exist
+                        for part in candidate_parts:
                             # Check if the part is a thought and has text
                             if getattr(part, 'thought', False) and getattr(part, 'text', None):
                                 reasoning_text_parts.append(part.text)
