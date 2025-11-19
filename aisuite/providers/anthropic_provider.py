@@ -77,6 +77,7 @@ class AnthropicMessageConverter:
         reasoning_content = None
         finish_reason = None
         stop_info = None
+        usage = None
 
         # 获取chunk类型
         chunk_type = getattr(chunk, 'type', 'unknown')
@@ -157,6 +158,17 @@ class AnthropicMessageConverter:
                     original_stop_reason = chunk.delta.stop_reason
                     finish_reason = self._get_finish_reason(chunk.delta)
 
+                    # Extract usage information if present on the streaming event
+                    usage_obj = getattr(chunk, "usage", None)
+                    if not usage_obj and hasattr(chunk.delta, "usage"):
+                        usage_obj = chunk.delta.usage
+
+                    if usage_obj:
+                        # Normalize usage to standard prompt/completion/total format
+                        normalized_usage = self._normalize_usage_obj(usage_obj)
+                        if normalized_usage:
+                            usage = normalized_usage
+
                     # Create enhanced stop info using stream-wide statistics
                     metadata = {
                         "has_content": provider._stream_has_content if provider else bool(content),
@@ -214,6 +226,14 @@ class AnthropicMessageConverter:
             else:
                 anthropic_logger.info(f"[PROVIDER] No stop_info to transmit")
 
+            metadata = {
+                'id': getattr(chunk, 'id', None),
+                'created': None,  # Anthropic doesn't provide timestamp in chunks
+                'model': model,
+            }
+            if usage:
+                metadata['usage'] = usage
+
             return ChatCompletionResponse(
                 choices=[
                     StreamChoice(
@@ -222,17 +242,13 @@ class AnthropicMessageConverter:
                             content=content if content else None,
                             role=role,
                             tool_calls=tool_calls,
-                            reasoning_content=reasoning_content
+                            reasoning_content=reasoning_content,
                         ),
                         finish_reason=finish_reason,
-                        stop_info=stop_info  # Enhanced stop information
+                        stop_info=stop_info,  # Enhanced stop information
                     )
                 ],
-                metadata={
-                    'id': getattr(chunk, 'id', None),
-                    'created': None,  # Anthropic doesn't provide timestamp in chunks
-                    'model': model
-                }
+                metadata=metadata,
             )
         else:
             # No meaningful content to pass downstream
@@ -369,13 +385,32 @@ class AnthropicMessageConverter:
         original_stop_reason = getattr(response, 'stop_reason', 'end_turn')
         return stop_reason_manager.map_stop_reason("anthropic", original_stop_reason, metadata)
 
-    def _get_usage_stats(self, response):
-        """Get the usage statistics."""
+    def _normalize_usage_obj(self, usage_obj):
+        """Normalize Anthropic usage object to the unified AISuite format."""
+        if not usage_obj:
+            return None
+
+        # Anthropic usage object typically has `input_tokens` and `output_tokens`
+        input_tokens = getattr(usage_obj, "input_tokens", None)
+        output_tokens = getattr(usage_obj, "output_tokens", None)
+
+        # Also support dict-like objects for extra robustness
+        if input_tokens is None or output_tokens is None and isinstance(usage_obj, dict):
+            input_tokens = usage_obj.get("input_tokens", input_tokens)
+            output_tokens = usage_obj.get("output_tokens", output_tokens)
+
+        if input_tokens is None or output_tokens is None:
+            return None
+
         return {
-            "prompt_tokens": response.usage.input_tokens,
-            "completion_tokens": response.usage.output_tokens,
-            "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
         }
+
+    def _get_usage_stats(self, response):
+        """Get the usage statistics for non-streaming responses."""
+        return self._normalize_usage_obj(getattr(response, "usage", None))
 
     def _get_message(self, response):
         """Get the appropriate message based on response type."""

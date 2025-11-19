@@ -32,7 +32,7 @@ class DeepseekProvider(Provider):
 
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
-        
+
         # Track accumulated content for streaming responses
         # Used to provide accurate metadata in stop_info
         self._stream_content_length = 0
@@ -79,6 +79,48 @@ class DeepseekProvider(Provider):
         stop_info.metadata["provider"] = "deepseek"
         return stop_info
 
+    def _normalize_usage(self, usage_obj):
+        """Normalize DeepSeek/OpenAI usage objects to a standard dict.
+
+        Supports both Chat Completions usage (prompt_tokens/completion_tokens)
+        and possible input/output token naming variants.
+        """
+        if not usage_obj:
+            return None
+
+        # Try to get a plain dict from pydantic model or mapping
+        if hasattr(usage_obj, "model_dump"):
+            data = usage_obj.model_dump()
+        elif isinstance(usage_obj, dict):
+            data = usage_obj
+        else:
+            data = {}
+            for attr in ("input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"):
+                if hasattr(usage_obj, attr):
+                    data[attr] = getattr(usage_obj, attr)
+
+        prompt_tokens = data.get("input_tokens") or data.get("prompt_tokens")
+        completion_tokens = data.get("output_tokens") or data.get("completion_tokens")
+
+        if prompt_tokens is None and hasattr(usage_obj, "prompt_tokens"):
+            prompt_tokens = getattr(usage_obj, "prompt_tokens")
+        if completion_tokens is None and hasattr(usage_obj, "completion_tokens"):
+            completion_tokens = getattr(usage_obj, "completion_tokens")
+
+        if prompt_tokens is None or completion_tokens is None:
+            return None
+
+        total_tokens = data.get("total_tokens")
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
+
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         # Any exception raised by OpenAI will be returned to the caller.
         # Maybe we should catch them and raise a custom LLMError.
@@ -88,14 +130,27 @@ class DeepseekProvider(Provider):
             self._stream_content_length = 0
             self._stream_tool_calls_count = 0
 
+            # Ensure usage is included in streaming responses
+            stream_kwargs = kwargs.copy()
+            stream_options = stream_kwargs.get("stream_options") or {}
+            if "include_usage" not in stream_options:
+                stream_options["include_usage"] = True
+            stream_kwargs["stream_options"] = stream_options
+
             response = await self.client.chat.completions.create(
                 model=model,
                 messages=messages,
                 stream=True,
-                **kwargs  # Pass any additional arguments to the OpenAI API
+                **stream_kwargs,  # Pass any additional arguments to the OpenAI API
             )
+
             async def stream_generator():
+                stream_usage = None
                 async for chunk in response:
+                    # Capture usage from streaming chunks (only appears on final chunk)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        stream_usage = self._normalize_usage(chunk.usage) or stream_usage
+
                     if chunk.choices:
                         # Create choices with stop_info
                         choices = []
@@ -103,23 +158,23 @@ class DeepseekProvider(Provider):
                             # Accumulate content and tool calls for accurate metadata
                             if choice.delta.content:
                                 self._stream_content_length += len(choice.delta.content)
-                            
+
                             accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
                             if accumulated_tool_calls:
                                 self._stream_tool_calls_count += len(accumulated_tool_calls)
-                            
+
                             # Create stop_info if finish_reason is present
                             stop_info = None
                             if choice.finish_reason:
                                 # Use accumulated values for final stop_info
-                                if choice.finish_reason == 'stop':
+                                if choice.finish_reason == "stop":
                                     metadata = {
                                         "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
                                         "content_length": self._stream_content_length,
                                         "tool_calls_count": self._stream_tool_calls_count,
                                         "finish_reason": choice.finish_reason,
                                         "model": chunk.model,
-                                        "provider": "deepseek"
+                                        "provider": "deepseek",
                                     }
                                     stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
                                     stop_info.metadata["provider"] = "deepseek"
@@ -127,33 +182,42 @@ class DeepseekProvider(Provider):
                                     choice_data = {"delta": choice.delta}
                                     stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
 
-                            choices.append(StreamChoice(
-                                index=choice.index,
-                                delta=ChoiceDelta(
-                                    content=choice.delta.content,
-                                    role=choice.delta.role,
-                                    tool_calls=accumulated_tool_calls,
-                                    reasoning_content=getattr(choice.delta, 'reasoning_content', None)
-                                ),
-                                finish_reason=choice.finish_reason,
-                                stop_info=stop_info
-                            ))
+                            choices.append(
+                                StreamChoice(
+                                    index=choice.index,
+                                    delta=ChoiceDelta(
+                                        content=choice.delta.content,
+                                        role=choice.delta.role,
+                                        tool_calls=accumulated_tool_calls,
+                                        reasoning_content=getattr(choice.delta, "reasoning_content", None),
+                                    ),
+                                    finish_reason=choice.finish_reason,
+                                    stop_info=stop_info,
+                                )
+                            )
+
+                        # Determine if this is the final chunk
+                        is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
+                        metadata = {
+                            "id": chunk.id,
+                            "created": chunk.created,
+                            "model": chunk.model,
+                        }
+                        if is_final_chunk and stream_usage:
+                            metadata["usage"] = stream_usage
 
                         yield ChatCompletionResponse(
                             choices=choices,
-                            metadata={
-                                'id': chunk.id,
-                                'created': chunk.created,
-                                'model': chunk.model
-                            }
+                            metadata=metadata,
                         )
+
             return stream_generator()
         else:
             response = await self.client.chat.completions.create(
                 model=model,
                 messages=messages,
                 stream=False,
-                **kwargs  # Pass any additional arguments to the OpenAI API
+                **kwargs,  # Pass any additional arguments to the OpenAI API
             )
 
             # Create choices with stop_info
@@ -161,29 +225,40 @@ class DeepseekProvider(Provider):
             for choice in response.choices:
                 # Create stop_info
                 choice_data = {"message": choice.message}
-                finish_reason = getattr(choice, 'finish_reason', None)
+                finish_reason = getattr(choice, "finish_reason", None)
                 stop_info = self._create_stop_info(finish_reason, choice_data, model)
 
-                choices.append(Choice(
-                    index=choice.index,
-                    message=Message(
-                        content=choice.message.content,
-                        role=choice.message.role,
-                        tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
-                        refusal=None,
-                        reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
-                    ),
-                    finish_reason=finish_reason,
-                    stop_info=stop_info
-                ))
+                choices.append(
+                    Choice(
+                        index=choice.index,
+                        message=Message(
+                            content=choice.message.content,
+                            role=choice.message.role,
+                            tool_calls=self._convert_tool_calls(choice.message.tool_calls)
+                            if hasattr(choice.message, "tool_calls") and choice.message.tool_calls
+                            else None,
+                            refusal=None,
+                            reasoning_content=self._convert_reasoning_content(getattr(choice.message, "reasoning_content", None)),
+                        ),
+                        finish_reason=finish_reason,
+                        stop_info=stop_info,
+                    )
+                )
+
+            usage = getattr(response, "usage", None)
+            usage_dict = self._normalize_usage(usage)
+
+            metadata = {
+                "id": response.id,
+                "created": response.created,
+                "model": model,
+            }
+            if usage_dict:
+                metadata["usage"] = usage_dict
 
             return ChatCompletionResponse(
                 choices=choices,
-                metadata={
-                    "id": response.id,
-                    "created": response.created,
-                    "model": model
-                }
+                metadata=metadata,
             )
 
     def _convert_reasoning_content(self, reasoning_content):

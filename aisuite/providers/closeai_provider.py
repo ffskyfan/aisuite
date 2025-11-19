@@ -67,7 +67,7 @@ class CloseaiProvider(Provider):
 
         # Map Responses function_call item.id (fc_*) to call_id (call_*) for next-turn outputs
         self._responses_tool_call_ids: Dict[str, str] = {}
-        
+
         # Track accumulated content for streaming responses
         # Used to provide accurate metadata in stop_info
         self._stream_content_length = 0
@@ -249,6 +249,48 @@ class CloseaiProvider(Provider):
             verbosity = kwargs.pop('verbosity')
             kwargs['text'] = {'verbosity': verbosity}
 
+
+    def _normalize_usage(self, usage_obj):
+        """Normalize OpenAI/CloseAI usage objects to a standard dict.
+
+        Supports both Chat Completions usage (prompt_tokens/completion_tokens)
+        and possible input/output token naming variants.
+        """
+        if not usage_obj:
+            return None
+
+        # Try to get a plain dict from pydantic model or mapping
+        if hasattr(usage_obj, "model_dump"):
+            data = usage_obj.model_dump()
+        elif isinstance(usage_obj, dict):
+            data = usage_obj
+        else:
+            data = {}
+            for attr in ("input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"):
+                if hasattr(usage_obj, attr):
+                    data[attr] = getattr(usage_obj, attr)
+
+        prompt_tokens = data.get("input_tokens") or data.get("prompt_tokens")
+        completion_tokens = data.get("output_tokens") or data.get("completion_tokens")
+
+        if prompt_tokens is None and hasattr(usage_obj, "prompt_tokens"):
+            prompt_tokens = getattr(usage_obj, "prompt_tokens")
+        if completion_tokens is None and hasattr(usage_obj, "completion_tokens"):
+            completion_tokens = getattr(usage_obj, "completion_tokens")
+
+        if prompt_tokens is None or completion_tokens is None:
+            return None
+
+        total_tokens = data.get("total_tokens")
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
     async def _responses_create(self, model: str, messages: List[Dict[str, Any]], stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """
         Create responses using CloseAI's Responses API.
@@ -425,7 +467,7 @@ class CloseaiProvider(Provider):
         Responses API expects tools in a flattened format without the nested 'function' structure.
         """
         converted_tools = []
-        
+
         for tool in tools:
             if isinstance(tool, dict):
                 if tool.get('type') == 'function' and 'function' in tool:
@@ -447,7 +489,7 @@ class CloseaiProvider(Provider):
             else:
                 # Non-dict tool, keep as is
                 converted_tools.append(tool)
-        
+
         return converted_tools
 
     def _accumulate_responses_tool_calls(self, chunk) -> Optional[List[ChatCompletionMessageToolCall]]:
@@ -540,28 +582,40 @@ class CloseaiProvider(Provider):
                 if isinstance(msg, dict):
                     cleaned_msg = msg.copy()
                     # Remove reasoning_content field as CloseAI API doesn't need it as input
-                    if 'reasoning_content' in cleaned_msg:
-                        cleaned_msg.pop('reasoning_content')
+                    if "reasoning_content" in cleaned_msg:
+                        cleaned_msg.pop("reasoning_content")
                     cleaned_messages.append(cleaned_msg)
                 else:
                     # If it's a Message object, convert to dict and remove reasoning_content
-                    if hasattr(msg, 'model_dump'):
+                    if hasattr(msg, "model_dump"):
                         cleaned_msg = msg.model_dump()
-                        if 'reasoning_content' in cleaned_msg:
-                            cleaned_msg.pop('reasoning_content')
+                        if "reasoning_content" in cleaned_msg:
+                            cleaned_msg.pop("reasoning_content")
                         cleaned_messages.append(cleaned_msg)
                     else:
                         cleaned_messages.append(msg)
+
+            # Ensure usage is included in streaming responses
+            stream_kwargs = prepared_kwargs.copy()
+            stream_options = stream_kwargs.get("stream_options") or {}
+            if "include_usage" not in stream_options:
+                stream_options["include_usage"] = True
+            stream_kwargs["stream_options"] = stream_options
 
             response = await self.client.chat.completions.create(
                 model=model,
                 messages=cleaned_messages,  # Use cleaned messages
                 stream=True,
-                **prepared_kwargs  # Use prepared kwargs that are compatible with the model
+                **stream_kwargs,  # Use prepared kwargs that are compatible with the model
             )
 
             async def stream_generator():
+                stream_usage = None
                 async for chunk in response:
+                    # Capture usage from streaming chunks (only appears on final chunk)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        stream_usage = self._normalize_usage(chunk.usage) or stream_usage
+
                     if chunk.choices:
                         # Create choices with stop_info
                         choices = []
@@ -569,51 +623,65 @@ class CloseaiProvider(Provider):
                             # Accumulate content and tool calls for accurate metadata
                             if choice.delta.content:
                                 self._stream_content_length += len(choice.delta.content)
-                            
+
                             accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
                             if accumulated_tool_calls:
                                 self._stream_tool_calls_count += len(accumulated_tool_calls)
-                            
+
                             # Create stop_info if finish_reason is present
                             stop_info = None
                             if choice.finish_reason:
                                 # Use accumulated values for final stop_info
-                                if choice.finish_reason == 'stop':
+                                if choice.finish_reason == "stop":
                                     metadata = {
                                         "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
                                         "content_length": self._stream_content_length,
                                         "tool_calls_count": self._stream_tool_calls_count,
                                         "finish_reason": choice.finish_reason,
                                         "model": chunk.model,
-                                        "provider": "closeai"
+                                        "provider": "closeai",
                                     }
                                     from aisuite.framework.stop_reason import stop_reason_manager
+
                                     stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
                                     stop_info.metadata["provider"] = "closeai"
                                 else:
                                     choice_data = {"delta": choice.delta}
                                     stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
 
-                            choices.append(StreamChoice(
-                                index=choice.index,
-                                delta=ChoiceDelta(
-                                    content=choice.delta.content,
-                                    role=choice.delta.role,
-                                    tool_calls=accumulated_tool_calls,
-                                    reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # Keep original format in streaming
-                                ),
-                                finish_reason=choice.finish_reason,
-                                stop_info=stop_info
-                            ))
+                            choices.append(
+                                StreamChoice(
+                                    index=choice.index,
+                                    delta=ChoiceDelta(
+                                        content=choice.delta.content,
+                                        role=choice.delta.role,
+                                        tool_calls=accumulated_tool_calls,
+                                        reasoning_content=getattr(
+                                            choice.delta,
+                                            "reasoning_content",
+                                            None,
+                                        ),  # Keep original format in streaming
+                                    ),
+                                    finish_reason=choice.finish_reason,
+                                    stop_info=stop_info,
+                                )
+                            )
+
+                        # Determine if this is the final chunk
+                        is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
+                        metadata = {
+                            "id": chunk.id,
+                            "created": chunk.created,
+                            "model": chunk.model,
+                        }
+                        if is_final_chunk and stream_usage:
+                            metadata["usage"] = stream_usage
 
                         yield ChatCompletionResponse(
                             choices=choices,
-                            metadata={
-                                'id': chunk.id,
-                                'created': chunk.created,
-                                'model': chunk.model
-                            }
+                            metadata=metadata,
                         )
+
             return stream_generator()
         else:
             # For non-streaming calls, also need to clean messages
@@ -785,33 +853,34 @@ class CloseaiProvider(Provider):
         tool_calls = None
 
         # Handle different event types based on official documentation
-        chunk_type = getattr(chunk, 'type', None)
+        chunk_type = getattr(chunk, "type", None)
+        usage_dict = None
 
-        if chunk_type == 'response.output_text.delta':
+        if chunk_type == "response.output_text.delta":
             # Text delta event - contains the actual content increments
-            if hasattr(chunk, 'delta'):
+            if hasattr(chunk, "delta"):
                 content = chunk.delta
                 role = "assistant"
                 # Accumulate content length for accurate stop_info metadata
                 if content:
                     self._stream_content_length += len(content)
 
-        elif chunk_type == 'response.output_item.added':
+        elif chunk_type == "response.output_item.added":
             # Output item added - set role for message items and handle function calls
-            if hasattr(chunk, 'item'):
+            if hasattr(chunk, "item"):
                 item = chunk.item
-                if hasattr(item, 'role'):
+                if hasattr(item, "role"):
                     role = item.role
-                elif hasattr(item, 'type') and item.type == 'message':
+                elif hasattr(item, "type") and item.type == "message":
                     role = "assistant"
-                elif hasattr(item, 'type') and item.type == 'function_call':
+                elif hasattr(item, "type") and item.type == "function_call":
                     # Handle function call item added
                     self._handle_responses_output_item_added(chunk)
                     role = "assistant"
 
-        elif chunk_type == 'response.function_call_arguments.delta':
+        elif chunk_type == "response.function_call_arguments.delta":
             # Function call arguments delta - handle tool calls streaming
-            if hasattr(chunk, 'delta') and hasattr(chunk, 'item_id'):
+            if hasattr(chunk, "delta") and hasattr(chunk, "item_id"):
                 # Accumulate function call arguments for Responses API
                 tool_calls = self._accumulate_responses_tool_calls(chunk)
                 if tool_calls:
@@ -824,22 +893,22 @@ class CloseaiProvider(Provider):
                                     content=None,
                                     role="assistant",
                                     tool_calls=tool_calls,
-                                    reasoning_content=None
+                                    reasoning_content=None,
                                 ),
                                 finish_reason=None,
-                                stop_info=None  # No stop_info for intermediate tool call chunks
+                                stop_info=None,  # No stop_info for intermediate tool call chunks
                             )
                         ],
                         metadata={
-                            'id': getattr(chunk, 'response_id', None),
-                            'created': getattr(chunk, 'created', None),
-                            'model': getattr(chunk, 'model', None)
-                        }
+                            "id": getattr(chunk, "response_id", None),
+                            "created": getattr(chunk, "created", None),
+                            "model": getattr(chunk, "model", None),
+                        },
                     )
 
-        elif chunk_type == 'response.function_call_arguments.done':
+        elif chunk_type == "response.function_call_arguments.done":
             # Function call arguments completed - finalize tool call
-            if hasattr(chunk, 'item_id') and hasattr(chunk, 'arguments'):
+            if hasattr(chunk, "item_id") and hasattr(chunk, "arguments"):
                 # Force completion of this tool call
                 item_id = chunk.item_id
                 if item_id in self._streaming_tool_calls:
@@ -848,14 +917,22 @@ class CloseaiProvider(Provider):
 
                     # Convert to final format
                     try:
-                        mock_tool_call = type('MockToolCall', (), {
-                            'id': tool_call_data["id"],
-                            'type': tool_call_data["type"],
-                            'function': type('MockFunction', (), {
-                                'name': tool_call_data["function"]["name"],
-                                'arguments': tool_call_data["function"]["arguments"]
-                            })()
-                        })()
+                        mock_tool_call = type(
+                            "MockToolCall",
+                            (),
+                            {
+                                "id": tool_call_data["id"],
+                                "type": tool_call_data["type"],
+                                "function": type(
+                                    "MockFunction",
+                                    (),
+                                    {
+                                        "name": tool_call_data["function"]["name"],
+                                        "arguments": tool_call_data["function"]["arguments"],
+                                    },
+                                )(),
+                            },
+                        )()
 
                         converted = self._convert_tool_calls([mock_tool_call])
                         if converted:
@@ -872,53 +949,57 @@ class CloseaiProvider(Provider):
                                             content=None,
                                             role="assistant",
                                             tool_calls=converted,
-                                            reasoning_content=None
+                                            reasoning_content=None,
                                         ),
                                         finish_reason=None,
-                                        stop_info=None  # No stop_info for intermediate tool call chunks
+                                        stop_info=None,  # No stop_info for intermediate tool call chunks
                                     )
                                 ],
                                 metadata={
-                                    'id': getattr(chunk, 'response_id', None),
-                                    'created': getattr(chunk, 'created', None),
-                                    'model': getattr(chunk, 'model', None)
-                                }
+                                    "id": getattr(chunk, "response_id", None),
+                                    "created": getattr(chunk, "created", None),
+                                    "model": getattr(chunk, "model", None),
+                                },
                             )
-                    except Exception as e:
+                    except Exception as e:  # noqa: F841
                         # If conversion fails, clean up and continue
                         if item_id in self._streaming_tool_calls:
                             del self._streaming_tool_calls[item_id]
 
-        elif chunk_type == 'response.output_item.done':
+        elif chunk_type == "response.output_item.done":
             # Output item completed - this is NOT the end of the entire response
             # Each tool call or message item will have its own done event
             # We should NOT set finish_reason here to avoid premature stop
             pass
 
-        elif chunk_type in ['response.completed', 'response.done']:
+        elif chunk_type in ["response.completed", "response.done"]:
             # Response completed - this is the REAL end of the entire response
             # Only set finish_reason when the entire response is complete
-            finish_reason = 'stop'
+            finish_reason = "stop"
+            # Extract usage from the final Responses chunk if available
+            if hasattr(chunk, "response"):
+                usage_dict = self._extract_usage_from_responses(chunk.response)
 
-        elif chunk_type == 'error':
+        elif chunk_type == "error":
             # Error occurred
-            finish_reason = 'error'
+            finish_reason = "error"
 
         # Create stop_info if finish_reason is present
         stop_info = None
         if finish_reason:
             # For the final stop_info, use accumulated values to reflect the entire response
-            if finish_reason == 'stop' and chunk_type in ['response.completed', 'response.done']:
+            if finish_reason == "stop" and chunk_type in ["response.completed", "response.done"]:
                 # Override with accumulated metadata for accurate representation
                 metadata = {
                     "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
                     "content_length": self._stream_content_length,
                     "tool_calls_count": self._stream_tool_calls_count,
                     "finish_reason": finish_reason,
-                    "model": getattr(chunk, 'model', None),
-                    "provider": "closeai"
+                    "model": getattr(chunk, "model", None),
+                    "provider": "closeai",
                 }
                 from aisuite.framework.stop_reason import stop_reason_manager
+
                 stop_info = stop_reason_manager.map_stop_reason("openai", finish_reason, metadata)
                 # Override provider in metadata to correctly identify as CloseAI
                 stop_info.metadata["provider"] = "closeai"
@@ -927,12 +1008,20 @@ class CloseaiProvider(Provider):
                 choice_data = {
                     "delta": {
                         "content": content,
-                        "tool_calls": tool_calls
+                        "tool_calls": tool_calls,
                     }
                 }
-                stop_info = self._create_stop_info(finish_reason, choice_data, getattr(chunk, 'model', None))
+                stop_info = self._create_stop_info(finish_reason, choice_data, getattr(chunk, "model", None))
 
         # Return streaming chunk - only include non-None values to avoid overwriting
+        metadata = {
+            "id": getattr(chunk, "response_id", None) or getattr(chunk, "item_id", None),
+            "created": getattr(chunk, "created", None),
+            "model": getattr(chunk, "model", None),
+        }
+        if usage_dict:
+            metadata["usage"] = usage_dict
+
         return ChatCompletionResponse(
             choices=[
                 StreamChoice(
@@ -941,17 +1030,13 @@ class CloseaiProvider(Provider):
                         content=content,
                         role=role,
                         tool_calls=tool_calls,
-                        reasoning_content=reasoning_content
+                        reasoning_content=reasoning_content,
                     ),
                     finish_reason=finish_reason,
-                    stop_info=stop_info
+                    stop_info=stop_info,
                 )
             ],
-            metadata={
-                'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'item_id', None),
-                'created': getattr(chunk, 'created', None),
-                'model': getattr(chunk, 'model', None)
-            }
+            metadata=metadata,
         )
 
     def _extract_usage_from_responses(self, response) -> Optional[Dict[str, Any]]:
@@ -1121,7 +1206,7 @@ class CloseaiProvider(Provider):
     def _extract_tool_calls_from_responses(self, response) -> Optional[List[ChatCompletionMessageToolCall]]:
         """Extract tool calls from Responses API response."""
         tool_calls = []
-        
+
         if hasattr(response, 'output') and response.output:
             for item in response.output:
                 if hasattr(item, 'type') and item.type == 'function_call':
@@ -1129,7 +1214,7 @@ class CloseaiProvider(Provider):
                     call_id = getattr(item, 'id', None) or getattr(item, 'call_id', None)
                     name = getattr(item, 'name', None)
                     arguments = getattr(item, 'arguments', '')
-                    
+
                     if call_id and name:
                         function = Function(
                             name=name,
@@ -1141,9 +1226,9 @@ class CloseaiProvider(Provider):
                             type="function"
                         )
                         tool_calls.append(tool_call_obj)
-        
+
         return tool_calls if tool_calls else None
-    
+
     def _convert_tool_calls(self, tool_calls):
         """Convert tool calls to the framework's format."""
         if not tool_calls:

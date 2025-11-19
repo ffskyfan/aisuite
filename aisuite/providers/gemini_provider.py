@@ -10,6 +10,57 @@ from aisuite.provider import Provider
 from google import genai
 from google.genai import types
 
+
+def _normalize_gemini_usage(usage_obj):
+    """Normalize Gemini usage/usageMetadata to AISuite standard dict.
+
+    Maps promptTokenCount/prompt_token_count -> prompt_tokens,
+    candidatesTokenCount/candidates_token_count -> completion_tokens,
+    totalTokenCount/total_token_count -> total_tokens.
+    """
+    if not usage_obj:
+        return None
+
+    # Try to extract as plain dict
+    if hasattr(usage_obj, "model_dump"):
+        data = usage_obj.model_dump()
+    elif isinstance(usage_obj, dict):
+        data = usage_obj
+    else:
+        data = {}
+        for attr in (
+            "prompt_token_count",
+            "candidates_token_count",
+            "total_token_count",
+            "promptTokenCount",
+            "candidatesTokenCount",
+            "totalTokenCount",
+        ):
+            if hasattr(usage_obj, attr):
+                data[attr] = getattr(usage_obj, attr)
+
+    prompt_tokens = data.get("prompt_token_count") or data.get("promptTokenCount")
+    completion_tokens = data.get("candidates_token_count") or data.get("candidatesTokenCount")
+    total_tokens = (
+        data.get("total_token_count")
+        or data.get("totalTokenCount")
+        or (
+            (prompt_tokens or 0) + (completion_tokens or 0)
+            if prompt_tokens is not None and completion_tokens is not None
+            else None
+        )
+    )
+
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+
+    return {
+        "prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else None,
+        "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
+        "total_tokens": int(total_tokens) if total_tokens is not None else None,
+    }
+
+
 class GeminiMessageConverter:
 
     @staticmethod
@@ -139,7 +190,20 @@ class GeminiMessageConverter:
                 "provider": "gemini"
             })
 
+        # 提取 usage 元数据（token 统计）
+        usage_metadata = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
+        usage = _normalize_gemini_usage(usage_metadata)
+
         # 创建 ChatCompletionResponse 对象
+        metadata = {
+            "model": response.model_version,  # 模型名称
+            # Gemini API 目前不会返回这些字段
+            "id": None,
+            "created": None,
+        }
+        if usage:
+            metadata["usage"] = usage
+
         return ChatCompletionResponse(
             choices=[
                 Choice(
@@ -149,19 +213,13 @@ class GeminiMessageConverter:
                         content=content,
                         tool_calls=tool_calls,
                         refusal=None,
-                        reasoning_content=reasoning_content
+                        reasoning_content=reasoning_content,
                     ),  # 使用 Message 对象包装响应内容
                     finish_reason=finish_reason,
-                    stop_info=stop_info
+                    stop_info=stop_info,
                 )
             ],
-            metadata={
-                "model": response.model_version,  # 模型名称
-                # Gemini API 可能不提供这些字段，所以我们设置为 None
-                "id": None,
-                "created": None,
-                "usage": None  # Gemini API 目前不提供 token 使用统计
-            }
+            metadata=metadata,
         )
 
 
@@ -207,11 +265,22 @@ class GeminiProvider(Provider):
 
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
-        
+
         # Track accumulated content for streaming responses
         # Used to provide accurate metadata in stop_info
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
+
+    def _is_gemini_3_model(self, model_id: str) -> bool:
+        """Heuristic check for Gemini 3 series models.
+
+        We use a simple substring match so it works for both plain
+        "gemini-3-..." and provider-prefixed names like "google/gemini-3-...".
+        """
+        if not model_id:
+            return False
+        return "gemini-3" in model_id
+
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from Gemini finish_reason."""
@@ -333,34 +402,34 @@ class GeminiProvider(Provider):
         }]
 
         return gemini_tools
-    
+
     def _preprocess_messages_for_gemini(self, messages: list) -> list:
         """
         Preprocess messages to ensure compatibility with Gemini's strict message ordering requirements.
-        
-        Gemini requires that function calls (assistant messages with tool_calls) must come 
+
+        Gemini requires that function calls (assistant messages with tool_calls) must come
         immediately after either:
         - A user message
         - A tool/function response message
-        
+
         This method reorganizes messages to meet these requirements when switching from other models.
         """
         if not messages:
             return messages
-        
+
         processed = []
         i = 0
-        
+
         while i < len(messages):
             msg = messages[i]
             role = msg.get("role")
-            
+
             # Check if this is a problematic sequence: assistant (without tool_calls) -> user
-            if (role == "assistant" and 
-                "tool_calls" not in msg and 
-                i + 1 < len(messages) and 
+            if (role == "assistant" and
+                "tool_calls" not in msg and
+                i + 1 < len(messages) and
                 messages[i + 1].get("role") == "user"):
-                
+
                 # Look ahead to see if there's a tool interaction pattern
                 # If the previous message was a tool response, we might need to consolidate
                 if i > 0 and messages[i - 1].get("role") == "tool":
@@ -368,23 +437,23 @@ class GeminiProvider(Provider):
                     # We can merge the assistant summary into the next user message
                     next_user = messages[i + 1].copy()
                     assistant_content = msg.get("content", "")
-                    
+
                     # Add context about the previous assistant response
                     if assistant_content:
                         # Prepend the assistant's summary to the user message
                         original_content = next_user.get("content", "")
                         next_user["content"] = f"[Assistant's previous response: {assistant_content}]\n\n{original_content}"
-                    
+
                     # Skip the problematic assistant message
                     i += 1  # Skip assistant
                     processed.append(next_user)
                     i += 1  # Move past user message
                     continue
-            
+
             # For other messages, add them as-is
             processed.append(msg)
             i += 1
-        
+
         return processed
 
 
@@ -403,11 +472,41 @@ class GeminiProvider(Provider):
         model_id = model
         # Separate system message (if present) for config
         config_kwargs = {}
-        # Add this for thinking_config for 2.5 series models
+        # Default thinking_config for 2.5 series models (thought summaries)
         if "2.5" in model_id:  # Heuristic check for 2.5 series models
-            # Ensure that types.ThinkingConfig and types.GenerateContentConfig are correctly referenced/imported
-            # Assuming 'types' is already imported from google.genai
             config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
+
+        # Reasoning / thinking control for Gemini 3 models
+        # Accept OpenAI-style reasoning_effort / reasoning, and direct thinking_level
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+        thinking_level = kwargs.pop("thinking_level", None)
+
+        # Also support OpenAI-style `reasoning={"effort": "low"}` for convenience
+        reasoning = kwargs.pop("reasoning", None)
+        if reasoning is not None and reasoning_effort is None:
+            if isinstance(reasoning, dict) and "effort" in reasoning:
+                reasoning_effort = reasoning["effort"]
+            elif isinstance(reasoning, str):
+                reasoning_effort = reasoning
+
+        if self._is_gemini_3_model(model_id):
+            # Map to Gemini 3 thinking_level = "low" | "high"
+            level = None
+            if isinstance(thinking_level, str) and thinking_level:
+                level = thinking_level.lower()
+            elif isinstance(reasoning_effort, str) and reasoning_effort:
+                eff = reasoning_effort.lower()
+                if eff in {"minimal", "low", "none", "disable"}:
+                    level = "low"
+                elif eff in {"medium", "high"}:
+                    level = "high"
+
+            if level in ("low", "high"):
+                config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=level)
+
+            # For Gemini 3, default temperature to 1.0 if not explicitly set
+            if "temperature" not in kwargs and "temperature" not in config_kwargs:
+                config_kwargs["temperature"] = 1.0
 
         if messages and messages[0]['role'] == "system":
             config_kwargs["system_instruction"] = messages[0]['content']
@@ -550,7 +649,7 @@ class GeminiProvider(Provider):
                 self._streaming_tool_calls = {}
                 self._stream_content_length = 0
                 self._stream_tool_calls_count = 0
-                
+
                 # For streaming, we need to handle this differently
                 # Use the client's models.generate_content_stream method
                 contents = []
@@ -616,6 +715,8 @@ class GeminiProvider(Provider):
                 # Use streaming generation
                 async def stream_generator():
                     response_id = None
+                    stream_usage = None
+                    pending_response = None
                     for chunk in self.client.models.generate_content_stream(
                         model=model_id,
                         contents=contents,
@@ -655,10 +756,17 @@ class GeminiProvider(Provider):
                             current_chunk_text = "".join(content_text_parts)
                             # Accumulate content length for accurate stop_info metadata
                             self._stream_content_length += len(current_chunk_text)
-                        
+
                         # Accumulate tool calls count
                         if tool_calls:
                             self._stream_tool_calls_count += len(tool_calls)
+
+                        # Capture usage metadata from chunk if available
+                        usage_metadata = getattr(chunk, "usage_metadata", None) or getattr(chunk, "usageMetadata", None)
+                        if usage_metadata:
+                            normalized_usage = _normalize_gemini_usage(usage_metadata)
+                            if normalized_usage:
+                                stream_usage = normalized_usage
 
                         # Check for finish_reason in chunk
                         finish_reason = None
@@ -666,7 +774,7 @@ class GeminiProvider(Provider):
                         if chunk.candidates and chunk.candidates[0].finish_reason:
                             finish_reason = chunk.candidates[0].finish_reason
                             # Use accumulated values for accurate stop_info metadata
-                            metadata = {
+                            stop_metadata = {
                                 "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
                                 "content_length": self._stream_content_length,
                                 "tool_calls_count": self._stream_tool_calls_count,
@@ -674,9 +782,15 @@ class GeminiProvider(Provider):
                                 "model": model_id,
                                 "provider": "gemini"
                             }
-                            stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, metadata)
+                            stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, stop_metadata)
 
-                        yield ChatCompletionResponse(
+                        response_metadata = {
+                            'id': response_id,
+                            'created': None,
+                            'model': model_id
+                        }
+
+                        current_response = ChatCompletionResponse(
                             choices=[
                                 StreamChoice(
                                     index=0,
@@ -690,12 +804,18 @@ class GeminiProvider(Provider):
                                     stop_info=stop_info
                                 )
                             ],
-                            metadata={
-                                'id': response_id,
-                                'created': None,
-                                'model': model_id
-                            }
+                            metadata=response_metadata
                         )
+
+                        if pending_response is not None:
+                            yield pending_response
+
+                        pending_response = current_response
+
+                    if pending_response is not None:
+                        if stream_usage:
+                            pending_response.metadata["usage"] = stream_usage
+                        yield pending_response
                 return stream_generator()
             else:
                 # For non-streaming, use generate_content directly
@@ -775,6 +895,8 @@ class GeminiProvider(Provider):
             # Streaming response: return a generator yielding ChatCompletionResponse objects
             async def stream_generator():
                 response_id = None  # We'll use the first valid chunk's id for all chunks
+                stream_usage = None
+                pending_response = None
                 for chunk in chat.send_message_stream(last_user_message):
                     if response_id is None:
                         potential_id = getattr(chunk, 'response_id', None)
@@ -814,10 +936,17 @@ class GeminiProvider(Provider):
                         current_chunk_text = "".join(content_text_parts)
                         # Accumulate content length for accurate stop_info metadata
                         self._stream_content_length += len(current_chunk_text)
-                    
+
                     # Accumulate tool calls count
                     if tool_calls:
                         self._stream_tool_calls_count += len(tool_calls)
+
+                    # Capture usage metadata from chunk if available
+                    usage_metadata = getattr(chunk, "usage_metadata", None) or getattr(chunk, "usageMetadata", None)
+                    if usage_metadata:
+                        normalized_usage = _normalize_gemini_usage(usage_metadata)
+                        if normalized_usage:
+                            stream_usage = normalized_usage
 
                     # Check for finish_reason in chunk
                     finish_reason = None
@@ -825,7 +954,7 @@ class GeminiProvider(Provider):
                     if chunk.candidates and chunk.candidates[0].finish_reason:
                         finish_reason = chunk.candidates[0].finish_reason
                         # Use accumulated values for accurate stop_info metadata
-                        metadata = {
+                        stop_metadata = {
                             "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
                             "content_length": self._stream_content_length,
                             "tool_calls_count": self._stream_tool_calls_count,
@@ -833,9 +962,15 @@ class GeminiProvider(Provider):
                             "model": model_id,
                             "provider": "gemini"
                         }
-                        stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, metadata)
+                        stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, stop_metadata)
 
-                    yield ChatCompletionResponse(
+                    response_metadata = {
+                        'id': response_id, # Use the captured ID (or None if never found)
+                        'created': None,  # Gemini doesn't provide timestamp
+                        'model': model_id
+                    }
+
+                    current_response = ChatCompletionResponse(
                         choices=[
                             StreamChoice(
                                 index=0,
@@ -849,18 +984,24 @@ class GeminiProvider(Provider):
                                 stop_info=stop_info
                             )
                         ],
-                        metadata={
-                            'id': response_id, # Use the captured ID (or None if never found)
-                            'created': None,  # Gemini doesn't provide timestamp
-                            'model': model_id
-                        }
+                        metadata=response_metadata
                     )
+
+                    if pending_response is not None:
+                        yield pending_response
+
+                    pending_response = current_response
+
+                if pending_response is not None:
+                    if stream_usage:
+                        pending_response.metadata["usage"] = stream_usage
+                    yield pending_response
             return stream_generator()
         else:
             # Single-turn completion: get the full response
             response = chat.send_message(message=last_user_message)
             return GeminiMessageConverter.from_gemini_response(response)  # The response object with .text, .candidates, etc.
-    
+
 
 
     def _accumulate_and_convert_tool_calls(self, delta):

@@ -46,7 +46,7 @@ class OpenaiProvider(Provider):
         self._streaming_tool_calls = {}
         # Map Responses function_call item.id (fc_*) -> call_id (call_*) for streaming tool calls
         self._responses_tool_call_ids: Dict[str, str] = {}
-        
+
         # Track accumulated content for streaming responses
         # Used to provide accurate metadata in stop_info
         self._stream_content_length = 0
@@ -278,6 +278,49 @@ class OpenaiProvider(Provider):
 
         return prepared_kwargs
 
+    def _normalize_usage(self, usage_obj):
+        """Normalize various OpenAI usage objects to a standard dict.
+
+        This helper can handle both Chat Completions usage (prompt_tokens/completion_tokens)
+        and Responses API usage (input_tokens/output_tokens).
+        """
+        if not usage_obj:
+            return None
+
+        # Try to get a plain dict from pydantic model or mapping
+        if hasattr(usage_obj, "model_dump"):
+            data = usage_obj.model_dump()
+        elif isinstance(usage_obj, dict):
+            data = usage_obj
+        else:
+            # Fallback to attribute access
+            data = {}
+            for attr in ("input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"):
+                if hasattr(usage_obj, attr):
+                    data[attr] = getattr(usage_obj, attr)
+
+        prompt_tokens = data.get("input_tokens") or data.get("prompt_tokens")
+        completion_tokens = data.get("output_tokens") or data.get("completion_tokens")
+
+        if prompt_tokens is None and hasattr(usage_obj, "prompt_tokens"):
+            prompt_tokens = getattr(usage_obj, "prompt_tokens")
+        if completion_tokens is None and hasattr(usage_obj, "completion_tokens"):
+            completion_tokens = getattr(usage_obj, "completion_tokens")
+
+        if prompt_tokens is None or completion_tokens is None:
+            return None
+
+        total_tokens = data.get("total_tokens")
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
+
     def _should_use_responses_api(self, model: str, kwargs: dict) -> bool:
         """
         是否使用 Responses API：
@@ -404,9 +447,22 @@ class OpenaiProvider(Provider):
                 stream=True,
                 **responses_kwargs
             )
+            stream_usage = None
+
             async def stream_gen():
+                nonlocal stream_usage
                 async for chunk in response:
                     ctype = getattr(chunk, 'type', None)
+
+                    # Capture usage information if available on this event
+                    usage_obj = None
+                    if hasattr(chunk, "usage"):
+                        usage_obj = getattr(chunk, "usage")
+                    elif hasattr(chunk, "response") and hasattr(chunk.response, "usage"):
+                        usage_obj = chunk.response.usage
+                    if usage_obj:
+                        stream_usage = self._normalize_usage(usage_obj) or stream_usage
+
                     if ctype == 'response.output_text.delta' and hasattr(chunk, 'delta'):
                         # Accumulate content length
                         if chunk.delta:
@@ -437,9 +493,15 @@ class OpenaiProvider(Provider):
                             "provider": "openai"
                         }
                         stop_info = stop_reason_manager.map_stop_reason("openai", 'stop', metadata)
+                        response_metadata = {
+                            'id': getattr(chunk, 'response_id', None),
+                            'model': getattr(chunk, 'model', None)
+                        }
+                        if stream_usage:
+                            response_metadata['usage'] = stream_usage
                         yield ChatCompletionResponse(
                             choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role=None, tool_calls=None, reasoning_content=None), finish_reason='stop', stop_info=stop_info)],
-                            metadata={'id': getattr(chunk, 'response_id', None), 'model': getattr(chunk, 'model', None)}
+                            metadata=response_metadata
                         )
             return stream_gen()
         else:
@@ -452,7 +514,7 @@ class OpenaiProvider(Provider):
             # 非流式：提取content和reasoning
             content = getattr(resp, 'output_text', None)
             reasoning_content = None
-            
+
             # 提取reasoning content
             if hasattr(resp, 'reasoning_items') and resp.reasoning_items:
                 reasoning_content = ReasoningContent(
@@ -464,7 +526,7 @@ class OpenaiProvider(Provider):
                         'response_id': getattr(resp, 'id', None)
                     }
                 )
-            
+
             # 更完整的content提取
             if not content and hasattr(resp, 'output') and resp.output:
                 for item in resp.output:
@@ -475,22 +537,32 @@ class OpenaiProvider(Provider):
                                 break
                         if content:
                             break
-            
+
             # 确保content不为None（GPT-5有时返回None）
             if content is None:
                 content = ""
-            
+
+            usage = getattr(resp, 'usage', None)
+            usage_dict = self._normalize_usage(usage)
+
+            metadata = {
+                'id': getattr(resp, 'id', None),
+                'model': getattr(resp, 'model', None)
+            }
+            if usage_dict:
+                metadata['usage'] = usage_dict
+
             return ChatCompletionResponse(
                 choices=[
                     Choice(index=0, message=Message(
-                        content=content, 
-                        role='assistant', 
-                        tool_calls=None, 
-                        refusal=None, 
+                        content=content,
+                        role='assistant',
+                        tool_calls=None,
+                        refusal=None,
                         reasoning_content=reasoning_content
                     ), finish_reason='stop')
                 ],
-                metadata={'id': getattr(resp, 'id', None), 'model': getattr(resp, 'model', None)}
+                metadata=metadata
             )
 
     def _convert_tools_for_responses_api(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -543,14 +615,27 @@ class OpenaiProvider(Provider):
 
             # Clean messages for OpenAI API (remove reasoning_content and truncate tool_call IDs)
             cleaned_messages, id_mapping = self._clean_messages_for_openai(messages)
+
+            # Ensure streaming usage is included in the OpenAI response
+            stream_kwargs = prepared_kwargs.copy()
+            stream_options = stream_kwargs.get("stream_options") or {}
+            if "include_usage" not in stream_options:
+                stream_options["include_usage"] = True
+            stream_kwargs["stream_options"] = stream_options
+
             response = await self.client.chat.completions.create(
                 model=model,
                 messages=cleaned_messages,  # 使用清理后的messages
                 stream=True,
-                **prepared_kwargs  # Use prepared kwargs that are compatible with the model
+                **stream_kwargs  # Use prepared kwargs that are compatible with the model
             )
             async def stream_generator():
+                stream_usage = None
                 async for chunk in response:
+                    # Capture usage from the streaming chunk if available (typically on final chunk)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        stream_usage = self._normalize_usage(chunk.usage) or stream_usage
+
                     if chunk.choices:
                         # Create choices with stop_info
                         choices = []
@@ -558,14 +643,14 @@ class OpenaiProvider(Provider):
                             # Accumulate content and tool calls for accurate metadata
                             if choice.delta.content:
                                 self._stream_content_length += len(choice.delta.content)
-                            
+
                             # Process tool calls and restore original IDs
                             accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
                             if accumulated_tool_calls and id_mapping:
                                 accumulated_tool_calls = self._restore_tool_call_ids(accumulated_tool_calls, id_mapping)
                             if accumulated_tool_calls:
                                 self._stream_tool_calls_count += len(accumulated_tool_calls)
-                            
+
                             # Create stop_info if finish_reason is present
                             stop_info = None
                             if choice.finish_reason:
@@ -596,13 +681,20 @@ class OpenaiProvider(Provider):
                                 stop_info=stop_info
                             ))
 
+                        # Determine if this is the final chunk (has finish_reason or usage)
+                        is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
+
+                        metadata = {
+                            'id': chunk.id,
+                            'created': chunk.created,
+                            'model': chunk.model
+                        }
+                        if is_final_chunk and stream_usage:
+                            metadata['usage'] = stream_usage
+
                         yield ChatCompletionResponse(
                             choices=choices,
-                            metadata={
-                                'id': chunk.id,
-                                'created': chunk.created,
-                                'model': chunk.model
-                            }
+                            metadata=metadata
                         )
             return stream_generator()
         else:
