@@ -224,7 +224,8 @@ class MessageNormalizer:
                             'function': {
                                 'name': getattr(tc.function, 'name', ''),
                                 'arguments': getattr(tc.function, 'arguments', '')
-                            }
+                            },
+                            'extra_content': getattr(tc, 'extra_content', None)
                         })
                 else:
                     tool_calls.append({
@@ -233,7 +234,8 @@ class MessageNormalizer:
                         'function': {
                             'name': getattr(tc.function, 'name', ''),
                             'arguments': getattr(tc.function, 'arguments', '')
-                        }
+                        },
+                        'extra_content': getattr(tc, 'extra_content', None)
                     })
             result['tool_calls'] = tool_calls
         

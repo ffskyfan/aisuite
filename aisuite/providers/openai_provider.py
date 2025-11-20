@@ -202,7 +202,8 @@ class OpenaiProvider(Provider):
             restored_tc = ChatCompletionMessageToolCall(
                 id=original_id,
                 function=tc.function,
-                type=tc.type
+                type=tc.type,
+                extra_content=getattr(tc, "extra_content", None)
             )
             restored_tool_calls.append(restored_tc)
 

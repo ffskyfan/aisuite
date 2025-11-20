@@ -1,6 +1,6 @@
 import os
 import json
-from typing import AsyncGenerator, Union
+from typing import Any, AsyncGenerator, Dict, Optional, Tuple, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
 from aisuite.framework.stop_reason import stop_reason_manager
@@ -59,6 +59,100 @@ def _normalize_gemini_usage(usage_obj):
         "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
         "total_tokens": int(total_tokens) if total_tokens is not None else None,
     }
+
+
+GEMINI_PROVIDER_NAME = "gemini"
+GEMINI_SIGNATURE_PLACEHOLDER = "skip_thought_signature_validator"
+
+
+def _extract_thought_signature(source: Any) -> Optional[str]:
+    """Best-effort extraction of thought_signature / thoughtSignature."""
+    if source is None:
+        return None
+
+    # Handle list of possible containers
+    if isinstance(source, (list, tuple)):
+        for item in source:
+            sig = _extract_thought_signature(item)
+            if sig:
+                return sig
+        return None
+
+    # Handle dict-based structures
+    if isinstance(source, dict):
+        for key in ("thought_signature", "thoughtSignature"):
+            sig = source.get(key)
+            if sig:
+                return sig
+        google_meta = source.get("google") or {}
+        if isinstance(google_meta, dict):
+            for key in ("thought_signature", "thoughtSignature"):
+                sig = google_meta.get(key)
+                if sig:
+                    return sig
+        # Recurse into nested metadata
+        for nested_key in ("metadata", "additional_kwargs"):
+            nested = source.get(nested_key)
+            sig = _extract_thought_signature(nested)
+            if sig:
+                return sig
+        return None
+
+    # Attribute-based objects (pydantic / SDK models)
+    for attr in ("thought_signature", "thoughtSignature"):
+        sig = getattr(source, attr, None)
+        if sig:
+            return sig
+
+    # Some SDK objects carry metadata/additional kwargs
+    for attr in ("metadata", "additional_kwargs"):
+        nested = getattr(source, attr, None)
+        sig = _extract_thought_signature(nested)
+        if sig:
+            return sig
+
+    # Fallback: model_dump() if available
+    if hasattr(source, "model_dump"):
+        try:
+            data = source.model_dump()
+            if isinstance(data, dict):
+                return _extract_thought_signature(data)
+        except Exception:
+            pass
+
+    return None
+
+
+def _build_tool_call_extra(signature: Optional[str], placeholder: bool = False) -> Optional[Dict[str, Any]]:
+    """Build extra_content payload for a tool call."""
+    if not signature and not placeholder:
+        return None
+
+    extra: Dict[str, Any] = {"provider": GEMINI_PROVIDER_NAME}
+    google_meta: Dict[str, Any] = {}
+
+    if signature:
+        google_meta["thought_signature"] = signature
+    if placeholder:
+        google_meta["placeholder"] = True
+
+    if google_meta:
+        extra["google"] = google_meta
+
+    return extra
+
+
+def _get_tool_call_extra(tool_call: Any) -> Optional[Dict[str, Any]]:
+    """Extract the extra_content dict from a tool_call structure."""
+    if tool_call is None:
+        return None
+    if isinstance(tool_call, ChatCompletionMessageToolCall):
+        return getattr(tool_call, "extra_content", None)
+    if isinstance(tool_call, dict):
+        extra = tool_call.get("extra_content")
+        if extra:
+            return extra
+    return None
 
 
 class GeminiMessageConverter:
@@ -135,6 +229,7 @@ class GeminiMessageConverter:
                 # Check if the part is a function call
                 elif hasattr(part, 'function_call') and part.function_call:
                     try:
+                        signature = _extract_thought_signature(part) or _extract_thought_signature(part.function_call)
                         function = Function(
                             name=part.function_call.name,
                             arguments=json.dumps(part.function_call.args) if hasattr(part.function_call, 'args') else "{}"
@@ -143,7 +238,8 @@ class GeminiMessageConverter:
                         tool_call_obj = ChatCompletionMessageToolCall(
                             id=f"call_{part.function_call.name}_{hash(str(part.function_call.args)) % 10000}",
                             function=function,
-                            type="function"
+                            type="function",
+                            extra_content=_build_tool_call_extra(signature)
                         )
 
                         if tool_calls is None:
@@ -281,6 +377,99 @@ class GeminiProvider(Provider):
             return False
         return "gemini-3" in model_id
 
+    def _resolve_tool_call_signature(self, model_id: str, tool_call: Any) -> Tuple[Optional[str], bool]:
+        """
+        Determine which signature should be used for a tool_call when replaying history.
+
+        Returns:
+            (signature, is_placeholder)
+        """
+        extra = _get_tool_call_extra(tool_call)
+        signature = _extract_thought_signature(extra) or _extract_thought_signature(tool_call)
+        placeholder = False
+
+        if not signature and self._is_gemini_3_model(model_id):
+            signature = GEMINI_SIGNATURE_PLACEHOLDER
+            placeholder = True
+
+        return signature, placeholder
+
+    def _attach_thought_signature(self, part: Any, signature: Optional[str]) -> None:
+        """Attach thought_signature metadata to a Part/function_call if possible."""
+        if not signature or part is None:
+            return
+
+        try:
+            setattr(part, "thought_signature", signature)
+        except Exception:
+            pass
+        try:
+            setattr(part, "thoughtSignature", signature)
+        except Exception:
+            pass
+
+        function_call = getattr(part, "function_call", None)
+        if function_call:
+            try:
+                setattr(function_call, "thought_signature", signature)
+            except Exception:
+                pass
+            try:
+                setattr(function_call, "thoughtSignature", signature)
+            except Exception:
+                pass
+
+    def _parse_tool_call_args(self, args: Any) -> Dict[str, Any]:
+        """Parse tool call arguments into a dictionary."""
+        if isinstance(args, dict):
+            return args
+        if isinstance(args, str):
+            try:
+                return json.loads(args)
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def _convert_assistant_tool_message_to_parts(self, model_id: str, msg: Dict[str, Any]) -> Optional[list]:
+        """
+        Convert an assistant message containing tool_calls into Gemini parts,
+        ensuring thought_signature is attached when available (or placeholder when required).
+        """
+        parts = []
+
+        if msg.get("content"):
+            parts.append(types.Part.from_text(text=msg["content"]))
+
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return parts if parts else None
+
+        for tool_call in tool_calls:
+            func_name = None
+            raw_args: Any = "{}"
+
+            if isinstance(tool_call, ChatCompletionMessageToolCall):
+                func_name = tool_call.function.name
+                raw_args = tool_call.function.arguments
+            elif isinstance(tool_call, dict):
+                func = tool_call.get("function", {})
+                func_name = func.get("name")
+                raw_args = func.get("arguments", "{}")
+
+            if not func_name:
+                continue
+
+            parsed_args = self._parse_tool_call_args(raw_args)
+            signature, _ = self._resolve_tool_call_signature(model_id, tool_call)
+            function_call_part = types.Part.from_function_call(
+                name=func_name,
+                args=parsed_args
+            )
+            if signature:
+                self._attach_thought_signature(function_call_part, signature)
+            parts.append(function_call_part)
+
+        return parts if parts else None
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from Gemini finish_reason."""
@@ -598,32 +787,7 @@ class GeminiProvider(Provider):
                     # Handle tool calls in assistant messages
                     if role == "assistant" and isinstance(msg.get("tool_calls"), list):
                         # Assistant message with tool calls - convert to function call parts
-                        parts = []
-
-                        # Add text content if present
-                        if msg.get("content"):
-                            parts.append(types.Part.from_text(text=msg["content"]))
-
-                        # Add function calls
-                        for tool_call in msg["tool_calls"]:
-                            if tool_call.get("type") == "function" and "function" in tool_call:
-                                func = tool_call["function"]
-                                # Parse arguments if they're a string
-                                args = func.get("arguments", "{}")
-                                if isinstance(args, str):
-                                    try:
-                                        import json
-                                        args = json.loads(args)
-                                    except json.JSONDecodeError:
-                                        args = {}
-
-                                # Create function call part
-                                function_call_part = types.Part.from_function_call(
-                                    name=func["name"],
-                                    args=args
-                                )
-                                parts.append(function_call_part)
-
+                        parts = self._convert_assistant_tool_message_to_parts(model_id, msg)
                         if parts:
                             history_msgs.append(types.Content(role=gemini_role, parts=parts))
                     else:
@@ -680,27 +844,7 @@ class GeminiProvider(Provider):
                         gemini_role = "model" if role == "assistant" else "user"
 
                         if role == "assistant" and isinstance(msg.get("tool_calls"), list):
-                            parts = []
-                            if msg.get("content"):
-                                parts.append(types.Part.from_text(text=msg["content"]))
-
-                            for tool_call in msg["tool_calls"]:
-                                if tool_call.get("type") == "function" and "function" in tool_call:
-                                    func = tool_call["function"]
-                                    args = func.get("arguments", "{}")
-                                    if isinstance(args, str):
-                                        try:
-                                            import json
-                                            args = json.loads(args)
-                                        except json.JSONDecodeError:
-                                            args = {}
-
-                                    function_call_part = types.Part.from_function_call(
-                                        name=func["name"],
-                                        args=args
-                                    )
-                                    parts.append(function_call_part)
-
+                            parts = self._convert_assistant_tool_message_to_parts(model_id, msg)
                             if parts:
                                 contents.append(types.Content(role=gemini_role, parts=parts))
                         else:
@@ -742,8 +886,19 @@ class GeminiProvider(Provider):
                                 if getattr(part, 'thought', False) and getattr(part, 'text', None):
                                     reasoning_text_parts.append(part.text)
                                 elif hasattr(part, 'function_call') and part.function_call:
+                                    function_call_obj = part.function_call
+                                    signature = _extract_thought_signature(part) or _extract_thought_signature(function_call_obj)
+                                    if signature and function_call_obj:
+                                        try:
+                                            setattr(function_call_obj, "thought_signature", signature)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            setattr(function_call_obj, "thoughtSignature", signature)
+                                        except Exception:
+                                            pass
                                     mock_delta = type('MockDelta', (), {
-                                        'function_call': part.function_call
+                                        'function_call': function_call_obj
                                     })()
                                     tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
                                 elif getattr(part, 'text', None):
@@ -846,27 +1001,7 @@ class GeminiProvider(Provider):
                         gemini_role = "model" if role == "assistant" else "user"
 
                         if role == "assistant" and isinstance(msg.get("tool_calls"), list):
-                            parts = []
-                            if msg.get("content"):
-                                parts.append(types.Part.from_text(text=msg["content"]))
-
-                            for tool_call in msg["tool_calls"]:
-                                if tool_call.get("type") == "function" and "function" in tool_call:
-                                    func = tool_call["function"]
-                                    args = func.get("arguments", "{}")
-                                    if isinstance(args, str):
-                                        try:
-                                            import json
-                                            args = json.loads(args)
-                                        except json.JSONDecodeError:
-                                            args = {}
-
-                                    function_call_part = types.Part.from_function_call(
-                                        name=func["name"],
-                                        args=args
-                                    )
-                                    parts.append(function_call_part)
-
+                            parts = self._convert_assistant_tool_message_to_parts(model_id, msg)
                             if parts:
                                 contents.append(types.Content(role=gemini_role, parts=parts))
                         else:
@@ -921,8 +1056,19 @@ class GeminiProvider(Provider):
                             # Check if the part is a function call
                             elif hasattr(part, 'function_call') and part.function_call:
                                 # Create a mock delta object for consistency with other providers
+                                function_call_obj = part.function_call
+                                signature = _extract_thought_signature(part) or _extract_thought_signature(function_call_obj)
+                                if signature and function_call_obj:
+                                    try:
+                                        setattr(function_call_obj, "thought_signature", signature)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        setattr(function_call_obj, "thoughtSignature", signature)
+                                    except Exception:
+                                        pass
                                 mock_delta = type('MockDelta', (), {
-                                    'function_call': part.function_call
+                                    'function_call': function_call_obj
                                 })()
                                 tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
                             # Else, if it's not a thought but has text, it's regular content
@@ -1042,6 +1188,7 @@ class GeminiProvider(Provider):
             return None
 
         try:
+            signature = _extract_thought_signature(function_call)
             # Gemini function calls are typically complete in a single chunk
             function = Function(
                 name=function_call.name,
@@ -1051,7 +1198,8 @@ class GeminiProvider(Provider):
             tool_call_obj = ChatCompletionMessageToolCall(
                 id=f"call_{function_call.name}_{hash(str(function_call.args)) % 10000}",  # Generate a unique ID
                 function=function,
-                type="function"
+                type="function",
+                extra_content=_build_tool_call_extra(signature)
             )
 
             return [tool_call_obj]
@@ -1087,7 +1235,8 @@ class GeminiProvider(Provider):
                     "function": {
                         "name": "",
                         "arguments": ""
-                    }
+                    },
+                    "extra_content": None
                 }
 
             tool_call = self._streaming_tool_calls[index]
@@ -1098,6 +1247,10 @@ class GeminiProvider(Provider):
 
             # Accumulate function data
             if hasattr(tool_call_delta, 'function') and tool_call_delta.function:
+                signature = _extract_thought_signature(tool_call_delta.function)
+                if signature:
+                    tool_call["extra_content"] = _build_tool_call_extra(signature)
+
                 if hasattr(tool_call_delta.function, 'name') and tool_call_delta.function.name:
                     tool_call["function"]["name"] += tool_call_delta.function.name
 
@@ -1107,6 +1260,12 @@ class GeminiProvider(Provider):
             # Set type if provided
             if hasattr(tool_call_delta, 'type') and tool_call_delta.type:
                 tool_call["type"] = tool_call_delta.type
+
+            # Some SDKs may attach signature at the delta level
+            if not tool_call.get("extra_content"):
+                signature = _extract_thought_signature(tool_call_delta)
+                if signature:
+                    tool_call["extra_content"] = _build_tool_call_extra(signature)
 
         # Check for complete tool calls and convert them
         complete_tool_calls = []
@@ -1128,7 +1287,8 @@ class GeminiProvider(Provider):
                     tool_call_obj = ChatCompletionMessageToolCall(
                         id=tool_call_data["id"],
                         function=function,
-                        type="function"
+                        type="function",
+                        extra_content=tool_call_data.get("extra_content")
                     )
 
                     complete_tool_calls.append(tool_call_obj)

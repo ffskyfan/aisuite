@@ -1,7 +1,7 @@
 """Interface to hold contents of api responses when they do not confirm to the OpenAI style response"""
 
 from pydantic import BaseModel
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 
 class Function(BaseModel):
@@ -13,6 +13,7 @@ class ChatCompletionMessageToolCall(BaseModel):
     id: str
     function: Function
     type: Literal["function"]
+    extra_content: Optional[Dict[str, Any]] = None
 
 
 class ReasoningContent(BaseModel):
