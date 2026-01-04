@@ -390,22 +390,64 @@ class AnthropicMessageConverter:
         if not usage_obj:
             return None
 
+        def _get_int(container, key, default=None):
+            value = None
+            if isinstance(container, dict):
+                value = container.get(key)
+            else:
+                value = getattr(container, key, None)
+            if value is None:
+                return default
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _deep_get(container, *path):
+            current = container
+            for key in path:
+                if current is None:
+                    return None
+                if isinstance(current, dict):
+                    current = current.get(key)
+                else:
+                    current = getattr(current, key, None)
+            return current
+
         # Anthropic usage object typically has `input_tokens` and `output_tokens`
-        input_tokens = getattr(usage_obj, "input_tokens", None)
-        output_tokens = getattr(usage_obj, "output_tokens", None)
-
-        # Also support dict-like objects for extra robustness
-        if input_tokens is None or output_tokens is None and isinstance(usage_obj, dict):
-            input_tokens = usage_obj.get("input_tokens", input_tokens)
-            output_tokens = usage_obj.get("output_tokens", output_tokens)
-
+        input_tokens = _get_int(usage_obj, "input_tokens")
+        output_tokens = _get_int(usage_obj, "output_tokens")
         if input_tokens is None or output_tokens is None:
             return None
 
+        cache_read_input_tokens = _get_int(usage_obj, "cache_read_input_tokens", 0) or 0
+        cache_write_input_tokens = _get_int(usage_obj, "cache_creation_input_tokens", 0) or 0
+        if cache_read_input_tokens < 0:
+            cache_read_input_tokens = 0
+        if cache_write_input_tokens < 0:
+            cache_write_input_tokens = 0
+
+        cache_creation = _deep_get(usage_obj, "cache_creation") or {}
+        ephemeral_5m_input_tokens = _get_int(cache_creation, "ephemeral_5m_input_tokens", 0) or 0
+        ephemeral_1h_input_tokens = _get_int(cache_creation, "ephemeral_1h_input_tokens", 0) or 0
+        if ephemeral_5m_input_tokens < 0:
+            ephemeral_5m_input_tokens = 0
+        if ephemeral_1h_input_tokens < 0:
+            ephemeral_1h_input_tokens = 0
+
+        # Anthropic semantics: total input tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+        prompt_tokens = input_tokens + cache_read_input_tokens + cache_write_input_tokens
+
         return {
-            "prompt_tokens": input_tokens,
+            "prompt_tokens": prompt_tokens,
             "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
+            "total_tokens": prompt_tokens + output_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_write_input_tokens": cache_write_input_tokens,
+            "cache_write_by_ttl": {
+                "ephemeral_5m_input_tokens": ephemeral_5m_input_tokens,
+                "ephemeral_1h_input_tokens": ephemeral_1h_input_tokens,
+            },
         }
 
     def _get_usage_stats(self, response):

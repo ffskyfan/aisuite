@@ -16,7 +16,8 @@ def _normalize_gemini_usage(usage_obj):
 
     Maps promptTokenCount/prompt_token_count -> prompt_tokens,
     candidatesTokenCount/candidates_token_count -> completion_tokens,
-    totalTokenCount/total_token_count -> total_tokens.
+    totalTokenCount/total_token_count -> total_tokens,
+    cachedContentTokenCount/cached_content_token_count -> cache_read_input_tokens.
     """
     if not usage_obj:
         return None
@@ -30,17 +31,26 @@ def _normalize_gemini_usage(usage_obj):
         data = {}
         for attr in (
             "prompt_token_count",
+            "cached_content_token_count",
             "candidates_token_count",
             "total_token_count",
             "promptTokenCount",
+            "cachedContentTokenCount",
             "candidatesTokenCount",
             "totalTokenCount",
         ):
             if hasattr(usage_obj, attr):
                 data[attr] = getattr(usage_obj, attr)
 
-    prompt_tokens = data.get("prompt_token_count") or data.get("promptTokenCount")
-    completion_tokens = data.get("candidates_token_count") or data.get("candidatesTokenCount")
+    prompt_tokens = data.get("prompt_token_count")
+    if prompt_tokens is None:
+        prompt_tokens = data.get("promptTokenCount")
+    cached_content_tokens = data.get("cached_content_token_count")
+    if cached_content_tokens is None:
+        cached_content_tokens = data.get("cachedContentTokenCount")
+    completion_tokens = data.get("candidates_token_count")
+    if completion_tokens is None:
+        completion_tokens = data.get("candidatesTokenCount")
     total_tokens = (
         data.get("total_token_count")
         or data.get("totalTokenCount")
@@ -58,6 +68,12 @@ def _normalize_gemini_usage(usage_obj):
         "prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else None,
         "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
         "total_tokens": int(total_tokens) if total_tokens is not None else None,
+        "cache_read_input_tokens": int(cached_content_tokens) if cached_content_tokens is not None else 0,
+        "cache_write_input_tokens": 0,
+        "cache_write_by_ttl": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 0,
+        },
     }
 
 

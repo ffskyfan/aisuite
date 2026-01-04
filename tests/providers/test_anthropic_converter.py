@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import MagicMock
+from types import SimpleNamespace
 from aisuite.providers.anthropic_provider import AnthropicMessageConverter
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function
 from aisuite.framework import ChatCompletionResponse
@@ -57,8 +58,7 @@ class TestAnthropicMessageConverter(unittest.TestCase):
     def test_convert_response_normal_message(self):
         response = MagicMock()
         response.stop_reason = "end_turn"
-        response.usage.input_tokens = 10
-        response.usage.output_tokens = 5
+        response.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
         content_mock = MagicMock()
         content_mock.type = "text"
         content_mock.text = "The weather is sunny."
@@ -70,7 +70,17 @@ class TestAnthropicMessageConverter(unittest.TestCase):
         self.assertEqual(normalized_response.choices[0].finish_reason, "stop")
         self.assertEqual(
             normalized_response.usage,
-            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "cache_read_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "cache_write_by_ttl": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0,
+                },
+            },
         )
         self.assertEqual(
             normalized_response.choices[0].message.content, "The weather is sunny."
@@ -83,8 +93,7 @@ class TestAnthropicMessageConverter(unittest.TestCase):
         response.model = "claude-3-5-sonnet-20241022"
         response.role = "assistant"
         response.stop_reason = "tool_use"
-        response.usage.input_tokens = 20
-        response.usage.output_tokens = 10
+        response.usage = SimpleNamespace(input_tokens=20, output_tokens=10)
         tool_use_mock = MagicMock()
         tool_use_mock.type = "tool_use"
         tool_use_mock.id = "tool123"
@@ -103,7 +112,17 @@ class TestAnthropicMessageConverter(unittest.TestCase):
         self.assertEqual(normalized_response.choices[0].finish_reason, "tool_calls")
         self.assertEqual(
             normalized_response.usage,
-            {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+            {
+                "prompt_tokens": 20,
+                "completion_tokens": 10,
+                "total_tokens": 30,
+                "cache_read_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "cache_write_by_ttl": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0,
+                },
+            },
         )
         self.assertEqual(
             normalized_response.choices[0].message.content,
@@ -116,6 +135,42 @@ class TestAnthropicMessageConverter(unittest.TestCase):
         self.assertEqual(
             normalized_response.choices[0].message.tool_calls[0].function.name,
             "get_weather",
+        )
+
+    def test_convert_response_usage_with_cache_tokens(self):
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            cache_read_input_tokens=3,
+            cache_creation_input_tokens=7,
+            cache_creation=SimpleNamespace(
+                ephemeral_5m_input_tokens=2,
+                ephemeral_1h_input_tokens=5,
+            ),
+        )
+
+        content_mock = MagicMock()
+        content_mock.type = "text"
+        content_mock.text = "Cached response."
+        response.content = [content_mock]
+
+        normalized_response = self.converter.convert_response(response)
+
+        self.assertEqual(
+            normalized_response.usage,
+            {
+                "prompt_tokens": 20,
+                "completion_tokens": 5,
+                "total_tokens": 25,
+                "cache_read_input_tokens": 3,
+                "cache_write_input_tokens": 7,
+                "cache_write_by_ttl": {
+                    "ephemeral_5m_input_tokens": 2,
+                    "ephemeral_1h_input_tokens": 5,
+                },
+            },
         )
 
     def test_convert_tool_spec(self):

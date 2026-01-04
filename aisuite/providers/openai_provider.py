@@ -288,6 +288,17 @@ class OpenaiProvider(Provider):
         if not usage_obj:
             return None
 
+        def _deep_get(container, *path):
+            current = container
+            for key in path:
+                if current is None:
+                    return None
+                if isinstance(current, dict):
+                    current = current.get(key)
+                else:
+                    current = getattr(current, key, None)
+            return current
+
         # Try to get a plain dict from pydantic model or mapping
         if hasattr(usage_obj, "model_dump"):
             data = usage_obj.model_dump()
@@ -300,8 +311,12 @@ class OpenaiProvider(Provider):
                 if hasattr(usage_obj, attr):
                     data[attr] = getattr(usage_obj, attr)
 
-        prompt_tokens = data.get("input_tokens") or data.get("prompt_tokens")
-        completion_tokens = data.get("output_tokens") or data.get("completion_tokens")
+        prompt_tokens = data.get("input_tokens")
+        if prompt_tokens is None:
+            prompt_tokens = data.get("prompt_tokens")
+        completion_tokens = data.get("output_tokens")
+        if completion_tokens is None:
+            completion_tokens = data.get("completion_tokens")
 
         if prompt_tokens is None and hasattr(usage_obj, "prompt_tokens"):
             prompt_tokens = getattr(usage_obj, "prompt_tokens")
@@ -311,14 +326,31 @@ class OpenaiProvider(Provider):
         if prompt_tokens is None or completion_tokens is None:
             return None
 
+        cached_tokens = _deep_get(data, "prompt_tokens_details", "cached_tokens")
+        if cached_tokens is None:
+            cached_tokens = _deep_get(data, "input_tokens_details", "cached_tokens")
+        if cached_tokens is None:
+            cached_tokens = _deep_get(usage_obj, "prompt_tokens_details", "cached_tokens")
+        if cached_tokens is None:
+            cached_tokens = _deep_get(usage_obj, "input_tokens_details", "cached_tokens")
+        cache_read_input_tokens = int(cached_tokens) if cached_tokens is not None else 0
+        if cache_read_input_tokens < 0:
+            cache_read_input_tokens = 0
+
         total_tokens = data.get("total_tokens")
         if total_tokens is None:
             total_tokens = prompt_tokens + completion_tokens
 
         return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
+            "prompt_tokens": int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+            "total_tokens": int(total_tokens),
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_write_input_tokens": 0,
+            "cache_write_by_ttl": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0,
+            },
         }
 
 
