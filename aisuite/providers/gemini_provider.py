@@ -15,7 +15,7 @@ def _normalize_gemini_usage(usage_obj):
     """Normalize Gemini usage/usageMetadata to AISuite standard dict.
 
     Maps promptTokenCount/prompt_token_count -> prompt_tokens,
-    candidatesTokenCount/candidates_token_count -> completion_tokens,
+    responseTokenCount/response_token_count (or candidatesTokenCount/candidates_token_count) -> completion_tokens,
     totalTokenCount/total_token_count -> total_tokens,
     cachedContentTokenCount/cached_content_token_count -> cache_read_input_tokens.
     """
@@ -32,10 +32,12 @@ def _normalize_gemini_usage(usage_obj):
         for attr in (
             "prompt_token_count",
             "cached_content_token_count",
+            "response_token_count",
             "candidates_token_count",
             "total_token_count",
             "promptTokenCount",
             "cachedContentTokenCount",
+            "responseTokenCount",
             "candidatesTokenCount",
             "totalTokenCount",
         ):
@@ -48,7 +50,11 @@ def _normalize_gemini_usage(usage_obj):
     cached_content_tokens = data.get("cached_content_token_count")
     if cached_content_tokens is None:
         cached_content_tokens = data.get("cachedContentTokenCount")
-    completion_tokens = data.get("candidates_token_count")
+    completion_tokens = data.get("response_token_count")
+    if completion_tokens is None:
+        completion_tokens = data.get("responseTokenCount")
+    if completion_tokens is None:
+        completion_tokens = data.get("candidates_token_count")
     if completion_tokens is None:
         completion_tokens = data.get("candidatesTokenCount")
     total_tokens = (

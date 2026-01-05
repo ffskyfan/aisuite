@@ -125,3 +125,44 @@ def test_gemini_normalize_cached_content_token_count_camel_case():
         },
     }
 
+
+def test_gemini_normalize_response_token_count_snake_case():
+    usage_metadata = {
+        "prompt_token_count": 100,
+        "cached_content_token_count": 60,
+        "response_token_count": 20,
+        "total_token_count": 120,
+    }
+    normalized = _normalize_gemini_usage(usage_metadata)
+    assert normalized == {
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+        "total_tokens": 120,
+        "cache_read_input_tokens": 60,
+        "cache_write_input_tokens": 0,
+        "cache_write_by_ttl": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 0,
+        },
+    }
+
+
+def test_gemini_normalize_response_token_count_camel_case():
+    usage_metadata = {
+        "promptTokenCount": 100,
+        "cachedContentTokenCount": 50,
+        "responseTokenCount": 20,
+        "totalTokenCount": 120,
+    }
+    normalized = _normalize_gemini_usage(usage_metadata)
+    assert normalized == {
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+        "total_tokens": 120,
+        "cache_read_input_tokens": 50,
+        "cache_write_input_tokens": 0,
+        "cache_write_by_ttl": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 0,
+        },
+    }
