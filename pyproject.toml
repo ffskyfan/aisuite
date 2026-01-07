@@ -2,7 +2,7 @@
 name = "aisuite"
 version = "0.1.10"
 description = "Uniform access layer for LLMs"
-authors = ["Andrew Ng, Rohit P"]
+authors = ["Andrew Ng, Rohit P, Erdeni"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
