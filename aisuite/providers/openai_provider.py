@@ -2,7 +2,7 @@ import openai
 import os
 import json
 import hashlib
-from typing import AsyncGenerator, Union, List, Dict, Any
+from typing import AsyncGenerator, Union, List, Dict, Any, Optional
 
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
@@ -51,6 +51,7 @@ class OpenaiProvider(Provider):
         # Used to provide accurate metadata in stop_info
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
+        self._stream_reasoning_buffer = ""
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from OpenAI finish_reason."""
@@ -353,6 +354,98 @@ class OpenaiProvider(Provider):
             },
         }
 
+    @staticmethod
+    def _summary_to_text(summary_obj) -> Optional[str]:
+        if not summary_obj:
+            return None
+        if isinstance(summary_obj, str):
+            text = summary_obj.strip()
+            return text if text else None
+        if isinstance(summary_obj, list):
+            parts = []
+            for item in summary_obj:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+                elif hasattr(item, "text"):
+                    text = getattr(item, "text", None)
+                    if isinstance(text, str):
+                        parts.append(text)
+            joined = "".join(parts).strip()
+            return joined if joined else None
+        if isinstance(summary_obj, dict):
+            text = summary_obj.get("text") or summary_obj.get("content")
+            if isinstance(text, str):
+                text = text.strip()
+                return text if text else None
+        if hasattr(summary_obj, "text"):
+            text = getattr(summary_obj, "text", None)
+            if isinstance(text, str):
+                text = text.strip()
+                return text if text else None
+        return None
+
+    def _extract_reasoning_text_from_item(self, item) -> Optional[str]:
+        if not item:
+            return None
+        item_type = getattr(item, "type", None) if not isinstance(item, dict) else item.get("type")
+        if item_type != "reasoning":
+            return None
+        summary = getattr(item, "summary", None) if not isinstance(item, dict) else item.get("summary")
+        text = self._summary_to_text(summary)
+        if text:
+            return text
+        item_text = getattr(item, "text", None) if not isinstance(item, dict) else item.get("text")
+        if isinstance(item_text, str):
+            item_text = item_text.strip()
+            return item_text if item_text else None
+        return None
+
+    def _extract_reasoning_delta_from_chunk(self, chunk) -> Optional[str]:
+        chunk_type = getattr(chunk, "type", "") or ""
+        reasoning_text = None
+        is_delta = False
+
+        if "reasoning" in chunk_type or "summary" in chunk_type:
+            delta = getattr(chunk, "delta", None)
+            if isinstance(delta, str) and delta:
+                reasoning_text = delta
+                is_delta = "delta" in chunk_type
+            else:
+                text = getattr(chunk, "text", None)
+                if isinstance(text, str) and text:
+                    reasoning_text = text
+                    is_delta = "delta" in chunk_type
+                else:
+                    reasoning_text = self._summary_to_text(getattr(chunk, "summary", None))
+
+        if reasoning_text is None:
+            item = getattr(chunk, "item", None)
+            reasoning_text = self._extract_reasoning_text_from_item(item)
+            is_delta = False
+
+        if not reasoning_text:
+            return None
+
+        if is_delta:
+            self._stream_reasoning_buffer += reasoning_text
+            return reasoning_text
+
+        if not self._stream_reasoning_buffer:
+            self._stream_reasoning_buffer = reasoning_text
+            return reasoning_text
+
+        if reasoning_text.startswith(self._stream_reasoning_buffer):
+            delta = reasoning_text[len(self._stream_reasoning_buffer):]
+            self._stream_reasoning_buffer = reasoning_text
+            return delta if delta else None
+
+        self._stream_reasoning_buffer = reasoning_text
+        return reasoning_text
+
 
     def _should_use_responses_api(self, model: str, kwargs: dict) -> bool:
         """
@@ -474,6 +567,7 @@ class OpenaiProvider(Provider):
             self._streaming_tool_calls = {}
             self._stream_content_length = 0
             self._stream_tool_calls_count = 0
+            self._stream_reasoning_buffer = ""
             response = await self.client.responses.create(
                 model=model,
                 input=input_items,
@@ -496,7 +590,13 @@ class OpenaiProvider(Provider):
                     if usage_obj:
                         stream_usage = self._normalize_usage(usage_obj) or stream_usage
 
-                    if ctype == 'response.output_text.delta' and hasattr(chunk, 'delta'):
+                    reasoning_delta = self._extract_reasoning_delta_from_chunk(chunk)
+                    if reasoning_delta:
+                        yield ChatCompletionResponse(
+                            choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=None, reasoning_content=reasoning_delta), finish_reason=None)],
+                            metadata={'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'id', None), 'model': getattr(chunk, 'model', None)}
+                        )
+                    elif ctype == 'response.output_text.delta' and hasattr(chunk, 'delta'):
                         # Accumulate content length
                         if chunk.delta:
                             self._stream_content_length += len(chunk.delta)
@@ -549,7 +649,23 @@ class OpenaiProvider(Provider):
             reasoning_content = None
 
             # 提取reasoning content
-            if hasattr(resp, 'reasoning_items') and resp.reasoning_items:
+            reasoning_text = None
+            if hasattr(resp, 'output') and resp.output:
+                for item in resp.output:
+                    reasoning_text = self._extract_reasoning_text_from_item(item)
+                    if reasoning_text:
+                        break
+
+            if reasoning_text:
+                reasoning_content = ReasoningContent(
+                    thinking=reasoning_text,
+                    provider="openai",
+                    raw_data={
+                        'output': resp.output if hasattr(resp, 'output') else None,
+                        'response_id': getattr(resp, 'id', None)
+                    }
+                )
+            elif hasattr(resp, 'reasoning_items') and resp.reasoning_items:
                 reasoning_content = ReasoningContent(
                     thinking="[推理内容已加密，暂未提供摘要]",
                     provider="openai",
@@ -645,6 +761,7 @@ class OpenaiProvider(Provider):
             self._streaming_tool_calls = {}
             self._stream_content_length = 0
             self._stream_tool_calls_count = 0
+            self._stream_reasoning_buffer = ""
 
             # Clean messages for OpenAI API (remove reasoning_content and truncate tool_call IDs)
             cleaned_messages, id_mapping = self._clean_messages_for_openai(messages)
