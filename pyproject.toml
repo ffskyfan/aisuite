@@ -20,7 +20,7 @@ cerebras_cloud_sdk = { version = "^1.19.0", optional = true }
 
 # Optional dependencies for different providers
 httpx = "^0.28.1"
-google-genai = "^1.31.0"
+google-genai = "^1.59.0"
 [tool.poetry.extras]
 anthropic = ["anthropic"]
 aws = ["boto3"]

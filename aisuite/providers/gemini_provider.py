@@ -177,6 +177,57 @@ def _get_tool_call_extra(tool_call: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _normalize_thinking_config(value: Any) -> Dict[str, Any]:
+    """Normalize thinking_config input into SDK-friendly snake_case keys."""
+    if value is None:
+        return {}
+
+    data: Dict[str, Any] = {}
+    if isinstance(value, types.ThinkingConfig):
+        try:
+            data = value.model_dump()
+        except Exception:
+            try:
+                data = value.dict()
+            except Exception:
+                data = {}
+    elif isinstance(value, dict):
+        data = value.copy()
+    elif hasattr(value, "__dict__"):
+        data = dict(value.__dict__)
+
+    if not data:
+        return {}
+
+    normalized: Dict[str, Any] = {}
+    remap = {
+        "includeThoughts": "include_thoughts",
+        "thinkingLevel": "thinking_level",
+        "thinkingBudget": "thinking_budget",
+    }
+    for key, val in data.items():
+        normalized[remap.get(key, key)] = val
+
+    return normalized
+
+
+def _filter_thinking_config_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop thinking_config keys unsupported by the installed SDK."""
+    if not data:
+        return {}
+
+    allowed = None
+    if hasattr(types.ThinkingConfig, "model_fields"):
+        allowed = set(types.ThinkingConfig.model_fields.keys())
+    elif hasattr(types.ThinkingConfig, "__fields__"):
+        allowed = set(types.ThinkingConfig.__fields__.keys())
+
+    if not allowed:
+        return data
+
+    return {key: value for key, value in data.items() if key in allowed}
+
+
 class GeminiMessageConverter:
 
     @staticmethod
@@ -398,6 +449,12 @@ class GeminiProvider(Provider):
         if not model_id:
             return False
         return "gemini-3" in model_id
+
+    def _is_gemini_3_flash_model(self, model_id: str) -> bool:
+        """Heuristic check for Gemini 3 Flash models."""
+        if not model_id:
+            return False
+        return "gemini-3" in model_id and "flash" in model_id
 
     def _resolve_tool_call_signature(self, model_id: str, tool_call: Any) -> Tuple[Optional[str], bool]:
         """
@@ -683,9 +740,11 @@ class GeminiProvider(Provider):
         model_id = model
         # Separate system message (if present) for config
         config_kwargs = {}
+        thinking_config_fields = _normalize_thinking_config(kwargs.pop("thinking_config", None))
         # Default thinking_config for 2.5 series models (thought summaries)
         if "2.5" in model_id:  # Heuristic check for 2.5 series models
-            config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
+            if "include_thoughts" not in thinking_config_fields:
+                thinking_config_fields["include_thoughts"] = True
 
         # Reasoning / thinking control for Gemini 3 models
         # Accept OpenAI-style reasoning_effort / reasoning, and direct thinking_level
@@ -701,23 +760,46 @@ class GeminiProvider(Provider):
                 reasoning_effort = reasoning
 
         if self._is_gemini_3_model(model_id):
-            # Map to Gemini 3 thinking_level = "low" | "high"
+            # Map to Gemini 3 thinking_level (Flash supports minimal/medium/high; Pro supports low/high)
             level = None
+            is_flash = self._is_gemini_3_flash_model(model_id)
             if isinstance(thinking_level, str) and thinking_level:
                 level = thinking_level.lower()
             elif isinstance(reasoning_effort, str) and reasoning_effort:
                 eff = reasoning_effort.lower()
-                if eff in {"minimal", "low", "none", "disable"}:
+                if eff in {"minimal", "none", "disable"}:
+                    level = "minimal" if is_flash else "low"
+                elif eff == "low":
                     level = "low"
-                elif eff in {"medium", "high"}:
+                elif eff == "medium":
+                    level = "medium" if is_flash else "high"
+                elif eff == "high":
                     level = "high"
 
-            if level in ("low", "high"):
-                config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=level)
+            if level and not is_flash:
+                if level == "minimal":
+                    level = "low"
+                elif level == "medium":
+                    level = "high"
+
+            thinking_requested = bool(thinking_config_fields) or bool(level) or isinstance(reasoning_effort, str)
+            if thinking_requested:
+                if level and "thinking_level" not in thinking_config_fields:
+                    thinking_config_fields["thinking_level"] = level
+                if "include_thoughts" not in thinking_config_fields:
+                    thinking_config_fields["include_thoughts"] = True
 
             # For Gemini 3, default temperature to 1.0 if not explicitly set
             if "temperature" not in kwargs and "temperature" not in config_kwargs:
                 config_kwargs["temperature"] = 1.0
+
+        if thinking_config_fields:
+            filtered_thinking_config = _filter_thinking_config_fields(thinking_config_fields)
+            if filtered_thinking_config:
+                try:
+                    config_kwargs["thinking_config"] = types.ThinkingConfig(**filtered_thinking_config)
+                except Exception:
+                    config_kwargs["thinking_config"] = filtered_thinking_config
 
         if messages and messages[0]['role'] == "system":
             config_kwargs["system_instruction"] = messages[0]['content']
