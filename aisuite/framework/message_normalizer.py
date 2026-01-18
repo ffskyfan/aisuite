@@ -14,7 +14,7 @@ class MessageNormalizer:
     CORE_FIELDS = {'role', 'content', 'tool_calls', 'name'}
     
     # Fields that may cause compatibility issues
-    OPTIONAL_FIELDS = {'refusal', 'reasoning_content', 'tool_call_id', 'function_call'}
+    OPTIONAL_FIELDS = {'refusal', 'reasoning_content', 'tool_call_id', 'function_call', 'cache_control'}
     
     # Provider-specific field mappings
     PROVIDER_FIELD_MAP = {

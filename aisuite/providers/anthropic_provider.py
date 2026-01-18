@@ -261,10 +261,35 @@ class AnthropicMessageConverter:
             return self._convert_dict_message(msg)
         return self._convert_message_object(msg)
 
+    def _apply_cache_control_to_content(self, content, cache_control):
+        """Apply Anthropic cache_control marking to message content blocks."""
+        if not cache_control:
+            return content
+
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                if isinstance(block, dict):
+                    copied = block.copy()
+                    copied.setdefault("cache_control", cache_control)
+                    blocks.append(copied)
+                else:
+                    blocks.append(block)
+            return blocks
+
+        if content is None:
+            content = ""
+        return [{"type": "text", "text": str(content), "cache_control": cache_control}]
+
     def _convert_dict_message(self, msg):
         """Convert a dictionary message to Anthropic format."""
+        cache_control = msg.get("cache_control")
         if msg["role"] == self.ROLE_TOOL:
-            return self._create_tool_result_message(msg["tool_call_id"], msg["content"])
+            return self._create_tool_result_message(
+                msg["tool_call_id"],
+                msg.get("content"),
+                cache_control=cache_control,
+            )
         elif msg["role"] == self.ROLE_ASSISTANT and "tool_calls" in msg:
             reasoning_content = msg.get("reasoning_content")
 
@@ -277,9 +302,12 @@ class AnthropicMessageConverter:
             return self._create_assistant_tool_message(
                 msg["content"],
                 msg["tool_calls"],
-                reasoning_content  # 传递 reasoning_content（可能是ReasoningContent对象）
+                reasoning_content,  # 传递 reasoning_content（可能是ReasoningContent对象）
+                cache_control=cache_control,
             )
-        return {"role": msg["role"], "content": msg["content"]}
+
+        content = self._apply_cache_control_to_content(msg.get("content"), cache_control)
+        return {"role": msg["role"], "content": content}
 
     def _convert_message_object(self, msg):
         """Convert a Message object to Anthropic format."""
@@ -294,20 +322,24 @@ class AnthropicMessageConverter:
             )
         return {"role": msg.role, "content": msg.content}
 
-    def _create_tool_result_message(self, tool_call_id, content):
+    def _create_tool_result_message(self, tool_call_id, content, cache_control=None):
         """Create a tool result message in Anthropic format."""
+        tool_result = {
+            "type": "tool_result",
+            "tool_use_id": tool_call_id,
+            "content": content,
+        }
+        if cache_control:
+            tool_result["cache_control"] = cache_control
+
         return {
             "role": self.ROLE_USER,
             "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_call_id,
-                    "content": content,
-                }
+                tool_result
             ],
         }
 
-    def _create_assistant_tool_message(self, content, tool_calls, reasoning_content=None):
+    def _create_assistant_tool_message(self, content, tool_calls, reasoning_content=None, cache_control=None):
         """Create an assistant message with tool calls in Anthropic format."""
         message_content = []
 
@@ -340,6 +372,9 @@ class AnthropicMessageConverter:
                     "input": json.loads(tool_input),
                 }
             )
+
+        if cache_control:
+            message_content = self._apply_cache_control_to_content(message_content, cache_control)
         return {"role": self.ROLE_ASSISTANT, "content": message_content}
 
     def _extract_system_message(self, messages):
@@ -347,10 +382,13 @@ class AnthropicMessageConverter:
         # TODO: This is a temporary solution to extract the system message.
         # User can pass multiple system messages, which can mingled with other messages.
         # This needs to be fixed to handle this case.
-        if messages and messages[0]["role"] == "system":
-            system_message = messages[0]["content"]
-            messages.pop(0)
-            return system_message
+        if messages and messages[0].get("role") == "system":
+            system_msg = messages.pop(0)
+            system_content = system_msg.get("content")
+            cache_control = system_msg.get("cache_control")
+            if cache_control:
+                return self._apply_cache_control_to_content(system_content, cache_control)
+            return system_content
         return []
 
     def _get_finish_reason(self, response):

@@ -32,6 +32,31 @@ class TestAnthropicMessageConverter(unittest.TestCase):
             converted_messages, [{"role": "user", "content": "What is the weather?"}]
         )
 
+    def test_convert_request_with_system_message_cache_control(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant.",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+            {"role": "user", "content": "What is the weather?"},
+        ]
+        system_message, converted_messages = self.converter.convert_request(messages)
+
+        self.assertEqual(
+            system_message,
+            [
+                {
+                    "type": "text",
+                    "text": "You are a helpful assistant.",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        )
+        self.assertEqual(
+            converted_messages, [{"role": "user", "content": "What is the weather?"}]
+        )
+
     def test_convert_request_with_tool_use_message(self):
         messages = [
             {"role": "tool", "tool_call_id": "tool123", "content": "Weather data here."}
@@ -49,6 +74,35 @@ class TestAnthropicMessageConverter(unittest.TestCase):
                             "type": "tool_result",
                             "tool_use_id": "tool123",
                             "content": "Weather data here.",
+                        }
+                    ],
+                }
+            ],
+        )
+
+    def test_convert_request_with_tool_use_message_cache_control(self):
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "tool123",
+                "content": "Weather data here.",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            }
+        ]
+        system_message, converted_messages = self.converter.convert_request(messages)
+
+        self.assertEqual(system_message, [])
+        self.assertEqual(
+            converted_messages,
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool123",
+                            "content": "Weather data here.",
+                            "cache_control": {"type": "ephemeral", "ttl": "5m"},
                         }
                     ],
                 }
