@@ -1,5 +1,7 @@
 import os
 import json
+import base64
+import logging
 from typing import Any, AsyncGenerator, Dict, Optional, Tuple, Union
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
@@ -10,6 +12,8 @@ from aisuite.provider import Provider
 from google import genai
 from google.genai import types
 
+
+logger = logging.getLogger(__name__)
 
 def _normalize_gemini_usage(usage_obj):
     """Normalize Gemini usage/usageMetadata to AISuite standard dict.
@@ -86,6 +90,27 @@ def _normalize_gemini_usage(usage_obj):
 GEMINI_PROVIDER_NAME = "gemini"
 GEMINI_SIGNATURE_PLACEHOLDER = "skip_thought_signature_validator"
 
+_TOOL_CALL_ERROR_FINISH_REASONS = {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"}
+
+
+def _normalize_finish_reason(reason: Any) -> Optional[str]:
+    if reason is None:
+        return None
+    if isinstance(reason, str):
+        return reason
+    # Prefer enum name/value when available
+    name = getattr(reason, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    value = getattr(reason, "value", None)
+    if isinstance(value, str) and value:
+        return value
+    text = str(reason)
+    if "." in text:
+        # e.g. "FinishReason.MALFORMED_FUNCTION_CALL" -> "MALFORMED_FUNCTION_CALL"
+        return text.rsplit(".", 1)[-1]
+    return text
+
 
 def _extract_thought_signature(source: Any) -> Optional[str]:
     """Best-effort extraction of thought_signature / thoughtSignature."""
@@ -147,14 +172,21 @@ def _extract_thought_signature(source: Any) -> Optional[str]:
 
 def _build_tool_call_extra(signature: Optional[str], placeholder: bool = False) -> Optional[Dict[str, Any]]:
     """Build extra_content payload for a tool call."""
-    if not signature and not placeholder:
+    normalized_signature = None
+    if signature is not None:
+        if isinstance(signature, bytes):
+            normalized_signature = "base64:" + base64.b64encode(signature).decode("ascii")
+        else:
+            normalized_signature = str(signature)
+
+    if not normalized_signature and not placeholder:
         return None
 
     extra: Dict[str, Any] = {"provider": GEMINI_PROVIDER_NAME}
     google_meta: Dict[str, Any] = {}
 
-    if signature:
-        google_meta["thought_signature"] = signature
+    if normalized_signature:
+        google_meta["thought_signature"] = normalized_signature
     if placeholder:
         google_meta["placeholder"] = True
 
@@ -467,6 +499,9 @@ class GeminiProvider(Provider):
         signature = _extract_thought_signature(extra) or _extract_thought_signature(tool_call)
         placeholder = False
 
+        # Gemini 3 requires a thought_signature for all replayed tool calls.
+        # If we don't have one from the SDK response, fall back to a placeholder
+        # to avoid hard 400 INVALID_ARGUMENT errors on the next request.
         if not signature and self._is_gemini_3_model(model_id):
             signature = GEMINI_SIGNATURE_PLACEHOLDER
             placeholder = True
@@ -475,26 +510,36 @@ class GeminiProvider(Provider):
 
     def _attach_thought_signature(self, part: Any, signature: Optional[str]) -> None:
         """Attach thought_signature metadata to a Part/function_call if possible."""
-        if not signature or part is None:
+        if signature is None or part is None:
             return
 
+        if isinstance(signature, bytes):
+            sig_bytes: bytes = signature
+        elif isinstance(signature, str) and signature.startswith("base64:"):
+            try:
+                sig_bytes = base64.b64decode(signature[len("base64:"):], validate=False)
+            except Exception:
+                sig_bytes = signature.encode("utf-8", errors="replace")
+        else:
+            sig_bytes = str(signature).encode("utf-8", errors="replace")
+
         try:
-            setattr(part, "thought_signature", signature)
+            setattr(part, "thought_signature", sig_bytes)
         except Exception:
             pass
         try:
-            setattr(part, "thoughtSignature", signature)
+            setattr(part, "thoughtSignature", sig_bytes)
         except Exception:
             pass
 
         function_call = getattr(part, "function_call", None)
         if function_call:
             try:
-                setattr(function_call, "thought_signature", signature)
+                setattr(function_call, "thought_signature", sig_bytes)
             except Exception:
                 pass
             try:
-                setattr(function_call, "thoughtSignature", signature)
+                setattr(function_call, "thoughtSignature", sig_bytes)
             except Exception:
                 pass
 
@@ -824,11 +869,19 @@ class GeminiProvider(Provider):
             elif isinstance(stop_seq, list):
                 config_kwargs["stop_sequences"] = stop_seq
         # Handle tools parameter - convert OpenAI format to Gemini format
+        tool_names_for_log: list[str] = []
         if "tools" in kwargs:
             openai_tools = kwargs.pop("tools")
             gemini_tools = self._convert_tool_spec(openai_tools)
             if gemini_tools:
                 config_kwargs["tools"] = gemini_tools
+            if isinstance(openai_tools, list):
+                for tool in openai_tools:
+                    if isinstance(tool, dict) and tool.get("type") == "function":
+                        func = tool.get("function") or {}
+                        name = func.get("name")
+                        if isinstance(name, str) and name:
+                            tool_names_for_log.append(name)
 
         # (Ignore any remaining kwargs that are not applicable for now)
         # Create config object if any config parameters were specified
@@ -993,14 +1046,7 @@ class GeminiProvider(Provider):
                                     function_call_obj = part.function_call
                                     signature = _extract_thought_signature(part) or _extract_thought_signature(function_call_obj)
                                     if signature and function_call_obj:
-                                        try:
-                                            setattr(function_call_obj, "thought_signature", signature)
-                                        except Exception:
-                                            pass
-                                        try:
-                                            setattr(function_call_obj, "thoughtSignature", signature)
-                                        except Exception:
-                                            pass
+                                        self._attach_thought_signature(function_call_obj, signature)
                                     mock_delta = type('MockDelta', (), {
                                         'function_call': function_call_obj
                                     })()
@@ -1031,7 +1077,7 @@ class GeminiProvider(Provider):
                         finish_reason = None
                         stop_info = None
                         if chunk.candidates and chunk.candidates[0].finish_reason:
-                            finish_reason = chunk.candidates[0].finish_reason
+                            finish_reason = _normalize_finish_reason(chunk.candidates[0].finish_reason)
                             # Use accumulated values for accurate stop_info metadata
                             stop_metadata = {
                                 "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
@@ -1041,7 +1087,19 @@ class GeminiProvider(Provider):
                                 "model": model_id,
                                 "provider": "gemini"
                             }
-                            stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, stop_metadata)
+                            if finish_reason in _TOOL_CALL_ERROR_FINISH_REASONS:
+                                try:
+                                    roles_tail = [getattr(c, "role", None) for c in contents][-12:]
+                                except Exception:
+                                    roles_tail = []
+                                logger.warning(
+                                    "Gemini tool-call error finish_reason=%s model=%s tools=%s roles_tail=%s",
+                                    finish_reason,
+                                    model_id,
+                                    tool_names_for_log,
+                                    roles_tail,
+                                )
+                            stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason or "", stop_metadata)
 
                         response_metadata = {
                             'id': response_id,
@@ -1163,14 +1221,7 @@ class GeminiProvider(Provider):
                                 function_call_obj = part.function_call
                                 signature = _extract_thought_signature(part) or _extract_thought_signature(function_call_obj)
                                 if signature and function_call_obj:
-                                    try:
-                                        setattr(function_call_obj, "thought_signature", signature)
-                                    except Exception:
-                                        pass
-                                    try:
-                                        setattr(function_call_obj, "thoughtSignature", signature)
-                                    except Exception:
-                                        pass
+                                    self._attach_thought_signature(function_call_obj, signature)
                                 mock_delta = type('MockDelta', (), {
                                     'function_call': function_call_obj
                                 })()
@@ -1202,7 +1253,7 @@ class GeminiProvider(Provider):
                     finish_reason = None
                     stop_info = None
                     if chunk.candidates and chunk.candidates[0].finish_reason:
-                        finish_reason = chunk.candidates[0].finish_reason
+                        finish_reason = _normalize_finish_reason(chunk.candidates[0].finish_reason)
                         # Use accumulated values for accurate stop_info metadata
                         stop_metadata = {
                             "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
@@ -1212,7 +1263,20 @@ class GeminiProvider(Provider):
                             "model": model_id,
                             "provider": "gemini"
                         }
-                        stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, stop_metadata)
+                        if finish_reason in _TOOL_CALL_ERROR_FINISH_REASONS:
+                            try:
+                                roles_tail = [getattr(c, "role", None) for c in (history_msgs or [])][-12:]
+                            except Exception:
+                                roles_tail = []
+                            logger.warning(
+                                "Gemini tool-call error finish_reason=%s model=%s tools=%s last_user_message_len=%s roles_tail=%s",
+                                finish_reason,
+                                model_id,
+                                tool_names_for_log,
+                                len(last_user_message or ""),
+                                roles_tail,
+                            )
+                        stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason or "", stop_metadata)
 
                     response_metadata = {
                         'id': response_id, # Use the captured ID (or None if never found)
@@ -1309,6 +1373,7 @@ class GeminiProvider(Provider):
             return [tool_call_obj]
 
         except Exception:
+            logger.exception("Failed to process Gemini function_call (name=%s)", getattr(function_call, "name", None))
             return None
 
     def _process_standard_tool_calls(self, tool_calls):
