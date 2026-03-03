@@ -13,6 +13,7 @@ Currently supported providers are:
 - Azure
 - Cerebras
 - Google
+- GLM-5
 - Groq
 - HuggingFace Ollama
 - Mistral
@@ -36,6 +37,12 @@ This installs aisuite along with anthropic's library.
 
 ```shell
 pip install 'aisuite[anthropic]'
+```
+
+This installs aisuite along with Zhipu's official SDK for GLM-5.
+
+```shell
+pip install 'aisuite[glm]'
 ```
 
 This installs all the provider-specific libraries

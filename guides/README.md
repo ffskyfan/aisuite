@@ -8,6 +8,7 @@ Here are the instructions for:
 - [Azure](azure.md) 
 - [Cohere](cohere.md)
 - [Google](google.md)
+- [GLM-5](glm.md)
 - [Hugging Face](huggingface.md)
 - [Mistral](mistral.md)
 - [OpenAI](openai.md)
@@ -18,4 +19,3 @@ Here are the instructions for:
 Unless otherwise stated, these guides have not been endorsed by the providers. 
 
 We also welcome additional [contributions](../CONTRIBUTING.md). 
-

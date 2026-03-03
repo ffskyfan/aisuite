@@ -36,6 +36,9 @@ def provider_configs():
         "nebius": {
             "api_key": "nebius-api-key",
         },
+        "glm": {
+            "api_key": "glm-api-key",
+        },
     }
 
 
@@ -86,6 +89,11 @@ def provider_configs():
             "aisuite.providers.nebius_provider.NebiusProvider.chat_completions_create",
             "nebius",
             "nebius-model",
+        ),
+        (
+            "aisuite.providers.glm_provider.GlmProvider.chat_completions_create",
+            "glm",
+            "glm-5",
         ),
     ],
 )
