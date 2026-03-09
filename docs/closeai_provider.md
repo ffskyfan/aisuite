@@ -35,6 +35,31 @@ client = ai.Client({
 })
 ```
 
+### Native Protocol Routing
+
+`closeai` can now route one provider config to multiple native protocol adapters.
+
+- Default protocol: `openai`
+- Per-call override: pass `protocol="anthropic"`
+- Model prefix override: use `model="closeai:anthropic/claude-sonnet-4-20250514"`
+- Config-based routing: set `model_protocols={"claude-": "anthropic"}`
+
+```python
+client = ai.Client({
+    "closeai": {
+        "api_key": "sk-your-closeai-api-key",
+        "model_protocols": {
+            "claude-": "anthropic"
+        },
+        "protocols": {
+            "anthropic": {
+                "base_url": "https://api.openai-proxy.org/anthropic"
+            }
+        }
+    }
+})
+```
+
 ## Usage Examples
 
 ### Basic Chat Completion
@@ -102,6 +127,32 @@ response = client.chat.completions.create(
     model="closeai:gemini-pro",
     messages=messages
 )
+```
+
+### Using CloseAI's Anthropic-Native Interface
+
+For Claude models, you can route through CloseAI's Anthropic-compatible endpoint instead of the OpenAI-compatible one:
+
+```python
+response = client.chat.completions.create(
+    model="closeai:claude-sonnet-4-20250514",
+    messages=messages,
+    protocol="anthropic",
+    thinking={"type": "enabled", "budget_tokens": 2048},
+)
+```
+
+Or configure routing once:
+
+```python
+client = ai.Client({
+    "closeai": {
+        "api_key": "sk-your-closeai-api-key",
+        "model_protocols": {
+            "claude-": "anthropic"
+        }
+    }
+})
 ```
 
 ### Reasoning Models

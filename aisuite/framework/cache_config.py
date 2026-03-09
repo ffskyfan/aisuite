@@ -43,19 +43,17 @@ class CacheConfig:
             priority: 优先级（0-100），用于智能缓存选择
             metadata: 额外的元数据
         """
-        # 支持字符串输入
-        if isinstance(cache_type, str):
-            self.cache_type = cache_type
-        else:
-            self.cache_type = cache_type.value if hasattr(cache_type, 'value') else cache_type
-            
-        if isinstance(ttl, str):
-            self.ttl = ttl
-        else:
-            self.ttl = ttl.value if hasattr(ttl, 'value') else ttl
+        self.cache_type = self._normalize_enum_value(cache_type)
+        self.ttl = self._normalize_enum_value(ttl)
             
         self.priority = priority
         self.metadata = metadata or {}
+
+    @staticmethod
+    def _normalize_enum_value(value: Union[Enum, str, Any]) -> Any:
+        if hasattr(value, "value"):
+            return value.value
+        return value
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式"""

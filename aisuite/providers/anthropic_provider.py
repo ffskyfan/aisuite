@@ -39,6 +39,15 @@ class AnthropicMessageConverter:
         "tool_use": "tool_calls",
     }
 
+    CACHE_TTL_ALIASES = {
+        "cachettl.minutes_5": "5m",
+        "minutes_5": "5m",
+        "5m": "5m",
+        "cachettl.hours_1": "1h",
+        "hours_1": "1h",
+        "1h": "1h",
+    }
+
     def convert_request(self, messages):
         """Convert framework messages to Anthropic format."""
         system_message = self._extract_system_message(messages)
@@ -261,8 +270,36 @@ class AnthropicMessageConverter:
             return self._convert_dict_message(msg)
         return self._convert_message_object(msg)
 
+    @classmethod
+    def _normalize_cache_ttl(cls, ttl):
+        if hasattr(ttl, "value"):
+            ttl = ttl.value
+        if ttl is None:
+            return None
+        ttl_str = str(ttl).strip()
+        if not ttl_str:
+            return None
+        normalized = cls.CACHE_TTL_ALIASES.get(ttl_str.lower())
+        return normalized or ttl_str
+
+    @classmethod
+    def _normalize_cache_control(cls, cache_control):
+        if not isinstance(cache_control, dict):
+            return cache_control
+
+        normalized = cache_control.copy()
+        if "type" in normalized and hasattr(normalized["type"], "value"):
+            normalized["type"] = normalized["type"].value
+
+        ttl = cls._normalize_cache_ttl(normalized.get("ttl"))
+        if ttl is not None:
+            normalized["ttl"] = ttl
+
+        return normalized
+
     def _apply_cache_control_to_content(self, content, cache_control):
         """Apply Anthropic cache_control marking to message content blocks."""
+        cache_control = self._normalize_cache_control(cache_control)
         if not cache_control:
             return content
 
@@ -270,11 +307,15 @@ class AnthropicMessageConverter:
             blocks = []
             for block in content:
                 if isinstance(block, dict):
-                    copied = block.copy()
-                    copied.setdefault("cache_control", cache_control)
-                    blocks.append(copied)
+                    blocks.append(block.copy())
                 else:
                     blocks.append(block)
+
+            for index in range(len(blocks) - 1, -1, -1):
+                block = blocks[index]
+                if isinstance(block, dict):
+                    block.setdefault("cache_control", cache_control)
+                    break
             return blocks
 
         if content is None:
@@ -283,7 +324,7 @@ class AnthropicMessageConverter:
 
     def _convert_dict_message(self, msg):
         """Convert a dictionary message to Anthropic format."""
-        cache_control = msg.get("cache_control")
+        cache_control = self._normalize_cache_control(msg.get("cache_control"))
         if msg["role"] == self.ROLE_TOOL:
             return self._create_tool_result_message(
                 msg["tool_call_id"],
@@ -324,6 +365,7 @@ class AnthropicMessageConverter:
 
     def _create_tool_result_message(self, tool_call_id, content, cache_control=None):
         """Create a tool result message in Anthropic format."""
+        cache_control = self._normalize_cache_control(cache_control)
         tool_result = {
             "type": "tool_result",
             "tool_use_id": tool_call_id,
@@ -341,6 +383,7 @@ class AnthropicMessageConverter:
 
     def _create_assistant_tool_message(self, content, tool_calls, reasoning_content=None, cache_control=None):
         """Create an assistant message with tool calls in Anthropic format."""
+        cache_control = self._normalize_cache_control(cache_control)
         message_content = []
 
         # 1. 如果有ReasoningContent，使用其原始数据重构thinking块
@@ -622,6 +665,10 @@ class AnthropicMessageConverter:
                     "required": function["parameters"].get("required", []),
                 },
             }
+            if tool.get("cache_control"):
+                anthropic_tool["cache_control"] = self._normalize_cache_control(
+                    tool["cache_control"]
+                )
             anthropic_tools.append(anthropic_tool)
 
         return anthropic_tools

@@ -109,6 +109,36 @@ class TestAnthropicMessageConverter(unittest.TestCase):
             ],
         )
 
+    def test_convert_request_with_assistant_tool_calls_marks_only_last_block(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Let me check the weather.",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                "tool_calls": [
+                    {
+                        "id": "tool123",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "San Francisco"}',
+                        },
+                    }
+                ],
+            }
+        ]
+
+        system_message, converted_messages = self.converter.convert_request(messages)
+
+        self.assertEqual(system_message, [])
+        self.assertEqual(converted_messages[0]["role"], "assistant")
+        self.assertEqual(converted_messages[0]["content"][0]["type"], "text")
+        self.assertNotIn("cache_control", converted_messages[0]["content"][0])
+        self.assertEqual(converted_messages[0]["content"][1]["type"], "tool_use")
+        self.assertEqual(
+            converted_messages[0]["content"][1]["cache_control"],
+            {"type": "ephemeral", "ttl": "5m"},
+        )
+
     def test_convert_response_normal_message(self):
         response = MagicMock()
         response.stop_reason = "end_turn"
@@ -259,6 +289,58 @@ class TestAnthropicMessageConverter(unittest.TestCase):
                 },
                 "required": ["location"],
             },
+        )
+
+    def test_convert_tool_spec_preserves_cache_control(self):
+        openai_tools = [
+            {
+                "type": "function",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string", "description": "City name."}
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+        anthropic_tools = self.converter.convert_tool_spec(openai_tools)
+
+        self.assertEqual(
+            anthropic_tools[0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+
+    def test_convert_tool_spec_normalizes_legacy_cache_ttl_strings(self):
+        openai_tools = [
+            {
+                "type": "function",
+                "cache_control": {"type": "ephemeral", "ttl": "CacheTTL.HOURS_1"},
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string", "description": "City name."}
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+        anthropic_tools = self.converter.convert_tool_spec(openai_tools)
+
+        self.assertEqual(
+            anthropic_tools[0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
         )
 
     def test_convert_request_with_tool_call_and_result(self):

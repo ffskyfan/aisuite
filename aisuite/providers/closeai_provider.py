@@ -1,1347 +1,240 @@
 import os
-import json
-from typing import Union, AsyncGenerator, List, Dict, Any, Optional
-from openai import AsyncOpenAI
+from typing import Any, AsyncGenerator, Dict, Optional, Union
 
-from aisuite.provider import Provider, LLMError
-from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
-from aisuite.framework.message import Message, ReasoningContent, ChatCompletionMessageToolCall, Function
-from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.framework.chat_completion_response import ChatCompletionResponse
+from aisuite.provider import Provider
+from aisuite.providers.openai_provider import OpenaiProvider
+
+CLOSEAI_OPENAI_BASE_URL = "https://api.openai-proxy.org/v1"
+CLOSEAI_ANTHROPIC_BASE_URL = "https://api.openai-proxy.org/anthropic"
+_CLOSEAI_ROUTING_CONFIG_KEYS = {
+    "default_protocol",
+    "protocol",
+    "native_protocol",
+    "protocols",
+    "model_protocols",
+    "infer_protocol_from_model",
+}
+
+
+def _normalize_closeai_protocol(protocol: Optional[str]) -> Optional[str]:
+    if protocol is None:
+        return None
+    normalized = str(protocol).strip().lower()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _resolve_closeai_protocol_base_url(
+    protocol: str, configured_base_url: Optional[str]
+) -> str:
+    protocol = _normalize_closeai_protocol(protocol) or "openai"
+    base_url = (configured_base_url or "").strip().rstrip("/")
+
+    if protocol == "anthropic":
+        if not base_url:
+            return CLOSEAI_ANTHROPIC_BASE_URL
+        if base_url.endswith("/anthropic"):
+            return base_url
+        if base_url.endswith("/v1"):
+            return f"{base_url[:-3]}/anthropic"
+        return f"{base_url}/anthropic"
+
+    if not base_url:
+        return CLOSEAI_OPENAI_BASE_URL
+    if base_url.endswith("/anthropic"):
+        return f"{base_url[:-11]}/v1"
+    return base_url
+
+
+class CloseaiOpenaiProvider(OpenaiProvider):
+    """Thin CloseAI adapter that reuses the OpenAI-compatible provider."""
+
+    def __init__(self, **config):
+        closeai_config = config.copy()
+        closeai_config["api_key"] = closeai_config.get("api_key") or os.getenv(
+            "CLOSEAI_API_KEY"
+        )
+        closeai_config["base_url"] = (
+            closeai_config.get("base_url") or CLOSEAI_OPENAI_BASE_URL
+        )
+
+        if not closeai_config["api_key"]:
+            raise ValueError(
+                "CloseAI API key is required. Set CLOSEAI_API_KEY environment "
+                "variable or pass api_key parameter."
+            )
+
+        super().__init__(**closeai_config)
 
 
 class CloseaiProvider(Provider):
-    """
-    CloseAI provider for aisuite with enhanced Responses API support.
+    """Route CloseAI requests to protocol-specific providers."""
 
-    CloseAI is an OpenAI-compatible API proxy service that provides access to multiple AI models
-    through a unified interface. It supports all OpenAI parameters and automatically handles
-    protocol conversion between different model providers.
-
-    Key features:
-    - Full OpenAI API compatibility (Chat Completions + Responses API)
-    - Multi-model aggregation interface
-    - Automatic protocol conversion (ChatCompletion ↔ Response, Anthropic, Gemini)
-    - Extended timeout support for reasoning models (up to 20 minutes)
-    - Load balancing across multiple accounts
-    - Intelligent API selection (Responses API for reasoning models, Chat Completions for others)
-    - Reasoning summaries conversion to aisuite ReasoningContent format
-    - Multi-turn reasoning context support for stateless conversations
-
-    Reasoning Model Support:
-    - GPT-5 series: Automatic Responses API usage with reasoning summaries
-    - o4 series: Enhanced reasoning support with context preservation
-    - o3 series: Traditional reasoning support
-    - o1 series: Traditional reasoning support
-
-    Limitations:
-    - Does not support stateful interfaces (file, fine-tune, assistants)
-    - Response API supports stateless usage only (but with context preservation in ReasoningContent)
-    """
+    SUPPORTED_PROTOCOLS = {"openai", "anthropic"}
+    DEFAULT_MODEL_PROTOCOLS = {
+        "claude-": "anthropic",
+    }
 
     def __init__(self, **config):
-        """
-        Initialize the CloseAI provider.
-
-        Args:
-            api_key (str, optional): CloseAI API key. If not provided, will look for CLOSEAI_API_KEY environment variable.
-            base_url (str, optional): Base URL for CloseAI API. Defaults to https://api.openai-proxy.org/v1
-            **config: Additional configuration passed to AsyncOpenAI client
-        """
-        # Get API key from config or environment
-        api_key = config.get('api_key') or os.getenv("CLOSEAI_API_KEY")
-        if not api_key:
-            raise ValueError("CloseAI API key is required. Set CLOSEAI_API_KEY environment variable or pass api_key parameter.")
-
-        # Set base URL - CloseAI uses OpenAI-compatible endpoint
-        base_url = config.get('base_url', 'https://api.openai-proxy.org/v1')
-
-        # Initialize OpenAI client with CloseAI configuration
-        self.client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            **{k: v for k, v in config.items() if k not in ['api_key', 'base_url']}
+        self._config = config.copy()
+        self._protocol_providers: Dict[str, Provider] = {}
+        self._default_protocol = self._validate_protocol(
+            self._config.get("default_protocol")
+            or self._config.get("protocol")
+            or "openai"
+        )
+        self._infer_protocol_from_model = bool(
+            self._config.get("infer_protocol_from_model", True)
+        )
+        self._model_protocols = self._build_model_protocols(
+            self._config.get("model_protocols")
         )
 
-        # Track streaming tool calls for accumulation
-        self._streaming_tool_calls = {}
+    def _validate_protocol(self, protocol: Optional[str]) -> str:
+        normalized = _normalize_closeai_protocol(protocol)
+        if normalized not in self.SUPPORTED_PROTOCOLS:
+            raise ValueError(
+                f"Unsupported CloseAI protocol '{protocol}'. "
+                f"Supported protocols: {sorted(self.SUPPORTED_PROTOCOLS)}"
+            )
+        return normalized
 
-        # Map Responses function_call item.id (fc_*) to call_id (call_*) for next-turn outputs
-        self._responses_tool_call_ids: Dict[str, str] = {}
+    def _build_model_protocols(
+        self, configured_protocols: Optional[Dict[str, str]]
+    ) -> Dict[str, str]:
+        if configured_protocols is None:
+            configured_protocols = {}
 
-        # Track accumulated content for streaming responses
-        # Used to provide accurate metadata in stop_info
-        self._stream_content_length = 0
-        self._stream_tool_calls_count = 0
-        self._stream_reasoning_buffer = ""
+        if not isinstance(configured_protocols, dict):
+            raise ValueError(
+                "closeai model_protocols must be a dict of model prefix -> protocol"
+            )
 
-    def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
-        """Create StopInfo from OpenAI-compatible finish_reason."""
-        if not finish_reason:
-            return None
+        merged_protocols = {}
+        if self._infer_protocol_from_model:
+            merged_protocols.update(self.DEFAULT_MODEL_PROTOCOLS)
+        merged_protocols.update(configured_protocols)
 
-        # Analyze choice data to determine content presence
-        has_content = False
-        content_length = 0
-        tool_calls_count = 0
+        normalized_protocols = {}
+        for model_prefix, protocol in merged_protocols.items():
+            if not model_prefix:
+                continue
+            normalized_protocols[str(model_prefix).lower()] = self._validate_protocol(
+                protocol
+            )
+        return normalized_protocols
 
-        if choice_data:
-            # Check message content
-            message = choice_data.get("message") or choice_data.get("delta")
-            if message:
-                content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else None)
-                if content:
-                    has_content = True
-                    content_length = len(content)
-
-                # Check tool calls
-                tool_calls = getattr(message, "tool_calls", None) or (message.get("tool_calls") if isinstance(message, dict) else None)
-                if tool_calls:
-                    tool_calls_count = len(tool_calls)
-                    if tool_calls_count > 0:
-                        has_content = True  # Tool calls count as content
-
-        metadata = {
-            "has_content": has_content,
-            "content_length": content_length,
-            "tool_calls_count": tool_calls_count,
-            "finish_reason": finish_reason,
-            "model": model,
-            "provider": "closeai"
-        }
-
-        # Use OpenAI mapping since CloseAI is OpenAI-compatible, but preserve CloseAI provider identity
-        stop_info = stop_reason_manager.map_stop_reason("openai", finish_reason, metadata)
-        # Override provider in metadata to correctly identify as CloseAI
-        stop_info.metadata["provider"] = "closeai"
-        return stop_info
-
-    def _supports_reasoning(self, model: str) -> bool:
-        """
-        Check if the model supports reasoning parameters.
-
-        CloseAI supports all OpenAI reasoning models and automatically handles
-        protocol conversion for models that require it.
-        """
-        # o1 series models support reasoning_effort
-        if model.startswith('o1-'):
-            return True
-        # o3 series models support reasoning_effort (including o3, o3-mini, etc.)
-        if model.startswith('o3') or model.startswith('o3-'):
-            return True
-        # o4 series models support reasoning_effort (including o4-mini, etc.)
-        if model.startswith('o4') or model.startswith('o4-'):
-            return True
-        # GPT-5 series models support reasoning parameter
-        if model.startswith('gpt-5'):
-            return True
-        # Regular GPT models (gpt-4o, gpt-4, etc.) do not support reasoning
-        return False
-
-    def _should_use_responses_api(self, model: str, kwargs: Dict[str, Any]) -> bool:
-        """
-        Determine if we should use Responses API instead of Chat Completions API.
-
-        According to OpenAI docs, GPT-5 and newer reasoning models work better with
-        Responses API, especially when using reasoning parameters or when we need
-        to pass reasoning items for multi-turn conversations.
-        """
-        # GPT-5 models are recommended to use Responses API
-        if model.startswith('gpt-5'):
-            return True
-
-        # o4 series models benefit from Responses API for reasoning summaries
-        if model.startswith('o4') or model.startswith('o4-'):
-            return True
-
-        # Use Responses API if reasoning parameters are present
-        if any(key in kwargs for key in ['reasoning', 'verbosity', 'reasoning_effort', 'reasoning_summary']):
-            return True
-
-        # Use Responses API if we have reasoning items in messages (for multi-turn)
-        messages = kwargs.get('messages', [])
-        for msg in messages:
-            if isinstance(msg, dict) and msg.get('reasoning_content'):
-                return True
-            elif hasattr(msg, 'reasoning_content') and msg.reasoning_content:
-                return True
-
-        return False
-
-    def _prepare_reasoning_kwargs(self, model: str, kwargs: Dict[str, Any], use_responses_api: bool = False) -> Dict[str, Any]:
-        """
-        Prepare reasoning-related kwargs based on model type and API choice.
-
-        CloseAI automatically handles protocol conversion and supports reasoning models
-        through both ChatCompletion and Responses interfaces.
-        """
-        prepared_kwargs = kwargs.copy()
-
-        # If model doesn't support reasoning, remove reasoning-related parameters
-        if not self._supports_reasoning(model):
-            # Remove reasoning parameters that would cause API errors
-            prepared_kwargs.pop('reasoning', None)
-            prepared_kwargs.pop('reasoning_effort', None)
-            prepared_kwargs.pop('reasoning_summary', None)
-            prepared_kwargs.pop('verbosity', None)
-            return prepared_kwargs
-
-        # For reasoning models, handle special parameter requirements
-        if (model.startswith('gpt-5') or
-            model.startswith('o1-') or
-            model.startswith('o3') or
-            model.startswith('o3-') or
-            model.startswith('o4') or
-            model.startswith('o4-')):
-
-            # Handle token limit parameters - convert to appropriate format based on API
-            max_tokens_value = None
-
-            # Check for max_tokens first (direct from user)
-            if 'max_tokens' in prepared_kwargs:
-                max_tokens_value = prepared_kwargs.pop('max_tokens')
-            # Check for max_completion_tokens (already converted by LLMUnit)
-            elif 'max_completion_tokens' in prepared_kwargs:
-                max_tokens_value = prepared_kwargs.pop('max_completion_tokens')
-
-            # Apply the appropriate parameter based on API type
-            if max_tokens_value is not None:
-                if use_responses_api:
-                    prepared_kwargs['max_output_tokens'] = max_tokens_value
-                else:
-                    prepared_kwargs['max_completion_tokens'] = max_tokens_value
-
-            # GPT-5 only supports default temperature (1.0)
-            if model.startswith('gpt-5'):
-                if 'temperature' in prepared_kwargs and prepared_kwargs['temperature'] != 1.0:
-                    prepared_kwargs.pop('temperature')  # Remove non-default temperature
-
-        if use_responses_api:
-            # For Responses API, convert Chat Completions parameters to Responses format
-            self._convert_to_responses_format(prepared_kwargs)
-        else:
-            # For Chat Completions API, remove Responses-specific parameters
-            prepared_kwargs.pop('reasoning', None)
-            prepared_kwargs.pop('reasoning_effort', None)
-            prepared_kwargs.pop('reasoning_summary', None)
-            prepared_kwargs.pop('verbosity', None)
-
-        return prepared_kwargs
-
-    def _convert_to_responses_format(self, kwargs: Dict[str, Any]) -> None:
-        """
-        Convert Chat Completions parameters to Responses API format.
-        """
-        # Convert reasoning_effort to reasoning.effort format
-        if 'reasoning_effort' in kwargs:
-            effort = kwargs.pop('reasoning_effort')
-            if 'reasoning' not in kwargs:
-                kwargs['reasoning'] = {}
-            kwargs['reasoning']['effort'] = effort
-
-        # Convert reasoning_summary to reasoning.summary format
-        if 'reasoning_summary' in kwargs:
-            summary = kwargs.pop('reasoning_summary')
-            if 'reasoning' not in kwargs:
-                kwargs['reasoning'] = {}
-            kwargs['reasoning']['summary'] = summary
-
-        # Convert verbosity to text.verbosity format
-        if 'verbosity' in kwargs:
-            verbosity = kwargs.pop('verbosity')
-            kwargs['text'] = {'verbosity': verbosity}
-
-
-    def _normalize_usage(self, usage_obj):
-        """Normalize OpenAI/CloseAI usage objects to a standard dict.
-
-        Supports both Chat Completions usage (prompt_tokens/completion_tokens)
-        and possible input/output token naming variants.
-        """
-        if not usage_obj:
-            return None
-
-        # Try to get a plain dict from pydantic model or mapping
-        if hasattr(usage_obj, "model_dump"):
-            data = usage_obj.model_dump()
-        elif isinstance(usage_obj, dict):
-            data = usage_obj
-        else:
-            data = {}
-            for attr in ("input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"):
-                if hasattr(usage_obj, attr):
-                    data[attr] = getattr(usage_obj, attr)
-
-        prompt_tokens = data.get("input_tokens") or data.get("prompt_tokens")
-        completion_tokens = data.get("output_tokens") or data.get("completion_tokens")
-
-        if prompt_tokens is None and hasattr(usage_obj, "prompt_tokens"):
-            prompt_tokens = getattr(usage_obj, "prompt_tokens")
-        if completion_tokens is None and hasattr(usage_obj, "completion_tokens"):
-            completion_tokens = getattr(usage_obj, "completion_tokens")
-
-        if prompt_tokens is None or completion_tokens is None:
-            return None
-
-        total_tokens = data.get("total_tokens")
-        if total_tokens is None:
-            total_tokens = prompt_tokens + completion_tokens
-
+    def _base_protocol_config(self) -> Dict[str, Any]:
         return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
+            key: value
+            for key, value in self._config.items()
+            if key not in _CLOSEAI_ROUTING_CONFIG_KEYS
         }
 
-    @staticmethod
-    def _summary_to_text(summary_obj) -> Optional[str]:
-        if not summary_obj:
-            return None
-        if isinstance(summary_obj, str):
-            text = summary_obj.strip()
-            return text if text else None
-        if isinstance(summary_obj, list):
-            parts = []
-            for item in summary_obj:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    text = item.get("text") or item.get("content")
-                    if isinstance(text, str):
-                        parts.append(text)
-                elif hasattr(item, "text"):
-                    text = getattr(item, "text", None)
-                    if isinstance(text, str):
-                        parts.append(text)
-            joined = "".join(parts).strip()
-            return joined if joined else None
-        if isinstance(summary_obj, dict):
-            text = summary_obj.get("text") or summary_obj.get("content")
-            if isinstance(text, str):
-                text = text.strip()
-                return text if text else None
-        if hasattr(summary_obj, "text"):
-            text = getattr(summary_obj, "text", None)
-            if isinstance(text, str):
-                text = text.strip()
-                return text if text else None
-        return None
+    def _build_protocol_config(self, protocol: str) -> Dict[str, Any]:
+        protocol_configs = self._config.get("protocols") or {}
+        if not isinstance(protocol_configs, dict):
+            raise ValueError("closeai protocols must be a dict of protocol -> config")
 
-    def _extract_reasoning_text_from_item(self, item) -> Optional[str]:
-        if not item:
-            return None
-        item_type = getattr(item, "type", None) if not isinstance(item, dict) else item.get("type")
-        if item_type != "reasoning":
-            return None
-        summary = getattr(item, "summary", None) if not isinstance(item, dict) else item.get("summary")
-        text = self._summary_to_text(summary)
-        if text:
-            return text
-        item_text = getattr(item, "text", None) if not isinstance(item, dict) else item.get("text")
-        if isinstance(item_text, str):
-            item_text = item_text.strip()
-            return item_text if item_text else None
-        return None
+        shared_config = self._base_protocol_config()
+        protocol_override = protocol_configs.get(protocol) or {}
+        if not isinstance(protocol_override, dict):
+            raise ValueError(f"closeai protocols['{protocol}'] must be a dict")
 
-    def _extract_reasoning_delta_from_chunk(self, chunk) -> Optional[str]:
-        chunk_type = getattr(chunk, "type", "") or ""
-        reasoning_text = None
-        is_delta = False
+        protocol_config = shared_config.copy()
+        protocol_config.update(protocol_override)
 
-        if "reasoning" in chunk_type or "summary" in chunk_type:
-            delta = getattr(chunk, "delta", None)
-            if isinstance(delta, str) and delta:
-                reasoning_text = delta
-                is_delta = "delta" in chunk_type
-            else:
-                text = getattr(chunk, "text", None)
-                if isinstance(text, str) and text:
-                    reasoning_text = text
-                    is_delta = "delta" in chunk_type
-                else:
-                    reasoning_text = self._summary_to_text(getattr(chunk, "summary", None))
-
-        if reasoning_text is None:
-            item = getattr(chunk, "item", None)
-            reasoning_text = self._extract_reasoning_text_from_item(item)
-            is_delta = False
-
-        if not reasoning_text:
-            return None
-
-        if is_delta:
-            self._stream_reasoning_buffer += reasoning_text
-            return reasoning_text
-
-        if not self._stream_reasoning_buffer:
-            self._stream_reasoning_buffer = reasoning_text
-            return reasoning_text
-
-        if reasoning_text.startswith(self._stream_reasoning_buffer):
-            delta = reasoning_text[len(self._stream_reasoning_buffer):]
-            self._stream_reasoning_buffer = reasoning_text
-            return delta if delta else None
-
-        self._stream_reasoning_buffer = reasoning_text
-        return reasoning_text
-
-    async def _responses_create(self, model: str, messages: List[Dict[str, Any]], stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
-        """
-        Create responses using CloseAI's Responses API.
-
-        This method handles the newer Responses API which is better for reasoning models
-        and supports passing reasoning items between turns.
-        """
-        # Prepare input format for Responses API
-        input_items = []
-
-        # Convert messages to Responses API input format
-        for msg in messages:
-            if isinstance(msg, dict):
-                msg_dict = msg.copy()
-                role = msg_dict.get('role')
-
-                # If this message carries Responses raw output via reasoning_content, append it directly
-                rc = msg_dict.get('reasoning_content')
-                raw_output = None
-                if rc is not None:
-                    try:
-                        if hasattr(rc, 'raw_data') and isinstance(rc.raw_data, dict):
-                            raw_output = rc.raw_data.get('output')
-                        elif isinstance(rc, dict):
-                            raw_output = rc.get('raw_data', {}).get('output')
-                    except Exception:
-                        raw_output = None
-                if raw_output:
-                    # Append the exact previous Responses output items (reasoning/message/function_call, etc.)
-                    input_items.extend(raw_output)
-                    # Do not add a separate assistant message to avoid duplication
-                    continue
-
-                # Convert assistant tool_calls into Responses function_call items (Chat-style)
-                if role == 'assistant' and 'tool_calls' in msg_dict and msg_dict['tool_calls']:
-                    # Preserve assistant textual content if present
-                    text = msg_dict.get('content')
-                    if text:
-                        input_items.append({'role': 'assistant', 'content': text})
-                    # Convert each tool_call
-                    for tc in msg_dict['tool_calls']:
-                        fn = tc.get('function', {})
-                        call_id = tc.get('id')
-                        name = fn.get('name')
-                        arguments = fn.get('arguments', '')
-                        input_items.append({
-                            'type': 'function_call',
-                            'call_id': call_id,
-                            'name': name,
-                            'arguments': arguments
-                        })
-                    continue  # Done with this assistant message
-
-                # Convert tool messages into function_call_output items
-                if role == 'tool':
-                    input_items.append({
-                        'type': 'function_call_output',
-                        'call_id': msg_dict.get('tool_call_id'),
-                        'output': msg_dict.get('content', '')
-                    })
-                    continue
-
-                # Skip function role messages (unsupported)
-                if role == 'function':
-                    continue
-
-                # Remove fields that Responses API doesn't support on message objects
-                for field in ['reasoning_content', 'tool_calls', 'tool_call_id']:
-                    msg_dict.pop(field, None)
-                input_items.append(msg_dict)
-
-            else:
-                # Handle Message objects
-                if hasattr(msg, 'model_dump'):
-                    msg_dict = msg.model_dump()
-                    role = msg_dict.get('role')
-
-                    # If this message carries Responses raw output via reasoning_content, append it directly
-                    rc = msg_dict.get('reasoning_content')
-                    raw_output = None
-                    if rc is not None:
-                        try:
-                            if hasattr(rc, 'raw_data') and isinstance(rc.raw_data, dict):
-                                raw_output = rc.raw_data.get('output')
-                            elif isinstance(rc, dict):
-                                raw_output = rc.get('raw_data', {}).get('output')
-                        except Exception:
-                            raw_output = None
-                    if raw_output:
-                        input_items.extend(raw_output)
-                        continue
-
-                    if role == 'assistant' and 'tool_calls' in msg_dict and msg_dict['tool_calls']:
-                        text = msg_dict.get('content')
-                        if text:
-                            input_items.append({'role': 'assistant', 'content': text})
-                        for tc in msg_dict['tool_calls']:
-                            fn = tc.get('function', {})
-                            call_id = tc.get('id')
-                            name = fn.get('name')
-                            arguments = fn.get('arguments', '')
-                            input_items.append({
-                                'type': 'function_call',
-                                'call_id': call_id,
-                                'name': name,
-                                'arguments': arguments
-                            })
-                        continue
-
-                    if role == 'tool':
-                        input_items.append({
-                            'type': 'function_call_output',
-                            'call_id': msg_dict.get('tool_call_id'),
-                            'output': msg_dict.get('content', '')
-                        })
-                        continue
-
-                    if role == 'function':
-                        continue
-
-                    for field in ['reasoning_content', 'tool_calls', 'tool_call_id']:
-                        msg_dict.pop(field, None)
-                    input_items.append(msg_dict)
-                else:
-                    # Fallback: append as-is if not a dict-like message
-                    input_items.append(msg)
-
-        # Note: For CloseAI, we don't need to manually pass reasoning items
-        # The service handles reasoning context automatically
-
-        # Prepare kwargs for Responses API
-        responses_kwargs = kwargs.copy()
-        responses_kwargs.pop('messages', None)  # Remove messages as we use input
-
-        # Convert tools format for Responses API if present
-        if 'tools' in responses_kwargs:
-            responses_kwargs['tools'] = self._convert_tools_for_responses_api(responses_kwargs['tools'])
-
-        if stream:
-            # Reset streaming state for Responses API
-            self._streaming_tool_calls = {}
-            self._stream_content_length = 0
-            self._stream_tool_calls_count = 0
-            self._stream_reasoning_buffer = ""
-
-            # For streaming, we need to handle the response differently
-            response = await self.client.responses.create(
-                model=model,
-                input=input_items,
-                stream=True,
-                **responses_kwargs
+        api_key = protocol_config.get("api_key") or os.getenv("CLOSEAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "CloseAI API key is required. Set CLOSEAI_API_KEY environment "
+                "variable or pass api_key parameter."
             )
 
-            async def stream_generator():
-                async for chunk in response:
-                    # Convert Responses API streaming format to ChatCompletionResponse
-                    yield self._convert_responses_stream_chunk(chunk)
+        configured_base_url = protocol_config.get("base_url")
+        protocol_config["api_key"] = api_key
+        protocol_config["base_url"] = _resolve_closeai_protocol_base_url(
+            protocol, configured_base_url
+        )
+        return protocol_config
 
-            return stream_generator()
-        else:
-            # Non-streaming response
-            response = await self.client.responses.create(
-                model=model,
-                input=input_items,
-                stream=False,
-                **responses_kwargs
-            )
+    def _extract_protocol_from_model(self, model: str) -> tuple[Optional[str], str]:
+        for delimiter in ("/", ":"):
+            if delimiter not in model:
+                continue
+            protocol_hint, stripped_model = model.split(delimiter, 1)
+            normalized_protocol = _normalize_closeai_protocol(protocol_hint)
+            if normalized_protocol in self.SUPPORTED_PROTOCOLS:
+                return normalized_protocol, stripped_model
+        return None, model
 
-            return self._convert_responses_response(response)
+    def _match_protocol_from_model(self, model: str) -> Optional[str]:
+        model_lower = model.lower()
+        best_match = None
+        best_match_length = -1
 
-    def _convert_tools_for_responses_api(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Convert tools from Chat Completions format to Responses API format.
+        for model_prefix, protocol in self._model_protocols.items():
+            if (
+                model_lower.startswith(model_prefix)
+                and len(model_prefix) > best_match_length
+            ):
+                best_match = protocol
+                best_match_length = len(model_prefix)
 
-        Responses API expects tools in a flattened format without the nested 'function' structure.
-        """
-        converted_tools = []
+        return best_match
 
-        for tool in tools:
-            if isinstance(tool, dict):
-                if tool.get('type') == 'function' and 'function' in tool:
-                    # Flatten the structure for Responses API
-                    function_def = tool['function']
-                    converted_tool = {
-                        'type': 'function',
-                        'name': function_def.get('name'),
-                        'description': function_def.get('description', ''),
-                        'parameters': function_def.get('parameters', {})
-                    }
-                    # Pass through strict mode if present
-                    if 'strict' in function_def:
-                        converted_tool['strict'] = function_def['strict']
-                    converted_tools.append(converted_tool)
-                else:
-                    # Keep as is for other formats
-                    converted_tools.append(tool)
-            else:
-                # Non-dict tool, keep as is
-                converted_tools.append(tool)
+    def _resolve_protocol(
+        self, model: str, request_kwargs: Dict[str, Any]
+    ) -> tuple[str, str]:
+        explicit_protocol = request_kwargs.pop("protocol", None) or request_kwargs.pop(
+            "native_protocol", None
+        )
+        model_protocol, stripped_model = self._extract_protocol_from_model(model)
 
-        return converted_tools
+        if explicit_protocol is not None:
+            return self._validate_protocol(explicit_protocol), stripped_model
 
-    def _accumulate_responses_tool_calls(self, chunk) -> Optional[List[ChatCompletionMessageToolCall]]:
-        """
-        Accumulate tool call arguments from Responses API streaming events.
+        if model_protocol is not None:
+            return model_protocol, stripped_model
 
-        This handles response.function_call_arguments.delta events and builds up
-        the complete tool call arguments incrementally.
-        """
-        if not hasattr(chunk, 'item_id') or not hasattr(chunk, 'delta'):
-            return None
+        matched_protocol = self._match_protocol_from_model(stripped_model)
+        if matched_protocol is not None:
+            return matched_protocol, stripped_model
 
-        item_id = chunk.item_id
-        delta = chunk.delta
+        return self._default_protocol, stripped_model
 
-        # Initialize tool call data if not exists
-        if item_id not in self._streaming_tool_calls:
-            # We need to get the function name from a previous event
-            # For now, we'll initialize with placeholder and update later
-            self._streaming_tool_calls[item_id] = {
-                "id": item_id,
-                "type": "function",
-                "function": {
-                    "name": "",  # Will be filled from response.output_item.added
-                    "arguments": ""
-                }
-            }
+    def _create_protocol_provider(self, protocol: str) -> Provider:
+        protocol_config = self._build_protocol_config(protocol)
 
-        # Accumulate arguments
-        self._streaming_tool_calls[item_id]["function"]["arguments"] += delta
+        if protocol == "openai":
+            return CloseaiOpenaiProvider(**protocol_config)
 
-        # Don't return anything yet - wait for completion
-        return None
+        if protocol == "anthropic":
+            from aisuite.providers.anthropic_provider import AnthropicProvider
 
-    def _handle_responses_output_item_added(self, chunk) -> None:
-        """
-        Handle response.output_item.added events to extract function names.
-        """
-        if (hasattr(chunk, 'item') and
-            hasattr(chunk.item, 'type') and
-            chunk.item.type == 'function_call' and
-            hasattr(chunk.item, 'name')):
+            return AnthropicProvider(**protocol_config)
 
-            # Get function name and ID
-            item_name = chunk.item.name
-            item_id = getattr(chunk.item, 'id', None)
-
-            # Initialize or update tool call data
-            if item_id:
-                if item_id not in self._streaming_tool_calls:
-                    self._streaming_tool_calls[item_id] = {
-                        "id": item_id,
-                        "type": "function",
-                        "function": {
-                            "name": item_name,
-                            "arguments": ""
-                        }
-                    }
-                else:
-                    # Update existing entry with function name
-                    self._streaming_tool_calls[item_id]["function"]["name"] = item_name
-
-    async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
-        """
-        Create chat completions using CloseAI's multi-model aggregation interface.
-
-        CloseAI automatically handles protocol conversion for different model types.
-        For newer reasoning models, we use the Responses API for better performance.
-        """
-        # Check if we should use Responses API
-        use_responses_api = self._should_use_responses_api(model, kwargs)
-
-        if use_responses_api:
-            # Use Responses API for better reasoning model support
-            prepared_kwargs = self._prepare_reasoning_kwargs(model, kwargs, use_responses_api=True)
-            return await self._responses_create(model, messages, stream, **prepared_kwargs)
-
-        # Use Chat Completions API for regular models
-        prepared_kwargs = self._prepare_reasoning_kwargs(model, kwargs, use_responses_api=False)
-
-        if stream:
-            # Reset streaming state
-            self._streaming_tool_calls = {}
-            self._stream_content_length = 0
-            self._stream_tool_calls_count = 0
-            self._stream_reasoning_buffer = ""
-
-            # Clean messages parameter, remove ReasoningContent objects
-            cleaned_messages = []
-            for msg in messages:
-                if isinstance(msg, dict):
-                    cleaned_msg = msg.copy()
-                    # Remove reasoning_content field as CloseAI API doesn't need it as input
-                    if "reasoning_content" in cleaned_msg:
-                        cleaned_msg.pop("reasoning_content")
-                    cleaned_messages.append(cleaned_msg)
-                else:
-                    # If it's a Message object, convert to dict and remove reasoning_content
-                    if hasattr(msg, "model_dump"):
-                        cleaned_msg = msg.model_dump()
-                        if "reasoning_content" in cleaned_msg:
-                            cleaned_msg.pop("reasoning_content")
-                        cleaned_messages.append(cleaned_msg)
-                    else:
-                        cleaned_messages.append(msg)
-
-            # Ensure usage is included in streaming responses
-            stream_kwargs = prepared_kwargs.copy()
-            stream_options = stream_kwargs.get("stream_options") or {}
-            if "include_usage" not in stream_options:
-                stream_options["include_usage"] = True
-            stream_kwargs["stream_options"] = stream_options
-
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=cleaned_messages,  # Use cleaned messages
-                stream=True,
-                **stream_kwargs,  # Use prepared kwargs that are compatible with the model
-            )
-
-            async def stream_generator():
-                stream_usage = None
-                async for chunk in response:
-                    # Capture usage from streaming chunks (only appears on final chunk)
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        stream_usage = self._normalize_usage(chunk.usage) or stream_usage
-
-                    if chunk.choices:
-                        # Create choices with stop_info
-                        choices = []
-                        for choice in chunk.choices:
-                            # Accumulate content and tool calls for accurate metadata
-                            if choice.delta.content:
-                                self._stream_content_length += len(choice.delta.content)
-
-                            accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
-                            if accumulated_tool_calls:
-                                self._stream_tool_calls_count += len(accumulated_tool_calls)
-
-                            # Create stop_info if finish_reason is present
-                            stop_info = None
-                            if choice.finish_reason:
-                                # Use accumulated values for final stop_info
-                                if choice.finish_reason == "stop":
-                                    metadata = {
-                                        "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
-                                        "content_length": self._stream_content_length,
-                                        "tool_calls_count": self._stream_tool_calls_count,
-                                        "finish_reason": choice.finish_reason,
-                                        "model": chunk.model,
-                                        "provider": "closeai",
-                                    }
-                                    from aisuite.framework.stop_reason import stop_reason_manager
-
-                                    stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
-                                    stop_info.metadata["provider"] = "closeai"
-                                else:
-                                    choice_data = {"delta": choice.delta}
-                                    stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
-
-                            choices.append(
-                                StreamChoice(
-                                    index=choice.index,
-                                    delta=ChoiceDelta(
-                                        content=choice.delta.content,
-                                        role=choice.delta.role,
-                                        tool_calls=accumulated_tool_calls,
-                                        reasoning_content=getattr(
-                                            choice.delta,
-                                            "reasoning_content",
-                                            None,
-                                        ),  # Keep original format in streaming
-                                    ),
-                                    finish_reason=choice.finish_reason,
-                                    stop_info=stop_info,
-                                )
-                            )
-
-                        # Determine if this is the final chunk
-                        is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
-                        metadata = {
-                            "id": chunk.id,
-                            "created": chunk.created,
-                            "model": chunk.model,
-                        }
-                        if is_final_chunk and stream_usage:
-                            metadata["usage"] = stream_usage
-
-                        yield ChatCompletionResponse(
-                            choices=choices,
-                            metadata=metadata,
-                        )
-
-            return stream_generator()
-        else:
-            # For non-streaming calls, also need to clean messages
-            cleaned_messages = []
-            for msg in messages:
-                if isinstance(msg, dict):
-                    cleaned_msg = msg.copy()
-                    if 'reasoning_content' in cleaned_msg:
-                        cleaned_msg.pop('reasoning_content')
-                    cleaned_messages.append(cleaned_msg)
-                else:
-                    if hasattr(msg, 'model_dump'):
-                        cleaned_msg = msg.model_dump()
-                        if 'reasoning_content' in cleaned_msg:
-                            cleaned_msg.pop('reasoning_content')
-                        cleaned_messages.append(cleaned_msg)
-                    else:
-                        cleaned_messages.append(msg)
-
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=cleaned_messages,  # Use cleaned messages
-                stream=False,
-                **prepared_kwargs  # Use prepared kwargs that are compatible with the model
-            )
-            # Create choices with stop_info
-            choices = []
-            for choice in response.choices:
-                # Create stop_info
-                choice_data = {"message": choice.message}
-                stop_info = self._create_stop_info(choice.finish_reason, choice_data, response.model)
-
-                choices.append(Choice(
-                    index=choice.index,
-                    message=Message(
-                        content=choice.message.content,
-                        role=choice.message.role,
-                        tool_calls=self._convert_tool_calls(choice.message.tool_calls) if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls else None,
-                        refusal=None,
-                        reasoning_content=self._convert_reasoning_content(getattr(choice.message, 'reasoning_content', None))
-                    ),
-                    finish_reason=choice.finish_reason,
-                    stop_info=stop_info
-                ))
-
-            return ChatCompletionResponse(
-                choices=choices,
-                metadata={
-                    "id": response.id,
-                    "created": response.created,
-                    "model": response.model,
-                    "usage": {
-                        "prompt_tokens": response.usage.prompt_tokens,
-                        "completion_tokens": response.usage.completion_tokens,
-                        "total_tokens": response.usage.total_tokens
-                    }
-                }
-            )
-
-    def _convert_responses_response(self, response) -> ChatCompletionResponse:
-        """
-        Convert Responses API response to ChatCompletionResponse format.
-        """
-        # Extract the main message content and reasoning
-        message_content = None
-        reasoning_content = None
-        finish_reason = "stop"
-
-        # First, try to get content from output_text (most reliable)
-        if hasattr(response, 'output_text') and response.output_text:
-            message_content = response.output_text
-
-        # Parse the response output for additional information
-        if hasattr(response, 'output') and response.output:
-            for item in response.output:
-                if hasattr(item, 'type'):
-                    if item.type == 'message':
-                        # Extract message content if we don't have it yet
-                        if hasattr(item, 'content') and item.content:
-                            for content_item in item.content:
-                                if hasattr(content_item, 'type') and content_item.type == 'output_text':
-                                    if hasattr(content_item, 'text'):
-                                        message_content = content_item.text
-                                        break
-                        # Get finish reason
-                        if hasattr(item, 'status'):
-                            finish_reason = "stop" if item.status == "completed" else "incomplete"
-                    elif item.type == 'reasoning':
-                        # Extract reasoning summary
-                        if hasattr(item, 'summary') and item.summary:
-                            reasoning_text = ""
-                            for summary_item in item.summary:
-                                if hasattr(summary_item, 'text'):
-                                    reasoning_text += summary_item.text + "\n"
-
-                            if reasoning_text.strip():
-                                # Create ReasoningContent with full response data for multi-turn support
-                                reasoning_content = ReasoningContent(
-                                    thinking=reasoning_text.strip(),
-                                    provider="closeai",
-                                    raw_data={
-                                        "reasoning_items": [item],  # Store reasoning items for next turn
-                                        "output": response.output,  # Store full output for context
-                                        "response_id": getattr(response, 'id', None)
-                                    }
-                                )
-                        else:
-                            # Even if no summary, create reasoning content to indicate reasoning was used
-                            reasoning_content = ReasoningContent(
-                                thinking="[推理过程已完成，但未提供摘要]",
-                                provider="closeai",
-                                raw_data={
-                                    "reasoning_items": [item],
-                                    "output": response.output,
-                                    "response_id": getattr(response, 'id', None)
-                                }
-                            )
-
-        # Ensure content is never None for compatibility
-        if message_content is None:
-            message_content = ""
-
-        # Create stop_info for Responses API
-        choice_data = {
-            "message": {
-                "content": message_content,
-                "tool_calls": self._extract_tool_calls_from_responses(response)
-            }
-        }
-        stop_info = self._create_stop_info(finish_reason, choice_data, getattr(response, 'model', None))
-
-        return ChatCompletionResponse(
-            choices=[
-                Choice(
-                    index=0,
-                    message=Message(
-                        content=message_content,
-                        role="assistant",
-                        tool_calls=self._extract_tool_calls_from_responses(response),
-                        refusal=None,
-                        reasoning_content=reasoning_content
-                    ),
-                    finish_reason=finish_reason,
-                    stop_info=stop_info
-                )
-            ],
-            metadata={
-                "id": getattr(response, 'id', None),
-                "created": getattr(response, 'created', None),
-                "model": getattr(response, 'model', None),
-                "usage": self._extract_usage_from_responses(response)
-            }
+        raise ValueError(
+            f"Unsupported CloseAI protocol '{protocol}'. "
+            f"Supported protocols: {sorted(self.SUPPORTED_PROTOCOLS)}"
         )
 
-    def _convert_responses_stream_chunk(self, chunk) -> ChatCompletionResponse:
-        """
-        Convert Responses API streaming chunk to ChatCompletionResponse format.
+    def _get_protocol_provider(self, protocol: str) -> Provider:
+        if protocol not in self._protocol_providers:
+            self._protocol_providers[protocol] = self._create_protocol_provider(protocol)
+        return self._protocol_providers[protocol]
 
-        Based on OpenAI Responses API streaming documentation:
-        - response.created: Response started
-        - response.output_text.delta: Text content delta (key event for content)
-        - response.function_call_arguments.delta: Function call arguments delta
-        - response.completed: Response finished
-        """
-        content = None
-        reasoning_content = None
-        finish_reason = None
-        role = None
-        tool_calls = None
-
-        # Handle different event types based on official documentation
-        chunk_type = getattr(chunk, "type", None)
-        usage_dict = None
-        reasoning_delta = self._extract_reasoning_delta_from_chunk(chunk)
-        if reasoning_delta:
-            reasoning_content = reasoning_delta
-
-        if chunk_type == "response.output_text.delta":
-            # Text delta event - contains the actual content increments
-            if hasattr(chunk, "delta"):
-                content = chunk.delta
-                role = "assistant"
-                # Accumulate content length for accurate stop_info metadata
-                if content:
-                    self._stream_content_length += len(content)
-
-        elif chunk_type == "response.output_item.added":
-            # Output item added - set role for message items and handle function calls
-            if hasattr(chunk, "item"):
-                item = chunk.item
-                if hasattr(item, "role"):
-                    role = item.role
-                elif hasattr(item, "type") and item.type == "message":
-                    role = "assistant"
-                elif hasattr(item, "type") and item.type == "function_call":
-                    # Handle function call item added
-                    self._handle_responses_output_item_added(chunk)
-                    role = "assistant"
-
-        elif chunk_type == "response.function_call_arguments.delta":
-            # Function call arguments delta - handle tool calls streaming
-            if hasattr(chunk, "delta") and hasattr(chunk, "item_id"):
-                # Accumulate function call arguments for Responses API
-                tool_calls = self._accumulate_responses_tool_calls(chunk)
-                if tool_calls:
-                    # Return accumulated tool calls when complete
-                    return ChatCompletionResponse(
-                        choices=[
-                            StreamChoice(
-                                index=0,
-                                delta=ChoiceDelta(
-                                    content=None,
-                                    role="assistant",
-                                    tool_calls=tool_calls,
-                                    reasoning_content=None,
-                                ),
-                                finish_reason=None,
-                                stop_info=None,  # No stop_info for intermediate tool call chunks
-                            )
-                        ],
-                        metadata={
-                            "id": getattr(chunk, "response_id", None),
-                            "created": getattr(chunk, "created", None),
-                            "model": getattr(chunk, "model", None),
-                        },
-                    )
-
-        elif chunk_type == "response.function_call_arguments.done":
-            # Function call arguments completed - finalize tool call
-            if hasattr(chunk, "item_id") and hasattr(chunk, "arguments"):
-                # Force completion of this tool call
-                item_id = chunk.item_id
-                if item_id in self._streaming_tool_calls:
-                    tool_call_data = self._streaming_tool_calls[item_id]
-                    tool_call_data["function"]["arguments"] = chunk.arguments
-
-                    # Convert to final format
-                    try:
-                        mock_tool_call = type(
-                            "MockToolCall",
-                            (),
-                            {
-                                "id": tool_call_data["id"],
-                                "type": tool_call_data["type"],
-                                "function": type(
-                                    "MockFunction",
-                                    (),
-                                    {
-                                        "name": tool_call_data["function"]["name"],
-                                        "arguments": tool_call_data["function"]["arguments"],
-                                    },
-                                )(),
-                            },
-                        )()
-
-                        converted = self._convert_tool_calls([mock_tool_call])
-                        if converted:
-                            # Remove completed tool call
-                            del self._streaming_tool_calls[item_id]
-                            # Increment tool calls count for accurate stop_info metadata
-                            self._stream_tool_calls_count += 1
-
-                            return ChatCompletionResponse(
-                                choices=[
-                                    StreamChoice(
-                                        index=0,
-                                        delta=ChoiceDelta(
-                                            content=None,
-                                            role="assistant",
-                                            tool_calls=converted,
-                                            reasoning_content=None,
-                                        ),
-                                        finish_reason=None,
-                                        stop_info=None,  # No stop_info for intermediate tool call chunks
-                                    )
-                                ],
-                                metadata={
-                                    "id": getattr(chunk, "response_id", None),
-                                    "created": getattr(chunk, "created", None),
-                                    "model": getattr(chunk, "model", None),
-                                },
-                            )
-                    except Exception as e:  # noqa: F841
-                        # If conversion fails, clean up and continue
-                        if item_id in self._streaming_tool_calls:
-                            del self._streaming_tool_calls[item_id]
-
-        elif chunk_type == "response.output_item.done":
-            # Output item completed - this is NOT the end of the entire response
-            # Each tool call or message item will have its own done event
-            # We should NOT set finish_reason here to avoid premature stop
-            pass
-
-        elif chunk_type in ["response.completed", "response.done"]:
-            # Response completed - this is the REAL end of the entire response
-            # Only set finish_reason when the entire response is complete
-            finish_reason = "stop"
-            # Extract usage from the final Responses chunk if available
-            if hasattr(chunk, "response"):
-                usage_dict = self._extract_usage_from_responses(chunk.response)
-
-        elif chunk_type == "error":
-            # Error occurred
-            finish_reason = "error"
-
-        # Create stop_info if finish_reason is present
-        stop_info = None
-        if finish_reason:
-            # For the final stop_info, use accumulated values to reflect the entire response
-            if finish_reason == "stop" and chunk_type in ["response.completed", "response.done"]:
-                # Override with accumulated metadata for accurate representation
-                metadata = {
-                    "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
-                    "content_length": self._stream_content_length,
-                    "tool_calls_count": self._stream_tool_calls_count,
-                    "finish_reason": finish_reason,
-                    "model": getattr(chunk, "model", None),
-                    "provider": "closeai",
-                }
-                from aisuite.framework.stop_reason import stop_reason_manager
-
-                stop_info = stop_reason_manager.map_stop_reason("openai", finish_reason, metadata)
-                # Override provider in metadata to correctly identify as CloseAI
-                stop_info.metadata["provider"] = "closeai"
-            else:
-                # For non-final or error cases, use standard approach
-                choice_data = {
-                    "delta": {
-                        "content": content,
-                        "tool_calls": tool_calls,
-                    }
-                }
-                stop_info = self._create_stop_info(finish_reason, choice_data, getattr(chunk, "model", None))
-
-        # Return streaming chunk - only include non-None values to avoid overwriting
-        metadata = {
-            "id": getattr(chunk, "response_id", None) or getattr(chunk, "item_id", None),
-            "created": getattr(chunk, "created", None),
-            "model": getattr(chunk, "model", None),
-        }
-        if usage_dict:
-            metadata["usage"] = usage_dict
-
-        return ChatCompletionResponse(
-            choices=[
-                StreamChoice(
-                    index=0,
-                    delta=ChoiceDelta(
-                        content=content,
-                        role=role,
-                        tool_calls=tool_calls,
-                        reasoning_content=reasoning_content,
-                    ),
-                    finish_reason=finish_reason,
-                    stop_info=stop_info,
-                )
-            ],
-            metadata=metadata,
+    async def chat_completions_create(
+        self, model, messages, stream: bool = False, **kwargs
+    ) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
+        request_kwargs = kwargs.copy()
+        protocol, resolved_model = self._resolve_protocol(model, request_kwargs)
+        provider = self._get_protocol_provider(protocol)
+        return await provider.chat_completions_create(
+            resolved_model,
+            messages,
+            stream=stream,
+            **request_kwargs,
         )
-
-    def _extract_usage_from_responses(self, response) -> Optional[Dict[str, Any]]:
-        """
-        Extract usage information from Responses API response.
-        """
-        if hasattr(response, 'usage'):
-            usage = response.usage
-            result = {}
-
-            if hasattr(usage, 'input_tokens'):
-                result['prompt_tokens'] = usage.input_tokens
-            if hasattr(usage, 'output_tokens'):
-                result['completion_tokens'] = usage.output_tokens
-            if hasattr(usage, 'total_tokens'):
-                result['total_tokens'] = usage.total_tokens
-            elif 'prompt_tokens' in result and 'completion_tokens' in result:
-                result['total_tokens'] = result['prompt_tokens'] + result['completion_tokens']
-
-            # Add reasoning token details if available
-            if hasattr(usage, 'output_tokens_details'):
-                details = usage.output_tokens_details
-                if hasattr(details, 'reasoning_tokens'):
-                    result['reasoning_tokens'] = details.reasoning_tokens
-
-            return result
-        return None
-
-    def _convert_reasoning_content(self, reasoning_content):
-        """
-        Convert CloseAI reasoning_content to ReasoningContent object.
-
-        This handles both Chat Completions API reasoning_content (simple string)
-        and Responses API reasoning summaries (structured format).
-        """
-        if not reasoning_content:
-            return None
-
-        # Handle simple string format (from Chat Completions API)
-        if isinstance(reasoning_content, str):
-            return ReasoningContent(
-                thinking=reasoning_content,
-                provider="closeai",
-                raw_data={"reasoning_content": reasoning_content}
-            )
-
-        # Handle structured format (from Responses API)
-        if isinstance(reasoning_content, dict):
-            thinking_text = ""
-
-            # Extract thinking text from various possible formats
-            if 'summary' in reasoning_content:
-                if isinstance(reasoning_content['summary'], list):
-                    for item in reasoning_content['summary']:
-                        if isinstance(item, dict) and 'text' in item:
-                            thinking_text += item['text'] + "\n"
-                        elif isinstance(item, str):
-                            thinking_text += item + "\n"
-                elif isinstance(reasoning_content['summary'], str):
-                    thinking_text = reasoning_content['summary']
-            elif 'thinking' in reasoning_content:
-                thinking_text = reasoning_content['thinking']
-            elif 'text' in reasoning_content:
-                thinking_text = reasoning_content['text']
-
-            return ReasoningContent(
-                thinking=thinking_text.strip() if thinking_text else str(reasoning_content),
-                provider="closeai",
-                raw_data=reasoning_content
-            )
-
-        # Fallback: convert to string
-        return ReasoningContent(
-            thinking=str(reasoning_content),
-            provider="closeai",
-            raw_data={"reasoning_content": reasoning_content}
-        )
-
-    def _accumulate_and_convert_tool_calls(self, delta):
-        """
-        Accumulate tool call chunks and convert to unified format when complete.
-
-        Args:
-            delta: The delta object from streaming response
-
-        Returns:
-            List of converted tool calls if any are complete, None otherwise
-        """
-        if not hasattr(delta, 'tool_calls') or not delta.tool_calls:
-            return None
-
-        # Accumulate tool call chunks
-        for tool_call_delta in delta.tool_calls:
-            index = getattr(tool_call_delta, 'index', 0)
-
-            # Initialize tool call accumulator if not exists
-            if index not in self._streaming_tool_calls:
-                self._streaming_tool_calls[index] = {
-                    "id": "",
-                    "type": "function",
-                    "function": {
-                        "name": "",
-                        "arguments": ""
-                    }
-                }
-
-            tool_call = self._streaming_tool_calls[index]
-
-            # Accumulate id
-            if hasattr(tool_call_delta, 'id') and tool_call_delta.id:
-                tool_call["id"] += tool_call_delta.id
-
-            # Accumulate function data
-            if hasattr(tool_call_delta, 'function') and tool_call_delta.function:
-                if hasattr(tool_call_delta.function, 'name') and tool_call_delta.function.name:
-                    tool_call["function"]["name"] += tool_call_delta.function.name
-
-                if hasattr(tool_call_delta.function, 'arguments') and tool_call_delta.function.arguments:
-                    tool_call["function"]["arguments"] += tool_call_delta.function.arguments
-
-            # Set type if provided
-            if hasattr(tool_call_delta, 'type') and tool_call_delta.type:
-                tool_call["type"] = tool_call_delta.type
-
-        # Check for complete tool calls and convert them
-        complete_tool_calls = []
-        for index, tool_call_data in list(self._streaming_tool_calls.items()):
-            if (tool_call_data["id"] and
-                tool_call_data["function"]["name"] and
-                tool_call_data["function"]["arguments"]):
-
-                try:
-                    # Try to parse arguments as JSON to ensure completeness
-                    json.loads(tool_call_data["function"]["arguments"])
-
-                    # Create mock object for _convert_tool_calls
-                    class MockToolCall:
-                        def __init__(self, id, function_name, function_args):
-                            self.id = id
-                            self.function = MockFunction(function_name, function_args)
-
-                    class MockFunction:
-                        def __init__(self, name, arguments):
-                            self.name = name
-                            self.arguments = arguments
-
-                    mock_tool_call = MockToolCall(
-                        tool_call_data["id"],
-                        tool_call_data["function"]["name"],
-                        tool_call_data["function"]["arguments"]
-                    )
-
-                    # Use existing conversion logic
-                    converted = self._convert_tool_calls([mock_tool_call])
-                    if converted:
-                        complete_tool_calls.extend(converted)
-
-                    # Remove completed tool call from accumulator
-                    del self._streaming_tool_calls[index]
-
-                except json.JSONDecodeError:
-                    # Arguments are not complete yet, continue accumulating
-                    continue
-
-        return complete_tool_calls if complete_tool_calls else None
-
-    def _extract_tool_calls_from_responses(self, response) -> Optional[List[ChatCompletionMessageToolCall]]:
-        """Extract tool calls from Responses API response."""
-        tool_calls = []
-
-        if hasattr(response, 'output') and response.output:
-            for item in response.output:
-                if hasattr(item, 'type') and item.type == 'function_call':
-                    # Extract function call details
-                    call_id = getattr(item, 'id', None) or getattr(item, 'call_id', None)
-                    name = getattr(item, 'name', None)
-                    arguments = getattr(item, 'arguments', '')
-
-                    if call_id and name:
-                        function = Function(
-                            name=name,
-                            arguments=arguments
-                        )
-                        tool_call_obj = ChatCompletionMessageToolCall(
-                            id=call_id,
-                            function=function,
-                            type="function"
-                        )
-                        tool_calls.append(tool_call_obj)
-
-        return tool_calls if tool_calls else None
-
-    def _convert_tool_calls(self, tool_calls):
-        """Convert tool calls to the framework's format."""
-        if not tool_calls:
-            return None
-
-        converted_tool_calls = []
-        for tool_call in tool_calls:
-            function = Function(
-                name=tool_call.function.name,
-                arguments=tool_call.function.arguments
-            )
-            tool_call_obj = ChatCompletionMessageToolCall(
-                id=tool_call.id,
-                function=function,
-                type="function"
-            )
-            converted_tool_calls.append(tool_call_obj)
-        return converted_tool_calls

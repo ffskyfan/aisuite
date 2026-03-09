@@ -56,8 +56,10 @@ class MessageNormalizer:
             ),
             "min_tokens": {
                 "claude-3-opus": 1024,
-                "claude-3-5-sonnet": 2048,
-                "claude-3-7-sonnet": 2048,
+                "claude-3-5-sonnet": 1024,
+                "claude-3-7-sonnet": 1024,
+                "claude-sonnet-4": 1024,
+                "claude-sonnet-4-6": 1024,
                 "claude-3-haiku": 2048,
             },
         },
@@ -91,11 +93,18 @@ class MessageNormalizer:
         # Extract provider from "provider:model" format if present
         if ":" in model:
             provider_part = model.split(":")[0].lower()
+            model_part = model.split(":", 1)[1].lower()
             # Direct provider mapping
             if provider_part in ["anthropic", "claude"]:
                 return "anthropic"
-            elif provider_part in ["openai", "closeai", "vercel"]:
+            elif provider_part in ["openai", "vercel"]:
                 return "openai"  # All these use OpenAI-compatible APIs
+            elif provider_part == "closeai":
+                if model_part.startswith(("anthropic/", "anthropic:")):
+                    return "anthropic"
+                if "claude" in model_part:
+                    return "anthropic"
+                return "openai"
             elif provider_part == "glm":
                 return "glm"
             elif provider_part in ["google", "gemini"]:
