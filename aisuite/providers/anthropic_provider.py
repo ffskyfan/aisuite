@@ -92,8 +92,20 @@ class AnthropicMessageConverter:
         chunk_type = getattr(chunk, 'type', 'unknown')
 
         # Handle Claude-specific state events that should not be passed downstream
-        if chunk_type in ["message_start", "content_block_stop", "message_stop", "ping"]:
+        if chunk_type in ["content_block_stop", "message_stop", "ping"]:
             return None  # Filter out Claude-specific state events
+
+        # Capture input-side usage from message_start (input_tokens, cache fields)
+        if chunk_type == "message_start":
+            if provider:
+                usage_obj = None
+                if hasattr(chunk, 'message') and chunk.message:
+                    usage_obj = getattr(chunk.message, 'usage', None)
+                if not usage_obj:
+                    usage_obj = getattr(chunk, 'usage', None)
+                if usage_obj:
+                    provider._patch_stream_usage(usage_obj)
+            return None  # Still filter out message_start from downstream
 
         # Handle content_block_start event
         elif chunk_type == "content_block_start":
@@ -167,14 +179,20 @@ class AnthropicMessageConverter:
                     original_stop_reason = chunk.delta.stop_reason
                     finish_reason = self._get_finish_reason(chunk.delta)
 
-                    # Extract usage information if present on the streaming event
+                    # Anthropic splits usage across two streaming events:
+                    #   - message_start.message.usage → input_tokens, cache fields
+                    #   - message_delta.usage → output_tokens
+                    # We patch the output-side here, then build the final merged usage.
                     usage_obj = getattr(chunk, "usage", None)
                     if not usage_obj and hasattr(chunk.delta, "usage"):
                         usage_obj = chunk.delta.usage
 
-                    if usage_obj:
-                        # Normalize usage to standard prompt/completion/total format
-                        normalized_usage = self._normalize_usage_obj(usage_obj)
+                    if provider:
+                        if usage_obj:
+                            provider._patch_stream_usage(usage_obj)
+                        normalized_usage = self._normalize_usage_obj(
+                            provider._build_stream_usage()
+                        )
                         if normalized_usage:
                             usage = normalized_usage
 
@@ -695,6 +713,69 @@ class AnthropicProvider(Provider):
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
         self._stream_reasoning_length = 0
+        # Structured state for accumulating usage across streaming events
+        self._stream_usage_state = self._make_empty_stream_usage_state()
+
+    # ---- Stream usage accumulation (patch / build) ----
+
+    @staticmethod
+    def _make_empty_stream_usage_state():
+        """Return a fresh, zeroed-out stream usage state dict."""
+        return {
+            "input_tokens": None,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0,
+            },
+        }
+
+    def _patch_stream_usage(self, usage_obj):
+        """Patch *_stream_usage_state* with fields present in *usage_obj*.
+
+        Called once for message_start (input side) and once for message_delta
+        (output side).  Only non-None values overwrite the current state so that
+        the two events complement each other.
+        """
+        def _get(key):
+            if isinstance(usage_obj, dict):
+                return usage_obj.get(key)
+            return getattr(usage_obj, key, None)
+
+        for key in ("input_tokens", "output_tokens",
+                     "cache_read_input_tokens", "cache_creation_input_tokens"):
+            val = _get(key)
+            if val is not None:
+                self._stream_usage_state[key] = int(val)
+
+        # Nested cache_creation fields
+        cache_creation_obj = _get("cache_creation")
+        if cache_creation_obj:
+            cc = self._stream_usage_state["cache_creation"]
+            for sub_key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"):
+                sub_val = (cache_creation_obj.get(sub_key) if isinstance(cache_creation_obj, dict)
+                           else getattr(cache_creation_obj, sub_key, None))
+                if sub_val is not None:
+                    cc[sub_key] = int(sub_val)
+
+    def _build_stream_usage(self):
+        """Build a merged usage dict from accumulated stream state.
+
+        Returns a dict with both input_tokens and output_tokens guaranteed
+        present (input_tokens defaults to 0 if message_start was somehow
+        missed), so _normalize_usage_obj will not return None.
+        """
+        s = self._stream_usage_state
+        input_tokens = s["input_tokens"] if s["input_tokens"] is not None else 0
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": s["output_tokens"],
+            "cache_read_input_tokens": s["cache_read_input_tokens"],
+            "cache_creation_input_tokens": s["cache_creation_input_tokens"],
+            "cache_creation": dict(s["cache_creation"]),
+        }
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion using the Anthropic API."""
@@ -734,6 +815,7 @@ class AnthropicProvider(Provider):
                 self._stream_content_length = 0
                 self._stream_tool_calls_count = 0
                 self._stream_reasoning_length = 0
+                self._stream_usage_state = self._make_empty_stream_usage_state()
 
                 response = await self.client.messages.create(
                     model=model,
