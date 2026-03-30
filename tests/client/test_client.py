@@ -39,6 +39,9 @@ def provider_configs():
         "glm": {
             "api_key": "glm-api-key",
         },
+        "vercel": {
+            "api_key": "vercel-api-key",
+        },
     }
 
 
@@ -94,6 +97,11 @@ def provider_configs():
             "aisuite.providers.glm_provider.GlmProvider.chat_completions_create",
             "glm",
             "glm-5",
+        ),
+        (
+            "aisuite.providers.vercel_provider.VercelProvider.chat_completions_create",
+            "vercel",
+            "gpt-5.2",
         ),
     ],
 )

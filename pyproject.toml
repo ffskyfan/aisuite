@@ -36,7 +36,7 @@ mistral = ["mistralai"]
 ollama = []
 openai = ["openai"]
 glm = ["zai-sdk"]
-vercel = ["openai"]
+vercel = ["openai", "anthropic"]
 watsonx = ["ibm-watsonx-ai"]
 all = ["anthropic", "aws", "cerebras_cloud_sdk", "google", "groq", "mistral", "openai", "cohere", "watsonx", "vercel", "zai-sdk"]  # To install all providers
 

@@ -1,34 +1,34 @@
 # Vercel AI Gateway Provider
 
-The Vercel AI Gateway provider allows you to access multiple AI models through Vercel's unified AI Gateway API. This provider uses OpenAI-compatible endpoints and supports various models from different providers like OpenAI, Anthropic, Google, and more.
+The Vercel AI Gateway provider allows you to access multiple AI models through Vercel's unified AI Gateway API. It routes requests to either Vercel's OpenAI-compatible endpoint or its Anthropic-compatible endpoint so OpenAI and Claude models can keep their native request semantics.
 
 ## What is Vercel AI Gateway?
 
-Vercel AI Gateway is a unified API that provides access to multiple AI providers through a single OpenAI-compatible interface. It offers:
+Vercel AI Gateway is a unified API that provides access to multiple AI providers through OpenAI-compatible and Anthropic-compatible interfaces. It offers:
 
 - **Multi-provider support**: Access models from OpenAI, Anthropic, Google, and more
-- **Provider routing**: Automatic fallback between providers for reliability
+- **Native protocol routing**: Use OpenAI-compatible APIs for GPT models and Anthropic-compatible APIs for Claude models
 - **Unified billing**: Single billing through your Vercel account
 - **Observability**: Built-in monitoring and analytics
 - **Rate limiting**: Centralized rate limit management
 
 ## Features
 
-- ✅ Chat completions (sync and async)
+- ✅ OpenAI-compatible chat completions and Responses API
+- ✅ Anthropic-compatible Messages API
 - ✅ Streaming responses
 - ✅ Tool/function calling
-- ✅ Multiple model providers through single gateway
-- ✅ Image and PDF attachments (if supported by underlying model)
-- ✅ Provider routing and fallback options
+- ✅ Anthropic prompt caching via `cache_control`
+- ✅ Native protocol routing for OpenAI and Claude models
 
 ## Installation
 
-The Vercel provider uses the OpenAI client library:
+The Vercel provider uses the OpenAI and Anthropic client libraries:
 
 ```bash
 pip install aisuite[vercel]
 # or
-pip install aisuite[openai]  # since vercel provider depends on openai
+pip install 'aisuite[openai,anthropic]'
 ```
 
 ## Configuration
@@ -74,9 +74,9 @@ client = ai.Client({
     }
 })
 
-# Use models in the format: vercel:provider/model
+# Use either the fully qualified gateway model id...
 response = await client.chat.completions.create(
-    model="vercel:anthropic/claude-sonnet-4",
+    model="vercel:anthropic/claude-sonnet-4.5",
     messages=[
         {"role": "user", "content": "Hello, how are you?"}
     ]
@@ -85,12 +85,28 @@ response = await client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+You can also use closeai-style shorthand for the two native protocol families:
+
+```python
+# Claude models route to the Anthropic-compatible endpoint
+response = await client.chat.completions.create(
+    model="vercel:claude-sonnet-4.5",
+    messages=[{"role": "user", "content": "Summarize this"}],
+)
+
+# GPT / o-series models route to the OpenAI-compatible endpoint
+response = await client.chat.completions.create(
+    model="vercel:gpt-5.2",
+    messages=[{"role": "user", "content": "Explain this code"}],
+)
+```
+
 ### Available Models
 
-The Vercel AI Gateway supports models from various providers:
+The Vercel AI Gateway supports models from various providers. For the dual-protocol routing in `aisuite`, the most relevant patterns are:
 
-- **OpenAI**: `vercel:openai/gpt-4o`, `vercel:openai/gpt-4o-mini`
-- **Anthropic**: `vercel:anthropic/claude-sonnet-4`, `vercel:anthropic/claude-haiku-4`
+- **OpenAI**: `vercel:gpt-5.2`, `vercel:openai/gpt-5.2`
+- **Anthropic**: `vercel:claude-sonnet-4.5`, `vercel:anthropic/claude-sonnet-4.5`
 - **Google**: `vercel:google/gemini-pro`, `vercel:google/gemini-flash`
 - **And many more...**
 
@@ -147,6 +163,29 @@ if response.choices[0].message.tool_calls:
     print(f"Arguments: {tool_call.function.arguments}")
 ```
 
+### Anthropic Prompt Caching
+
+Claude models can use the Anthropic-compatible endpoint so `cache_control` is passed through without converting to OpenAI chat format:
+
+```python
+response = await client.chat.completions.create(
+    model="vercel:claude-sonnet-4.5",
+    messages=[
+        {
+            "role": "user",
+            "content": "Analyze this cached context"
+        }
+    ],
+    system=[
+        {
+            "type": "text",
+            "text": long_document_content,
+            "cache_control": {"type": "ephemeral"}
+        }
+    ]
+)
+```
+
 ### Provider Options and Reasoning
 
 Vercel AI Gateway supports advanced provider options including reasoning (thinking) capabilities:
@@ -183,7 +222,7 @@ response = await client.chat.completions.create(
 )
 ```
 
-**Note**: While Vercel AI Gateway is OpenAI-compatible, current documentation indicates that reasoning content parameters are not explicitly supported in the OpenAI-compatible API. The provider includes reasoning content handling for compatibility and potential future support, but reasoning functionality may not be available at this time.
+If you need Claude-native features such as `thinking` or explicit `cache_control`, prefer the Anthropic route by using a Claude model id or `protocol="anthropic"`.
 
 ### Image Analysis
 
@@ -239,8 +278,9 @@ except Exception as e:
 1. The Vercel AI Gateway acts as a proxy to multiple AI providers
 2. Model availability depends on your gateway configuration
 3. Pricing and rate limits are managed through your Vercel account
-4. The provider uses OpenAI-compatible API format internally
-5. All features supported by the underlying models should work through the gateway
+4. GPT / o-series models route through the OpenAI-compatible API
+5. Claude models route through the Anthropic-compatible API
+6. All features supported by the underlying models should work through the matching native protocol
 
 ## Troubleshooting
 

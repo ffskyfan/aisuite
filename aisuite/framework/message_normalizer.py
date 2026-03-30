@@ -97,9 +97,9 @@ class MessageNormalizer:
             # Direct provider mapping
             if provider_part in ["anthropic", "claude"]:
                 return "anthropic"
-            elif provider_part in ["openai", "vercel"]:
+            elif provider_part == "openai":
                 return "openai"  # All these use OpenAI-compatible APIs
-            elif provider_part == "closeai":
+            elif provider_part in ["closeai", "vercel"]:
                 if model_part.startswith(("anthropic/", "anthropic:")):
                     return "anthropic"
                 if "claude" in model_part:
