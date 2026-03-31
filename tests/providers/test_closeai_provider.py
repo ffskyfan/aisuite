@@ -3,6 +3,13 @@ from unittest.mock import patch
 import pytest
 
 from aisuite.framework.message_normalizer import MessageNormalizer
+from aisuite.framework.replay_payload import (
+    ProviderReplayCapabilities,
+    ReplayBuildResult,
+    ReplayCaptureResult,
+    ReplayDiagnostic,
+    ReplayValidationResult,
+)
 from aisuite.providers.closeai_provider import CloseaiProvider
 from aisuite.providers.openai_provider import OpenaiProvider
 
@@ -11,6 +18,9 @@ class _FakeAsyncProvider:
     def __init__(self, protocol: str):
         self.protocol = protocol
         self.calls = []
+        self.validation_calls = []
+        self.capture_calls = []
+        self.build_calls = []
 
     async def chat_completions_create(self, model, messages, stream=False, **kwargs):
         self.calls.append(
@@ -22,6 +32,41 @@ class _FakeAsyncProvider:
             }
         )
         return {"protocol": self.protocol, "model": model, "kwargs": kwargs}
+
+    def get_replay_capabilities(self, model=None):
+        return ProviderReplayCapabilities(
+            needs_provider_call_id_binding=self.protocol == "anthropic",
+            supports_canonical_only_history=True,
+        )
+
+    def capture_response(self, response, model=None, **kwargs):
+        self.capture_calls.append({"response": response, "model": model, "kwargs": kwargs})
+        return ReplayCaptureResult(
+            canonical_message={"role": "assistant", "content": "captured"},
+            replay_metadata={"protocol": self.protocol},
+        )
+
+    def validate_replay_window(self, model, messages, **kwargs):
+        self.validation_calls.append(
+            {"model": model, "messages": messages, "kwargs": kwargs}
+        )
+        return ReplayValidationResult(
+            ok=True,
+            diagnostics=(
+                ReplayDiagnostic(
+                    code="delegated",
+                    message="validated by fake provider",
+                    provider=self.protocol,
+                ),
+            ),
+        )
+
+    def build_replay_view(self, model, messages, **kwargs):
+        self.build_calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+        return ReplayBuildResult(
+            request_view={"protocol": self.protocol, "model": model, "messages": messages},
+            replay_mode=f"{self.protocol}_replay",
+        )
 
 
 @pytest.mark.asyncio
@@ -131,3 +176,35 @@ def test_message_normalizer_detects_closeai_claude_as_anthropic():
         )
         == "anthropic"
     )
+
+
+def test_closeai_replay_contract_delegates_to_anthropic_provider():
+    provider = CloseaiProvider(api_key="test-closeai-key")
+    fake_provider = _FakeAsyncProvider("anthropic")
+    provider._protocol_providers["anthropic"] = fake_provider
+
+    capabilities = provider.get_replay_capabilities("claude-sonnet-4-20250514")
+    validation = provider.validate_replay_window(
+        "claude-sonnet-4-20250514",
+        [{"role": "tool", "tool_call_id": "tool_1", "content": "ok"}],
+        protocol="anthropic",
+    )
+    replay_build = provider.build_replay_view(
+        "claude-sonnet-4-20250514",
+        [{"role": "user", "content": "hello"}],
+        protocol="anthropic",
+    )
+    captured = provider.capture_response(
+        {"response": "ok"},
+        model="claude-sonnet-4-20250514",
+        protocol="anthropic",
+    )
+
+    assert capabilities.needs_provider_call_id_binding is True
+    assert validation.ok is True
+    assert validation.diagnostics[0].provider == "anthropic"
+    assert fake_provider.validation_calls[0]["model"] == "claude-sonnet-4-20250514"
+    assert replay_build.replay_mode == "anthropic_replay"
+    assert replay_build.request_view["model"] == "claude-sonnet-4-20250514"
+    assert captured.replay_metadata["protocol"] == "anthropic"
+    assert fake_provider.capture_calls[0]["model"] == "claude-sonnet-4-20250514"
