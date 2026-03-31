@@ -211,3 +211,67 @@ def test_glm_message_normalizer_preserves_reasoning_content():
     )
 
     assert normalized[0]["reasoning_content"]["thinking"] == "keep me"
+
+
+def test_glm_build_replay_view_preserves_reasoning_content(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+
+    with patch("aisuite.providers.glm_provider.ZhipuAiClient"):
+        provider = GlmProvider()
+
+        replay_build = provider.build_replay_view(
+            "glm-5",
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": {
+                        "thinking": "cached reasoning",
+                        "provider": "glm",
+                    },
+                },
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+    assert replay_build.replay_mode == "canonical_with_reasoning"
+    assert replay_build.request_view[0]["reasoning_content"] == "cached reasoning"
+
+
+def test_glm_validate_replay_window_reports_missing_tool_call_id(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+
+    with patch("aisuite.providers.glm_provider.ZhipuAiClient"):
+        provider = GlmProvider()
+        result = provider.validate_replay_window(
+            "glm-5",
+            [{"role": "tool", "content": "result"}],
+        )
+
+    assert result.ok is False
+    assert any(diag.code == "missing_tool_call_id" for diag in result.diagnostics)
+
+
+def test_glm_capture_response_returns_structured_result(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+
+    with patch("aisuite.providers.glm_provider.ZhipuAiClient"):
+        provider = GlmProvider()
+        response = _ns(
+            choices=[
+                _ns(
+                    stop_info=_ns(reason="complete"),
+                    message=_ns(
+                        role="assistant",
+                        content="done",
+                        tool_calls=None,
+                        reasoning_content=provider._convert_reasoning_content("think"),
+                    ),
+                )
+            ]
+        )
+
+        captured = provider.capture_response(response, model="glm-5")
+
+    assert captured.canonical_message.content == "done"
+    assert captured.replay_metadata["reasoning_content"]["provider"] == "glm"

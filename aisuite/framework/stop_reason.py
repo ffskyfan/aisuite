@@ -38,6 +38,7 @@ class StopReason(Enum):
 
     # Tool/Function Call Issues
     TOOL_CALL_ERROR = "tool_call_error"     # Tool call error
+    PROTOCOL_ERROR = "protocol_error"       # Provider protocol/replay error
 
     # Error
     ERROR = "error"                         # Model/request error
@@ -197,7 +198,16 @@ class GeminiStopMapper(ProviderStopMapper):
                 StopReason.LANGUAGE_UNSUPPORTED, original_reason, metadata
             )
 
+        elif original_reason in ["MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE"]:
+            metadata = metadata or {}
+            metadata["error_class"] = "protocol_error"
+            return self._create_stop_info(
+                StopReason.PROTOCOL_ERROR, original_reason, metadata
+            )
+
         elif original_reason in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"]:
+            metadata = metadata or {}
+            metadata["error_class"] = "tool_call_error"
             return self._create_stop_info(
                 StopReason.TOOL_CALL_ERROR, original_reason, metadata
             )

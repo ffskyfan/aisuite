@@ -6,10 +6,20 @@ import anthropic
 import json
 import logging
 from typing import AsyncGenerator, Union
-from aisuite.provider import Provider
+from aisuite.provider import Provider, LLMError
 from aisuite.framework import ChatCompletionResponse
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
 from aisuite.framework.chat_completion_response import Choice, ChoiceDelta, StreamChoice
+from aisuite.framework.replay_payload import (
+    ProviderReplayCapabilities,
+    ReplayBuildResult,
+    ReplayCaptureResult,
+    ReplayDiagnostic,
+    ReplayValidationResult,
+    build_replay_payload,
+    get_replay_payload,
+    unwrap_replay_payload,
+)
 from aisuite.framework.stop_reason import stop_reason_manager
 
 # 设置专门的logger用于调试stop reason
@@ -23,6 +33,22 @@ if not anthropic_logger.handlers:
 
 # Define a constant for the default max_tokens value
 DEFAULT_MAX_TOKENS = 4096
+ANTHROPIC_THINKING_REPLAY_KIND = "anthropic_thinking_block"
+
+
+def _build_anthropic_thinking_replay_payload(thinking_block_data):
+    return build_replay_payload(
+        "anthropic",
+        ANTHROPIC_THINKING_REPLAY_KIND,
+        thinking_block_data,
+    )
+
+
+def _extract_anthropic_thinking_block(raw_data):
+    envelope = get_replay_payload(raw_data)
+    if envelope and envelope.get("provider") == "anthropic":
+        return unwrap_replay_payload(raw_data)
+    return raw_data
 
 
 class AnthropicMessageConverter:
@@ -406,7 +432,9 @@ class AnthropicMessageConverter:
 
         # 1. 如果有ReasoningContent，使用其原始数据重构thinking块
         if reasoning_content and hasattr(reasoning_content, 'raw_data') and reasoning_content.raw_data:
-            message_content.append(reasoning_content.raw_data)
+            thinking_block = _extract_anthropic_thinking_block(reasoning_content.raw_data)
+            if thinking_block:
+                message_content.append(thinking_block)
 
         # 2. 添加文本内容
         if content:
@@ -589,7 +617,7 @@ class AnthropicMessageConverter:
                         thinking=content_block.thinking,
                         signature=thinking_block_data.get('signature'),
                         provider="anthropic",
-                        raw_data=thinking_block_data
+                        raw_data=_build_anthropic_thinking_replay_payload(thinking_block_data)
                     )
                 elif content_block.type == "text" and hasattr(content_block, 'text'):
                     text_content = content_block.text
@@ -652,7 +680,7 @@ class AnthropicMessageConverter:
                         thinking=content_block.thinking,
                         signature=thinking_block_data.get('signature'),
                         provider="anthropic",
-                        raw_data=thinking_block_data
+                        raw_data=_build_anthropic_thinking_replay_payload(thinking_block_data)
                     )
                     break
 
@@ -715,6 +743,96 @@ class AnthropicProvider(Provider):
         self._stream_reasoning_length = 0
         # Structured state for accumulating usage across streaming events
         self._stream_usage_state = self._make_empty_stream_usage_state()
+
+    def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
+        return ProviderReplayCapabilities(
+            needs_exact_turn_replay=False,
+            needs_provider_call_id_binding=True,
+            needs_reasoning_raw_replay=True,
+            supports_canonical_only_history=True,
+            empty_actionless_stop_is_retryable=True,
+        )
+
+    def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
+        diagnostics: list[ReplayDiagnostic] = []
+        normalized_messages: list[dict] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                normalized_messages.append(msg)
+            elif hasattr(msg, "model_dump"):
+                normalized_messages.append(msg.model_dump())
+
+        for msg in normalized_messages:
+            role = msg.get("role")
+            if role == "tool" and not msg.get("tool_call_id"):
+                diagnostics.append(
+                    ReplayDiagnostic(
+                        code="missing_tool_call_id",
+                        message="Anthropic tool result replay requires tool_call_id.",
+                        provider="anthropic",
+                    )
+                )
+            if role == "assistant" and msg.get("tool_calls"):
+                for tool_call in msg.get("tool_calls", []):
+                    tool_call_id = tool_call.get("id") if isinstance(tool_call, dict) else getattr(tool_call, "id", None)
+                    function = tool_call.get("function", {}) if isinstance(tool_call, dict) else getattr(tool_call, "function", None)
+                    function_name = function.get("name") if isinstance(function, dict) else getattr(function, "name", None)
+                    if not tool_call_id:
+                        diagnostics.append(
+                            ReplayDiagnostic(
+                                code="missing_tool_call_id",
+                                message="Anthropic assistant tool call is missing id.",
+                                provider="anthropic",
+                            )
+                        )
+                    if not function_name:
+                        diagnostics.append(
+                            ReplayDiagnostic(
+                                code="missing_tool_function_name",
+                                message="Anthropic assistant tool call is missing function name.",
+                                provider="anthropic",
+                                metadata={"tool_call_id": tool_call_id},
+                            )
+                        )
+
+        return ReplayValidationResult(
+            ok=not any(diag.severity == "error" for diag in diagnostics),
+            diagnostics=tuple(diagnostics),
+        )
+
+    def capture_response(self, response, model: str | None = None, **kwargs):
+        if not response or not getattr(response, "choices", None):
+            return ReplayCaptureResult()
+        choice = response.choices[0]
+        message = getattr(choice, "message", None)
+        if not message:
+            return ReplayCaptureResult(stop_info=getattr(choice, "stop_info", None))
+        reasoning_content = getattr(message, "reasoning_content", None)
+        return ReplayCaptureResult(
+            canonical_message=message,
+            stop_info=getattr(choice, "stop_info", None),
+            replay_metadata={
+                "tool_calls": getattr(message, "tool_calls", None),
+                "reasoning_content": getattr(reasoning_content, "raw_data", None) if reasoning_content else None,
+            },
+            protocol_diagnostics=(),
+        )
+
+    def build_replay_view(self, model: str, messages: list, **kwargs):
+        validation = self.validate_replay_window(model, messages, **kwargs)
+        if not validation.ok:
+            error_codes = ", ".join(diag.code for diag in validation.diagnostics if diag.severity == "error")
+            raise LLMError(f"Anthropic replay window validation failed: {error_codes}")
+        system_message, converted_messages = self.converter.convert_request(messages)
+        return ReplayBuildResult(
+            request_view={
+                "system": system_message,
+                "messages": converted_messages,
+            },
+            replay_mode="anthropic_messages",
+            degraded=validation.degraded,
+            diagnostics=validation.diagnostics,
+        )
 
     # ---- Stream usage accumulation (patch / build) ----
 
@@ -779,12 +897,21 @@ class AnthropicProvider(Provider):
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion using the Anthropic API."""
+        replay_request_view = kwargs.pop("_replay_request_view", None)
+        replay_mode = kwargs.pop("_replay_mode", None)
         kwargs = self._prepare_kwargs(kwargs)
 
         # Track thinking state for error recovery
         self._thinking_enabled = "thinking" in kwargs
 
-        system_message, converted_messages = self.converter.convert_request(messages)
+        if replay_request_view is not None and replay_mode == "anthropic_messages":
+            if isinstance(replay_request_view, dict):
+                system_message = replay_request_view.get("system")
+                converted_messages = replay_request_view.get("messages") or []
+            else:
+                system_message, converted_messages = self.converter.convert_request(replay_request_view)
+        else:
+            system_message, converted_messages = self.converter.convert_request(messages)
 
 
 

@@ -1,15 +1,27 @@
 import openai
 import os
 import json
-from typing import AsyncGenerator, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
+from aisuite.framework.replay_payload import (
+    ProviderReplayCapabilities,
+    ReplayBuildResult,
+    ReplayCaptureResult,
+    ReplayDiagnostic,
+    ReplayValidationResult,
+    build_replay_payload,
+    get_replay_payload,
+    unwrap_replay_payload,
+)
 from aisuite.framework.stop_reason import stop_reason_manager
 
 
 class DeepseekProvider(Provider):
+    REASONING_REPLAY_KIND = "deepseek_reasoning_text"
+
     def __init__(self, **config):
         """
         Initialize the DeepSeek provider with the given configuration.
@@ -37,6 +49,172 @@ class DeepseekProvider(Provider):
         # Used to provide accurate metadata in stop_info
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
+
+    def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
+        return ProviderReplayCapabilities(
+            needs_exact_turn_replay=False,
+            needs_provider_call_id_binding=True,
+            needs_reasoning_raw_replay=True,
+            supports_canonical_only_history=True,
+            empty_actionless_stop_is_retryable=False,
+        )
+
+    def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
+        diagnostics: list[ReplayDiagnostic] = []
+        normalized_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                normalized_messages.append(msg)
+            elif hasattr(msg, "model_dump"):
+                normalized_messages.append(msg.model_dump())
+
+        for msg in normalized_messages:
+            role = msg.get("role")
+            if role == "tool" and not msg.get("tool_call_id"):
+                diagnostics.append(
+                    ReplayDiagnostic(
+                        code="missing_tool_call_id",
+                        message="DeepSeek tool result replay requires tool_call_id.",
+                        provider="deepseek",
+                        metadata={"role": "tool"},
+                    )
+                )
+            if role == "assistant" and msg.get("tool_calls"):
+                for tool_call in msg.get("tool_calls", []):
+                    function = (
+                        tool_call.get("function", {})
+                        if isinstance(tool_call, dict)
+                        else getattr(tool_call, "function", None)
+                    )
+                    tool_call_id = (
+                        tool_call.get("id")
+                        if isinstance(tool_call, dict)
+                        else getattr(tool_call, "id", None)
+                    )
+                    function_name = None
+                    if isinstance(function, dict):
+                        function_name = function.get("name")
+                    elif function is not None:
+                        function_name = getattr(function, "name", None)
+                    if not tool_call_id:
+                        diagnostics.append(
+                            ReplayDiagnostic(
+                                code="missing_tool_call_id",
+                                message="DeepSeek assistant tool call is missing id.",
+                                provider="deepseek",
+                            )
+                        )
+                    if not function_name:
+                        diagnostics.append(
+                            ReplayDiagnostic(
+                                code="missing_tool_function_name",
+                                message="DeepSeek assistant tool call is missing function name.",
+                                provider="deepseek",
+                                metadata={"tool_call_id": tool_call_id},
+                            )
+                        )
+
+        return ReplayValidationResult(
+            ok=not any(diag.severity == "error" for diag in diagnostics),
+            diagnostics=tuple(diagnostics),
+        )
+
+    def capture_response(self, response, model: str | None = None, **kwargs):
+        if not response or not getattr(response, "choices", None):
+            return ReplayCaptureResult()
+        choice = response.choices[0]
+        message = getattr(choice, "message", None)
+        if not message:
+            return ReplayCaptureResult(stop_info=getattr(choice, "stop_info", None))
+
+        replay_metadata = {
+            "tool_calls": getattr(message, "tool_calls", None),
+            "reasoning_content": None,
+        }
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content is not None:
+            replay_metadata["reasoning_content"] = getattr(
+                reasoning_content, "raw_data", None
+            )
+        return ReplayCaptureResult(
+            canonical_message=message,
+            stop_info=getattr(choice, "stop_info", None),
+            replay_metadata=replay_metadata,
+            protocol_diagnostics=(),
+        )
+
+    def _build_reasoning_replay_payload(self, reasoning_content: str) -> Dict[str, Any]:
+        return build_replay_payload(
+            "deepseek",
+            self.REASONING_REPLAY_KIND,
+            {"reasoning_content": reasoning_content},
+            legacy_fields={"reasoning_content": reasoning_content},
+        )
+
+    def _extract_reasoning_input(self, reasoning_content: Any) -> Optional[str]:
+        if reasoning_content is None:
+            return None
+
+        if isinstance(reasoning_content, ReasoningContent):
+            raw_data = reasoning_content.raw_data or {}
+            envelope = get_replay_payload(raw_data)
+            if envelope and envelope.get("provider") == "deepseek":
+                payload = unwrap_replay_payload(raw_data)
+                if isinstance(payload, dict) and payload.get("reasoning_content"):
+                    return payload["reasoning_content"]
+            return raw_data.get("reasoning_content") or reasoning_content.thinking
+
+        if isinstance(reasoning_content, dict):
+            raw_data = reasoning_content.get("raw_data") or {}
+            envelope = get_replay_payload(raw_data)
+            if envelope and envelope.get("provider") == "deepseek":
+                payload = unwrap_replay_payload(raw_data)
+                if isinstance(payload, dict) and payload.get("reasoning_content"):
+                    return payload["reasoning_content"]
+            return (
+                raw_data.get("reasoning_content")
+                or reasoning_content.get("thinking")
+                or reasoning_content.get("text")
+                or str(reasoning_content)
+            )
+
+        return str(reasoning_content)
+
+    def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        prepared_messages = []
+
+        for message in messages:
+            prepared = (
+                message.model_dump()
+                if hasattr(message, "model_dump")
+                else dict(message)
+            )
+            prepared.pop("refusal", None)
+
+            reasoning_content = prepared.get("reasoning_content")
+            if reasoning_content is not None:
+                prepared["reasoning_content"] = self._extract_reasoning_input(
+                    reasoning_content
+                )
+
+            prepared_messages.append(prepared)
+
+        return prepared_messages
+
+    def build_replay_view(self, model: str, messages: list, **kwargs):
+        validation = self.validate_replay_window(model, messages, **kwargs)
+        if not validation.ok:
+            error_codes = ", ".join(
+                diag.code for diag in validation.diagnostics if diag.severity == "error"
+            )
+            raise LLMError(f"DeepSeek replay window validation failed: {error_codes}")
+
+        return ReplayBuildResult(
+            request_view=self._prepare_messages(messages),
+            replay_mode="canonical_with_reasoning",
+            degraded=validation.degraded,
+            diagnostics=validation.diagnostics,
+        )
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from OpenAI-compatible finish_reason."""
@@ -106,7 +284,15 @@ class DeepseekProvider(Provider):
             data = usage_obj
         else:
             data = {}
-            for attr in ("input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"):
+            for attr in (
+                "input_tokens",
+                "output_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+            ):
                 if hasattr(usage_obj, attr):
                     data[attr] = getattr(usage_obj, attr)
 
@@ -164,6 +350,14 @@ class DeepseekProvider(Provider):
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         # Any exception raised by OpenAI will be returned to the caller.
         # Maybe we should catch them and raise a custom LLMError.
+        replay_request_view = kwargs.pop("_replay_request_view", None)
+        replay_mode = kwargs.pop("_replay_mode", None)
+        if replay_request_view is not None and replay_mode == "canonical_with_reasoning":
+            prepared_messages = replay_request_view
+        else:
+            replay_build = self.build_replay_view(model, messages, **kwargs)
+            prepared_messages = replay_build.request_view
+
         if stream:
             # Reset streaming state
             self._streaming_tool_calls = {}
@@ -179,7 +373,7 @@ class DeepseekProvider(Provider):
 
             response = await self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=prepared_messages,
                 stream=True,
                 **stream_kwargs,  # Pass any additional arguments to the OpenAI API
             )
@@ -255,7 +449,7 @@ class DeepseekProvider(Provider):
         else:
             response = await self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=prepared_messages,
                 stream=False,
                 **kwargs,  # Pass any additional arguments to the OpenAI API
             )
@@ -309,7 +503,7 @@ class DeepseekProvider(Provider):
         return ReasoningContent(
             thinking=reasoning_content,
             provider="deepseek",
-            raw_data={"reasoning_content": reasoning_content}
+            raw_data=self._build_reasoning_replay_payload(reasoning_content),
         )
 
     def _accumulate_and_convert_tool_calls(self, delta):

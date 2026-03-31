@@ -16,11 +16,23 @@ from aisuite.framework.message import (
     Message,
     ReasoningContent,
 )
+from aisuite.framework.replay_payload import (
+    ProviderReplayCapabilities,
+    ReplayBuildResult,
+    ReplayCaptureResult,
+    ReplayDiagnostic,
+    ReplayValidationResult,
+    build_replay_payload,
+    get_replay_payload,
+    unwrap_replay_payload,
+)
 from aisuite.framework.stop_reason import stop_reason_manager
 from aisuite.provider import LLMError, Provider
 
 
 class GlmProvider(Provider):
+    REASONING_REPLAY_KIND = "glm_reasoning_text"
+
     def __init__(self, **config):
         api_key = (
             config.get("api_key")
@@ -40,6 +52,107 @@ class GlmProvider(Provider):
         self._streaming_tool_calls: Dict[int, Dict[str, Any]] = {}
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
+
+    def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
+        return ProviderReplayCapabilities(
+            needs_exact_turn_replay=False,
+            needs_provider_call_id_binding=True,
+            needs_reasoning_raw_replay=True,
+            supports_canonical_only_history=True,
+            empty_actionless_stop_is_retryable=False,
+        )
+
+    def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
+        diagnostics: list[ReplayDiagnostic] = []
+        normalized_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                normalized_messages.append(msg)
+            elif hasattr(msg, "model_dump"):
+                normalized_messages.append(msg.model_dump())
+
+        for msg in normalized_messages:
+            role = msg.get("role")
+            if role == "tool" and not msg.get("tool_call_id"):
+                diagnostics.append(
+                    ReplayDiagnostic(
+                        code="missing_tool_call_id",
+                        message="GLM tool result replay requires tool_call_id.",
+                        provider="glm",
+                        metadata={"role": "tool"},
+                    )
+                )
+            if role == "assistant" and msg.get("tool_calls"):
+                for tool_call in msg.get("tool_calls", []):
+                    function = (
+                        tool_call.get("function", {})
+                        if isinstance(tool_call, dict)
+                        else getattr(tool_call, "function", None)
+                    )
+                    tool_call_id = (
+                        tool_call.get("id")
+                        if isinstance(tool_call, dict)
+                        else getattr(tool_call, "id", None)
+                    )
+                    function_name = None
+                    if isinstance(function, dict):
+                        function_name = function.get("name")
+                    elif function is not None:
+                        function_name = getattr(function, "name", None)
+                    if not tool_call_id:
+                        diagnostics.append(
+                            ReplayDiagnostic(
+                                code="missing_tool_call_id",
+                                message="GLM assistant tool call is missing id.",
+                                provider="glm",
+                            )
+                        )
+                    if not function_name:
+                        diagnostics.append(
+                            ReplayDiagnostic(
+                                code="missing_tool_function_name",
+                                message="GLM assistant tool call is missing function name.",
+                                provider="glm",
+                                metadata={"tool_call_id": tool_call_id},
+                            )
+                        )
+
+        return ReplayValidationResult(
+            ok=not any(diag.severity == "error" for diag in diagnostics),
+            diagnostics=tuple(diagnostics),
+        )
+
+    def capture_response(self, response, model: str | None = None, **kwargs):
+        if not response or not getattr(response, "choices", None):
+            return ReplayCaptureResult()
+        choice = response.choices[0]
+        message = getattr(choice, "message", None)
+        if not message:
+            return ReplayCaptureResult(stop_info=getattr(choice, "stop_info", None))
+
+        replay_metadata = {
+            "tool_calls": getattr(message, "tool_calls", None),
+            "reasoning_content": None,
+        }
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content is not None:
+            replay_metadata["reasoning_content"] = getattr(
+                reasoning_content, "raw_data", None
+            )
+        return ReplayCaptureResult(
+            canonical_message=message,
+            stop_info=getattr(choice, "stop_info", None),
+            replay_metadata=replay_metadata,
+            protocol_diagnostics=(),
+        )
+
+    def _build_reasoning_replay_payload(self, reasoning_content: str) -> Dict[str, Any]:
+        return build_replay_payload(
+            "glm",
+            self.REASONING_REPLAY_KIND,
+            {"reasoning_content": reasoning_content},
+            legacy_fields={"reasoning_content": reasoning_content},
+        )
 
     def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         prepared_messages = []
@@ -92,10 +205,20 @@ class GlmProvider(Provider):
 
         if isinstance(reasoning_content, ReasoningContent):
             raw_data = reasoning_content.raw_data or {}
+            envelope = get_replay_payload(raw_data)
+            if envelope and envelope.get("provider") == "glm":
+                payload = unwrap_replay_payload(raw_data)
+                if isinstance(payload, dict) and payload.get("reasoning_content"):
+                    return payload["reasoning_content"]
             return raw_data.get("reasoning_content") or reasoning_content.thinking
 
         if isinstance(reasoning_content, dict):
             raw_data = reasoning_content.get("raw_data") or {}
+            envelope = get_replay_payload(raw_data)
+            if envelope and envelope.get("provider") == "glm":
+                payload = unwrap_replay_payload(raw_data)
+                if isinstance(payload, dict) and payload.get("reasoning_content"):
+                    return payload["reasoning_content"]
             return (
                 raw_data.get("reasoning_content")
                 or reasoning_content.get("thinking")
@@ -104,6 +227,21 @@ class GlmProvider(Provider):
             )
 
         return str(reasoning_content)
+
+    def build_replay_view(self, model: str, messages: list, **kwargs):
+        validation = self.validate_replay_window(model, messages, **kwargs)
+        if not validation.ok:
+            error_codes = ", ".join(
+                diag.code for diag in validation.diagnostics if diag.severity == "error"
+            )
+            raise LLMError(f"GLM replay window validation failed: {error_codes}")
+
+        return ReplayBuildResult(
+            request_view=self._prepare_messages(messages),
+            replay_mode="canonical_with_reasoning",
+            degraded=validation.degraded,
+            diagnostics=validation.diagnostics,
+        )
 
     def _create_stop_info(
         self, finish_reason: Optional[str], choice_data: dict = None, model: str = None
@@ -213,7 +351,7 @@ class GlmProvider(Provider):
         return ReasoningContent(
             thinking=reasoning_content,
             provider="glm",
-            raw_data={"reasoning_content": reasoning_content},
+            raw_data=self._build_reasoning_replay_payload(reasoning_content),
         )
 
     def _convert_tool_calls(
@@ -307,7 +445,13 @@ class GlmProvider(Provider):
     def chat_completions_create(
         self, model, messages, stream: bool = False, **kwargs
     ) -> Union[ChatCompletionResponse, Generator[ChatCompletionResponse, None, None]]:
-        prepared_messages = self._prepare_messages(messages)
+        replay_request_view = kwargs.pop("_replay_request_view", None)
+        replay_mode = kwargs.pop("_replay_mode", None)
+        if replay_request_view is not None and replay_mode == "canonical_with_reasoning":
+            prepared_messages = replay_request_view
+        else:
+            replay_build = self.build_replay_view(model, messages, **kwargs)
+            prepared_messages = replay_build.request_view
         prepared_kwargs = self._prepare_kwargs(kwargs)
 
         try:

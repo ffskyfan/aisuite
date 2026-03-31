@@ -2,6 +2,10 @@ import os
 from typing import Any, AsyncGenerator, Dict, Optional, Union
 
 from aisuite.framework.chat_completion_response import ChatCompletionResponse
+from aisuite.framework.replay_payload import (
+    ReplayBuildResult,
+    ReplayValidationResult,
+)
 from aisuite.provider import Provider
 from aisuite.providers.openai_provider import OpenaiProvider
 
@@ -262,6 +266,47 @@ class VercelProvider(Provider):
         if protocol not in self._protocol_providers:
             self._protocol_providers[protocol] = self._create_protocol_provider(protocol)
         return self._protocol_providers[protocol]
+
+    def _resolve_replay_target(
+        self, model: Optional[str], kwargs: Optional[Dict[str, Any]] = None
+    ) -> tuple[Provider, Optional[str], Dict[str, Any]]:
+        replay_kwargs = (kwargs or {}).copy()
+        if model is None:
+            protocol = self._default_protocol
+            return self._get_protocol_provider(protocol), None, replay_kwargs
+
+        protocol, resolved_model = self._resolve_protocol(model, replay_kwargs)
+        return self._get_protocol_provider(protocol), resolved_model, replay_kwargs
+
+    def get_replay_capabilities(self, model: str | None = None):
+        provider, resolved_model, _ = self._resolve_replay_target(model)
+        return provider.get_replay_capabilities(resolved_model)
+
+    def capture_response(self, response, model: str | None = None, **kwargs):
+        provider, resolved_model, replay_kwargs = self._resolve_replay_target(
+            model, kwargs
+        )
+        return provider.capture_response(
+            response, model=resolved_model, **replay_kwargs
+        )
+
+    def validate_replay_window(
+        self, model: str, messages: list, **kwargs
+    ) -> ReplayValidationResult:
+        provider, resolved_model, replay_kwargs = self._resolve_replay_target(
+            model, kwargs
+        )
+        return provider.validate_replay_window(
+            resolved_model or model, messages, **replay_kwargs
+        )
+
+    def build_replay_view(self, model: str, messages: list, **kwargs) -> ReplayBuildResult:
+        provider, resolved_model, replay_kwargs = self._resolve_replay_target(
+            model, kwargs
+        )
+        return provider.build_replay_view(
+            resolved_model or model, messages, **replay_kwargs
+        )
 
     async def chat_completions_create(
         self, model, messages, stream: bool = False, **kwargs

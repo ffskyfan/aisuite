@@ -7,10 +7,23 @@ from typing import AsyncGenerator, Union, List, Dict, Any, Optional
 from aisuite.provider import Provider, LLMError
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
+from aisuite.framework.replay_payload import (
+    ProviderReplayCapabilities,
+    ReplayBuildResult,
+    ReplayCaptureResult,
+    ReplayDiagnostic,
+    ReplayValidationResult,
+    build_replay_payload,
+    get_replay_payload,
+    unwrap_replay_payload,
+)
 from aisuite.framework.stop_reason import stop_reason_manager
 
 
 class OpenaiProvider(Provider):
+    RESPONSES_REPLAY_KIND = "responses_output"
+    CHAT_REASONING_REPLAY_KIND = "openai_reasoning_text"
+
     # OpenAI finish_reason mapping to standard StopReason
     FINISH_REASON_MAPPING = {
         "stop": "complete",
@@ -52,6 +65,89 @@ class OpenaiProvider(Provider):
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
         self._stream_reasoning_buffer = ""
+
+    def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
+        return ProviderReplayCapabilities(
+            needs_exact_turn_replay=False,
+            needs_provider_call_id_binding=True,
+            needs_reasoning_raw_replay=bool(model and self._should_use_responses_api(model, {})),
+            supports_canonical_only_history=True,
+            empty_actionless_stop_is_retryable=False,
+        )
+
+    def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
+        diagnostics: list[ReplayDiagnostic] = []
+        normalized_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                normalized_messages.append(msg)
+            elif hasattr(msg, "model_dump"):
+                normalized_messages.append(msg.model_dump())
+
+        for msg in normalized_messages:
+            role = msg.get("role")
+            if role == "tool" and not msg.get("tool_call_id"):
+                diagnostics.append(
+                    ReplayDiagnostic(
+                        code="missing_tool_call_id",
+                        message="OpenAI tool result replay requires tool_call_id.",
+                        provider="openai",
+                        metadata={"role": "tool"},
+                    )
+                )
+            if role == "assistant" and msg.get("tool_calls"):
+                for tool_call in msg.get("tool_calls", []):
+                    function = tool_call.get("function", {}) if isinstance(tool_call, dict) else getattr(tool_call, "function", None)
+                    tool_call_id = tool_call.get("id") if isinstance(tool_call, dict) else getattr(tool_call, "id", None)
+                    function_name = None
+                    if isinstance(function, dict):
+                        function_name = function.get("name")
+                    elif function is not None:
+                        function_name = getattr(function, "name", None)
+                    if not tool_call_id:
+                        diagnostics.append(
+                            ReplayDiagnostic(
+                                code="missing_tool_call_id",
+                                message="OpenAI assistant tool call is missing id.",
+                                provider="openai",
+                            )
+                        )
+                    if not function_name:
+                        diagnostics.append(
+                            ReplayDiagnostic(
+                                code="missing_tool_function_name",
+                                message="OpenAI assistant tool call is missing function name.",
+                                provider="openai",
+                                metadata={"tool_call_id": tool_call_id},
+                            )
+                        )
+
+        return ReplayValidationResult(
+            ok=not any(diag.severity == "error" for diag in diagnostics),
+            diagnostics=tuple(diagnostics),
+        )
+
+    def capture_response(self, response, model: str | None = None, **kwargs):
+        if not response or not getattr(response, "choices", None):
+            return ReplayCaptureResult()
+        choice = response.choices[0]
+        message = getattr(choice, "message", None)
+        if not message:
+            return ReplayCaptureResult(stop_info=getattr(choice, "stop_info", None))
+
+        replay_metadata = {
+            "tool_calls": getattr(message, "tool_calls", None),
+            "reasoning_content": None,
+        }
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content is not None:
+            replay_metadata["reasoning_content"] = getattr(reasoning_content, "raw_data", None)
+        return ReplayCaptureResult(
+            canonical_message=message,
+            stop_info=getattr(choice, "stop_info", None),
+            replay_metadata=replay_metadata,
+            protocol_diagnostics=(),
+        )
 
     def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
         """Create StopInfo from OpenAI finish_reason."""
@@ -457,6 +553,126 @@ class OpenaiProvider(Provider):
             return True
         return False
 
+    def _build_reasoning_replay_payload(self, reasoning_content: str) -> Dict[str, Any]:
+        return build_replay_payload(
+            "openai",
+            self.CHAT_REASONING_REPLAY_KIND,
+            {"reasoning_content": reasoning_content},
+            legacy_fields={"reasoning_content": reasoning_content},
+        )
+
+    def _build_responses_replay_payload(
+        self,
+        *,
+        output: Any = None,
+        response_id: Optional[str] = None,
+        reasoning_items: Any = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "output": output,
+            "response_id": response_id,
+        }
+        if reasoning_items is not None:
+            payload["reasoning_items"] = reasoning_items
+
+        return build_replay_payload(
+            "openai",
+            self.RESPONSES_REPLAY_KIND,
+            payload,
+            legacy_fields=payload,
+        )
+
+    def _extract_responses_replay_payload(self, raw_data: Any) -> Dict[str, Any]:
+        envelope = get_replay_payload(raw_data)
+        if envelope and envelope.get("provider") == "openai":
+            payload = unwrap_replay_payload(raw_data)
+            if isinstance(payload, dict):
+                return payload
+            return {}
+        if isinstance(raw_data, dict):
+            return raw_data
+        return {}
+
+    def _extract_responses_raw_output(self, raw_data: Any) -> Any:
+        payload = self._extract_responses_replay_payload(raw_data)
+        return payload.get("output")
+
+    def _build_responses_input_items(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        input_items: List[Dict[str, Any]] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                msg_dict = msg.copy()
+            elif hasattr(msg, 'model_dump'):
+                msg_dict = msg.model_dump()
+            else:
+                input_items.append(msg)
+                continue
+
+            role = msg_dict.get('role')
+            rc = msg_dict.get('reasoning_content')
+            raw_output = None
+            try:
+                if rc is not None:
+                    if hasattr(rc, 'raw_data'):
+                        raw_output = self._extract_responses_raw_output(rc.raw_data)
+                    elif isinstance(rc, dict):
+                        raw_output = self._extract_responses_raw_output(rc.get('raw_data'))
+            except Exception:
+                raw_output = None
+
+            if raw_output:
+                input_items.extend(raw_output)
+                continue
+
+            if role == 'assistant' and msg_dict.get('tool_calls'):
+                text = msg_dict.get('content')
+                if text:
+                    input_items.append({'role': 'assistant', 'content': text})
+                for tc in msg_dict['tool_calls']:
+                    fn = tc.get('function', {})
+                    input_items.append({
+                        'type': 'function_call',
+                        'call_id': tc.get('id'),
+                        'name': fn.get('name'),
+                        'arguments': fn.get('arguments', '')
+                    })
+                continue
+
+            if role == 'tool':
+                input_items.append({
+                    'type': 'function_call_output',
+                    'call_id': msg_dict.get('tool_call_id'),
+                    'output': msg_dict.get('content', '')
+                })
+                continue
+
+            for field in ['reasoning_content', 'tool_calls', 'tool_call_id']:
+                msg_dict.pop(field, None)
+            input_items.append(msg_dict)
+
+        return input_items
+
+    def build_replay_view(self, model: str, messages: list, **kwargs):
+        validation = self.validate_replay_window(model, messages, **kwargs)
+        if not validation.ok:
+            error_codes = ", ".join(diag.code for diag in validation.diagnostics if diag.severity == "error")
+            raise LLMError(f"OpenAI replay window validation failed: {error_codes}")
+
+        if self._should_use_responses_api(model, kwargs):
+            return ReplayBuildResult(
+                request_view=self._build_responses_input_items(messages),
+                replay_mode="responses_output",
+                degraded=validation.degraded,
+                diagnostics=validation.diagnostics,
+            )
+        cleaned_messages, _ = self._clean_messages_for_openai(messages)
+        return ReplayBuildResult(
+            request_view=cleaned_messages,
+            replay_mode="canonical",
+            degraded=validation.degraded,
+            diagnostics=validation.diagnostics,
+        )
+
     async def _responses_create(self, model: str, messages: List[Dict[str, Any]], stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """
         使用 OpenAI Responses API（与 CloseAI 对齐）的调用实现：
@@ -465,95 +681,15 @@ class OpenaiProvider(Provider):
         - 若上一轮消息包含 reasoning_content.raw_data.output（Responses 原生 output），直接 extend 到本轮 input
         - 支持流式事件：response.output_text.delta / response.function_call_arguments.delta / done
         """
+        replay_request_view = kwargs.pop("_replay_request_view", None)
+        replay_mode = kwargs.pop("_replay_mode", None)
+
         # 准备 input
-        input_items: List[Dict[str, Any]] = []
-        for msg in messages:
-            if isinstance(msg, dict):
-                msg_dict = msg.copy()
-                role = msg_dict.get('role')
-                # 回传上一轮 Responses 原生 output（若可用）
-                rc = msg_dict.get('reasoning_content')
-                raw_output = None
-                try:
-                    if rc is not None:
-                        if hasattr(rc, 'raw_data') and isinstance(rc.raw_data, dict):
-                            raw_output = rc.raw_data.get('output')
-                        elif isinstance(rc, dict):
-                            raw_output = rc.get('raw_data', {}).get('output')
-                except Exception:
-                    raw_output = None
-                if raw_output:
-                    input_items.extend(raw_output)
-                    continue
-                # assistant.tool_calls -> function_call
-                if role == 'assistant' and 'tool_calls' in msg_dict and msg_dict['tool_calls']:
-                    text = msg_dict.get('content')
-                    if text:
-                        input_items.append({'role': 'assistant', 'content': text})
-                    for tc in msg_dict['tool_calls']:
-                        fn = tc.get('function', {})
-                        input_items.append({
-                            'type': 'function_call',
-                            'call_id': tc.get('id'),
-                            'name': fn.get('name'),
-                            'arguments': fn.get('arguments', '')
-                        })
-                    continue
-                # role: tool -> function_call_output
-                if role == 'tool':
-                    input_items.append({
-                        'type': 'function_call_output',
-                        'call_id': msg_dict.get('tool_call_id'),
-                        'output': msg_dict.get('content', '')
-                    })
-                    continue
-                # 清理不支持字段
-                for field in ['reasoning_content', 'tool_calls', 'tool_call_id']:
-                    msg_dict.pop(field, None)
-                input_items.append(msg_dict)
-            else:
-                # Message 对象
-                if hasattr(msg, 'model_dump'):
-                    md = msg.model_dump()
-                    role = md.get('role')
-                    rc = md.get('reasoning_content')
-                    raw_output = None
-                    try:
-                        if rc is not None:
-                            if hasattr(rc, 'raw_data') and isinstance(rc.raw_data, dict):
-                                raw_output = rc.raw_data.get('output')
-                            elif isinstance(rc, dict):
-                                raw_output = rc.get('raw_data', {}).get('output')
-                    except Exception:
-                        raw_output = None
-                    if raw_output:
-                        input_items.extend(raw_output)
-                        continue
-                    if role == 'assistant' and 'tool_calls' in md and md['tool_calls']:
-                        text = md.get('content')
-                        if text:
-                            input_items.append({'role': 'assistant', 'content': text})
-                        for tc in md['tool_calls']:
-                            fn = tc.get('function', {})
-                            input_items.append({
-                                'type': 'function_call',
-                                'call_id': tc.get('id'),
-                                'name': fn.get('name'),
-                                'arguments': fn.get('arguments', '')
-                            })
-                        continue
-                    if role == 'tool':
-                        input_items.append({
-                            'type': 'function_call_output',
-                            'call_id': md.get('tool_call_id'),
-                            'output': md.get('content', '')
-                        })
-                        continue
-                    for field in ['reasoning_content', 'tool_calls', 'tool_call_id']:
-                        md.pop(field, None)
-                    input_items.append(md)
-                else:
-                    input_items.append(msg)
+        if replay_request_view is not None and replay_mode == "responses_output":
+            input_items = replay_request_view
+        else:
+            replay_build = self.build_replay_view(model, messages, **kwargs)
+            input_items = replay_build.request_view
 
         # 准备 kwargs：去掉 messages，处理 tools（透传）
         responses_kwargs = kwargs.copy()
@@ -660,20 +796,20 @@ class OpenaiProvider(Provider):
                 reasoning_content = ReasoningContent(
                     thinking=reasoning_text,
                     provider="openai",
-                    raw_data={
-                        'output': resp.output if hasattr(resp, 'output') else None,
-                        'response_id': getattr(resp, 'id', None)
-                    }
+                    raw_data=self._build_responses_replay_payload(
+                        output=resp.output if hasattr(resp, 'output') else None,
+                        response_id=getattr(resp, 'id', None),
+                    )
                 )
             elif hasattr(resp, 'reasoning_items') and resp.reasoning_items:
                 reasoning_content = ReasoningContent(
                     thinking="[推理内容已加密，暂未提供摘要]",
                     provider="openai",
-                    raw_data={
-                        'reasoning_items': resp.reasoning_items,
-                        'output': resp.output if hasattr(resp, 'output') else None,
-                        'response_id': getattr(resp, 'id', None)
-                    }
+                    raw_data=self._build_responses_replay_payload(
+                        reasoning_items=resp.reasoning_items,
+                        output=resp.output if hasattr(resp, 'output') else None,
+                        response_id=getattr(resp, 'id', None),
+                    )
                 )
 
             # 更完整的content提取
@@ -746,11 +882,17 @@ class OpenaiProvider(Provider):
 
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
+        replay_request_view = kwargs.pop("_replay_request_view", None)
+        replay_mode = kwargs.pop("_replay_mode", None)
+
         # Prepare kwargs based on model capabilities
         prepared_kwargs = self._prepare_reasoning_kwargs(model, kwargs)
 
         # Check if we should use Responses API instead of Chat Completions API
         if self._should_use_responses_api(model, prepared_kwargs):
+            if replay_request_view is not None:
+                prepared_kwargs["_replay_request_view"] = replay_request_view
+                prepared_kwargs["_replay_mode"] = replay_mode
             # GPT-5 + reasoning 等场景：走 Responses API 路径（与 closeaide 实现对齐）
             return await self._responses_create(model, messages, stream=stream, **prepared_kwargs)
 
@@ -764,7 +906,8 @@ class OpenaiProvider(Provider):
             self._stream_reasoning_buffer = ""
 
             # Clean messages for OpenAI API (remove reasoning_content and truncate tool_call IDs)
-            cleaned_messages, id_mapping = self._clean_messages_for_openai(messages)
+            source_messages = replay_request_view if replay_request_view is not None else messages
+            cleaned_messages, id_mapping = self._clean_messages_for_openai(source_messages)
 
             # Ensure streaming usage is included in the OpenAI response
             stream_kwargs = prepared_kwargs.copy()
@@ -849,7 +992,8 @@ class OpenaiProvider(Provider):
             return stream_generator()
         else:
             # Clean messages for OpenAI API (remove reasoning_content and truncate tool_call IDs)
-            cleaned_messages, id_mapping = self._clean_messages_for_openai(messages)
+            source_messages = replay_request_view if replay_request_view is not None else messages
+            cleaned_messages, id_mapping = self._clean_messages_for_openai(source_messages)
 
             response = await self.client.chat.completions.create(
                 model=model,
@@ -906,7 +1050,7 @@ class OpenaiProvider(Provider):
         return ReasoningContent(
             thinking=reasoning_content,
             provider="openai",
-            raw_data={"reasoning_content": reasoning_content}
+            raw_data=self._build_reasoning_replay_payload(reasoning_content)
         )
 
     def _accumulate_and_convert_tool_calls(self, delta):

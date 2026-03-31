@@ -2,15 +2,33 @@ import os
 import json
 import base64
 import logging
-from typing import Any, AsyncGenerator, Dict, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from types import SimpleNamespace
 from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
+from aisuite.framework.replay_payload import (
+    ProviderReplayCapabilities,
+    ReplayBuildResult,
+    ReplayCaptureResult,
+    ReplayDiagnostic,
+    ReplayValidationResult,
+    build_replay_payload,
+    get_replay_payload,
+    unwrap_replay_payload,
+)
 from aisuite.framework.stop_reason import stop_reason_manager
-from aisuite.provider import Provider
+from aisuite.provider import Provider, LLMError
 
-# Import Google GenAI SDK
-from google import genai
-from google.genai import types
+# Import Google GenAI SDK lazily so helper functions remain importable when the
+# optional dependency is absent in the current environment.
+_GEMINI_IMPORT_ERROR = None
+try:
+    from google import genai
+    from google.genai import types
+except ModuleNotFoundError as exc:
+    _GEMINI_IMPORT_ERROR = exc
+    genai = SimpleNamespace(Client=None)
+    types = SimpleNamespace()
 
 
 logger = logging.getLogger(__name__)
@@ -89,8 +107,11 @@ def _normalize_gemini_usage(usage_obj):
 
 GEMINI_PROVIDER_NAME = "gemini"
 GEMINI_SIGNATURE_PLACEHOLDER = "skip_thought_signature_validator"
+GEMINI_TOOL_CALL_REPLAY_KIND = "gemini_tool_call"
+GEMINI_THOUGHT_PARTS_REPLAY_KIND = "gemini_thought_parts"
 
 _TOOL_CALL_ERROR_FINISH_REASONS = {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"}
+_PROTOCOL_ERROR_FINISH_REASONS = {"MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE"}
 
 
 def _normalize_finish_reason(reason: Any) -> Optional[str]:
@@ -110,6 +131,38 @@ def _normalize_finish_reason(reason: Any) -> Optional[str]:
         # e.g. "FinishReason.MALFORMED_FUNCTION_CALL" -> "MALFORMED_FUNCTION_CALL"
         return text.rsplit(".", 1)[-1]
     return text
+
+
+def _extract_provider_call_id(source: Any) -> Optional[str]:
+    if source is None:
+        return None
+
+    if isinstance(source, dict):
+        for key in ("id", "call_id", "callId"):
+            value = source.get(key)
+            if value:
+                return str(value)
+        payload = source.get("payload")
+        if payload is not None:
+            nested = _extract_provider_call_id(payload)
+            if nested:
+                return nested
+        return None
+
+    for attr in ("id", "call_id", "callId"):
+        value = getattr(source, attr, None)
+        if value:
+            return str(value)
+
+    if hasattr(source, "model_dump"):
+        try:
+            dumped = source.model_dump()
+            if isinstance(dumped, dict):
+                return _extract_provider_call_id(dumped)
+        except Exception:
+            pass
+
+    return None
 
 
 def _extract_thought_signature(source: Any) -> Optional[str]:
@@ -138,7 +191,7 @@ def _extract_thought_signature(source: Any) -> Optional[str]:
                 if sig:
                     return sig
         # Recurse into nested metadata
-        for nested_key in ("metadata", "additional_kwargs"):
+        for nested_key in ("metadata", "additional_kwargs", "payload", "meta"):
             nested = source.get(nested_key)
             sig = _extract_thought_signature(nested)
             if sig:
@@ -170,8 +223,17 @@ def _extract_thought_signature(source: Any) -> Optional[str]:
     return None
 
 
-def _build_tool_call_extra(signature: Optional[str], placeholder: bool = False) -> Optional[Dict[str, Any]]:
-    """Build extra_content payload for a tool call."""
+def _build_tool_call_extra(
+    signature: Optional[str],
+    *,
+    provider_call_id: Optional[str] = None,
+    provider_function_name: Optional[str] = None,
+    replay_mode: str = "provider_exact_turn",
+    placeholder: bool = False,
+    degraded: bool = False,
+    degraded_reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build replay metadata for a Gemini tool call."""
     normalized_signature = None
     if signature is not None:
         if isinstance(signature, bytes):
@@ -179,21 +241,128 @@ def _build_tool_call_extra(signature: Optional[str], placeholder: bool = False) 
         else:
             normalized_signature = str(signature)
 
-    if not normalized_signature and not placeholder:
+    if not normalized_signature and not placeholder and not provider_call_id and not provider_function_name:
         return None
 
-    extra: Dict[str, Any] = {"provider": GEMINI_PROVIDER_NAME}
-    google_meta: Dict[str, Any] = {}
+    if (
+        not normalized_signature
+        and not placeholder
+        and (provider_call_id or provider_function_name)
+        and not degraded
+    ):
+        degraded = True
+        degraded_reason = degraded_reason or "missing_thought_signature"
+        if replay_mode == "provider_exact_turn":
+            replay_mode = "degraded_legacy_turn"
 
-    if normalized_signature:
-        google_meta["thought_signature"] = normalized_signature
+    payload: Dict[str, Any] = {
+        "provider_call_id": provider_call_id,
+        "provider_function_name": provider_function_name,
+        "replay_mode": replay_mode,
+        "thought_signature": normalized_signature,
+    }
+    meta: Dict[str, Any] = {}
     if placeholder:
-        google_meta["placeholder"] = True
+        meta["placeholder"] = True
+    if degraded:
+        meta["degraded"] = True
+    if degraded_reason:
+        meta["degraded_reason"] = degraded_reason
 
-    if google_meta:
-        extra["google"] = google_meta
+    legacy_google_meta: Dict[str, Any] = {}
+    if normalized_signature:
+        legacy_google_meta["thought_signature"] = normalized_signature
+    if placeholder:
+        legacy_google_meta["placeholder"] = True
 
-    return extra
+    legacy_fields: Dict[str, Any] = {
+        "provider": GEMINI_PROVIDER_NAME,
+        "provider_call_id": provider_call_id,
+        "provider_function_name": provider_function_name,
+        "replay_mode": replay_mode,
+    }
+    if legacy_google_meta:
+        legacy_fields["google"] = legacy_google_meta
+
+    return build_replay_payload(
+        GEMINI_PROVIDER_NAME,
+        GEMINI_TOOL_CALL_REPLAY_KIND,
+        payload,
+        meta=meta,
+        legacy_fields=legacy_fields,
+    )
+
+
+def _extract_gemini_tool_call_metadata(tool_call: Any) -> Dict[str, Any]:
+    extra = _get_tool_call_extra(tool_call)
+    if not isinstance(extra, dict):
+        return {}
+
+    envelope = get_replay_payload(extra)
+    if envelope and envelope.get("provider") == GEMINI_PROVIDER_NAME:
+        payload = unwrap_replay_payload(extra)
+        meta = envelope.get("meta")
+        result = payload.copy() if isinstance(payload, dict) else {}
+        if isinstance(meta, dict):
+            result["_meta"] = meta
+        return result
+
+    google_meta = extra.get("google")
+    metadata: Dict[str, Any] = {
+        "provider_call_id": extra.get("provider_call_id"),
+        "provider_function_name": extra.get("provider_function_name"),
+        "replay_mode": extra.get("replay_mode"),
+    }
+    if isinstance(google_meta, dict):
+        metadata["thought_signature"] = google_meta.get("thought_signature")
+        metadata["_meta"] = {
+            "placeholder": bool(google_meta.get("placeholder")),
+        }
+    elif "thought_signature" in extra:
+        metadata["thought_signature"] = extra.get("thought_signature")
+
+    return {k: v for k, v in metadata.items() if v is not None or k == "_meta"}
+
+
+def _is_degraded_gemini_tool_call_metadata(metadata: Dict[str, Any]) -> bool:
+    if not metadata:
+        return False
+
+    meta = metadata.get("_meta")
+    if isinstance(meta, dict) and meta.get("degraded"):
+        return True
+
+    replay_mode = metadata.get("replay_mode")
+    return isinstance(replay_mode, str) and replay_mode not in {"", "provider_exact_turn"}
+
+
+def _is_exact_gemini_tool_call_metadata(metadata: Dict[str, Any]) -> bool:
+    return bool(metadata) and not _is_degraded_gemini_tool_call_metadata(metadata)
+
+
+def _build_gemini_thought_parts_raw_data(thought_parts: List[Dict[str, Any]], thinking_text: str) -> Dict[str, Any]:
+    payload = {
+        "thought_parts": thought_parts,
+        "thinking_text": thinking_text,
+    }
+    return build_replay_payload(
+        GEMINI_PROVIDER_NAME,
+        GEMINI_THOUGHT_PARTS_REPLAY_KIND,
+        payload,
+        legacy_fields=payload,
+    )
+
+
+def _extract_gemini_reasoning_payload(raw_data: Any) -> Dict[str, Any]:
+    envelope = get_replay_payload(raw_data)
+    if envelope and envelope.get("provider") == GEMINI_PROVIDER_NAME:
+        payload = unwrap_replay_payload(raw_data)
+        if isinstance(payload, dict):
+            return payload
+        return {}
+    if isinstance(raw_data, dict):
+        return raw_data
+    return {}
 
 
 def _get_tool_call_extra(tool_call: Any) -> Optional[Dict[str, Any]]:
@@ -325,15 +494,26 @@ class GeminiMessageConverter:
 
         if candidate_parts:
             reasoning_text_parts = []
+            reasoning_part_data = []
             content_text_parts = []
 
             for part in candidate_parts:
                 # Check if the part is a thought and has text
                 if getattr(part, 'thought', False) and getattr(part, 'text', None):
                     reasoning_text_parts.append(part.text)
+                    if hasattr(part, 'model_dump'):
+                        reasoning_part_data.append(part.model_dump())
+                    elif hasattr(part, 'dict'):
+                        reasoning_part_data.append(part.dict())
+                    else:
+                        reasoning_part_data.append({
+                            "thought": True,
+                            "text": part.text,
+                        })
                 # Check if the part is a function call
                 elif hasattr(part, 'function_call') and part.function_call:
                     try:
+                        provider_call_id = _extract_provider_call_id(part.function_call)
                         signature = _extract_thought_signature(part) or _extract_thought_signature(part.function_call)
                         function = Function(
                             name=part.function_call.name,
@@ -341,10 +521,14 @@ class GeminiMessageConverter:
                         )
 
                         tool_call_obj = ChatCompletionMessageToolCall(
-                            id=f"call_{part.function_call.name}_{hash(str(part.function_call.args)) % 10000}",
+                            id=provider_call_id or f"call_{part.function_call.name}_{hash(str(part.function_call.args)) % 10000}",
                             function=function,
                             type="function",
-                            extra_content=_build_tool_call_extra(signature)
+                            extra_content=_build_tool_call_extra(
+                                signature,
+                                provider_call_id=provider_call_id,
+                                provider_function_name=part.function_call.name,
+                            )
                         )
 
                         if tool_calls is None:
@@ -359,14 +543,19 @@ class GeminiMessageConverter:
 
             # Combine reasoning parts if any
             if reasoning_text_parts:
-                reasoning_content = "".join(reasoning_text_parts)
+                combined_thinking = "".join(reasoning_text_parts)
+                reasoning_content = ReasoningContent(
+                    thinking=combined_thinking,
+                    provider="gemini",
+                    raw_data=_build_gemini_thought_parts_raw_data(reasoning_part_data, combined_thinking),
+                )
 
             # Use combined content text or fallback to response.text
             if content_text_parts:
                 content = "".join(content_text_parts)
 
         # Get finish_reason for stop_info creation
-        finish_reason = response.candidates[0].finish_reason if response.candidates else None
+        finish_reason = _normalize_finish_reason(response.candidates[0].finish_reason) if response.candidates else None
 
         # Create stop_info (we need to import stop_reason_manager at the top level)
         stop_info = None
@@ -426,6 +615,32 @@ class GeminiMessageConverter:
 
 
 class GeminiProvider(Provider):
+    def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
+        return ProviderReplayCapabilities(
+            needs_exact_turn_replay=True,
+            needs_provider_call_id_binding=True,
+            needs_reasoning_raw_replay=True,
+            supports_canonical_only_history=False,
+            empty_actionless_stop_is_retryable=True,
+        )
+
+    def capture_response(self, response, model: str | None = None, **kwargs):
+        if not response or not getattr(response, "choices", None):
+            return ReplayCaptureResult()
+        choice = response.choices[0]
+        message = getattr(choice, "message", None)
+        if not message:
+            return ReplayCaptureResult(stop_info=getattr(choice, "stop_info", None))
+        reasoning_content = getattr(message, "reasoning_content", None)
+        return ReplayCaptureResult(
+            canonical_message=message,
+            stop_info=getattr(choice, "stop_info", None),
+            replay_metadata={
+                "tool_calls": getattr(message, "tool_calls", None),
+                "reasoning_content": getattr(reasoning_content, "raw_data", None) if reasoning_content else None,
+            },
+            protocol_diagnostics=(),
+        )
 
     def _convert_reasoning_content(self, thinking_text, parts):
         """Convert Gemini thinking content to ReasoningContent object."""
@@ -451,13 +666,15 @@ class GeminiProvider(Provider):
         return ReasoningContent(
             thinking=thinking_text,
             provider="gemini",
-            raw_data={
-                "thought_parts": thought_parts,
-                "thinking_text": thinking_text
-            }
+            raw_data=_build_gemini_thought_parts_raw_data(thought_parts, thinking_text)
         )
+
     def __init__(self, **kwargs):
         """Initialize the Gemini provider with API key and client."""
+        if getattr(genai, "Client", None) is None:
+            raise RuntimeError(
+                "google-genai is required for GeminiProvider"
+            ) from _GEMINI_IMPORT_ERROR
         api_key = os.environ.get("GEMINI_API_KEY") or kwargs.get("api_key")
         if api_key is None:
             raise RuntimeError("GEMINI_API_KEY is required for GeminiProvider")
@@ -495,18 +712,45 @@ class GeminiProvider(Provider):
         Returns:
             (signature, is_placeholder)
         """
-        extra = _get_tool_call_extra(tool_call)
-        signature = _extract_thought_signature(extra) or _extract_thought_signature(tool_call)
+        metadata = _extract_gemini_tool_call_metadata(tool_call)
+        signature = metadata.get("thought_signature") or _extract_thought_signature(tool_call)
         placeholder = False
 
-        # Gemini 3 requires a thought_signature for all replayed tool calls.
-        # If we don't have one from the SDK response, fall back to a placeholder
-        # to avoid hard 400 INVALID_ARGUMENT errors on the next request.
-        if not signature and self._is_gemini_3_model(model_id):
+        # Gemini 3 requires a thought_signature for replaying Gemini-originated
+        # tool calls. Placeholder fallback is reserved for degraded/legacy
+        # histories that do not carry Gemini-native replay metadata.
+        if not signature and self._is_gemini_3_model(model_id) and self._should_use_placeholder_signature(tool_call, metadata):
             signature = GEMINI_SIGNATURE_PLACEHOLDER
             placeholder = True
 
         return signature, placeholder
+
+    def _should_use_placeholder_signature(self, tool_call: Any, metadata: Dict[str, Any]) -> bool:
+        if not metadata:
+            return True
+
+        if _is_degraded_gemini_tool_call_metadata(metadata):
+            return True
+
+        replay_mode = metadata.get("replay_mode")
+        provider_call_id = metadata.get("provider_call_id")
+        provider_function_name = metadata.get("provider_function_name")
+
+        provider = None
+        extra = _get_tool_call_extra(tool_call)
+        if isinstance(extra, dict):
+            provider = extra.get("provider")
+            envelope = get_replay_payload(extra)
+            if envelope:
+                provider = envelope.get("provider") or provider
+
+        is_gemini_history = (
+            provider == GEMINI_PROVIDER_NAME
+            or bool(provider_call_id)
+            or bool(provider_function_name)
+            or replay_mode == "provider_exact_turn"
+        )
+        return not is_gemini_history
 
     def _attach_thought_signature(self, part: Any, signature: Optional[str]) -> None:
         """Attach thought_signature metadata to a Part/function_call if possible."""
@@ -543,6 +787,281 @@ class GeminiProvider(Provider):
             except Exception:
                 pass
 
+    def _build_protocol_diagnostic(
+        self,
+        code: str,
+        message: str,
+        *,
+        severity: str = "error",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ReplayDiagnostic:
+        return ReplayDiagnostic(
+            code=code,
+            message=message,
+            severity=severity,
+            provider=GEMINI_PROVIDER_NAME,
+            metadata=metadata or {},
+        )
+
+    def _normalize_message_dict(self, msg: Any) -> Dict[str, Any]:
+        if isinstance(msg, dict):
+            return msg
+        if hasattr(msg, "model_dump"):
+            try:
+                return msg.model_dump()
+            except Exception:
+                pass
+        return {}
+
+    def _find_replay_tool_call_metadata(self, messages: List[Any], tool_call_id: str) -> Dict[str, Any]:
+        for msg in reversed(messages):
+            msg_dict = self._normalize_message_dict(msg)
+            if msg_dict.get("role") != "assistant":
+                continue
+            tool_calls = msg_dict.get("tool_calls") or []
+            for tool_call in reversed(tool_calls):
+                if isinstance(tool_call, dict):
+                    current_id = tool_call.get("id")
+                else:
+                    current_id = getattr(tool_call, "id", None)
+                if current_id == tool_call_id:
+                    metadata = _extract_gemini_tool_call_metadata(tool_call)
+                    if metadata:
+                        return metadata
+                    function_name = None
+                    if isinstance(tool_call, dict):
+                        function_name = (tool_call.get("function") or {}).get("name")
+                    elif getattr(tool_call, "function", None):
+                        function_name = getattr(tool_call.function, "name", None)
+                    if function_name:
+                        return {
+                            "provider_function_name": function_name,
+                            "_legacy_fallback": True,
+                            "_exact_metadata": False,
+                        }
+        return {}
+
+    def _resolve_tool_response_replay_metadata(
+        self,
+        model_id: str,
+        msg: Dict[str, Any],
+        replay_messages: Optional[List[Any]] = None,
+    ) -> Tuple[Dict[str, Any], Optional[ReplayDiagnostic]]:
+        tool_call_id = msg.get("tool_call_id")
+        if not tool_call_id:
+            return {}, None
+
+        replay_metadata = self._find_replay_tool_call_metadata(replay_messages or [], tool_call_id)
+        if replay_metadata:
+            replay_metadata = dict(replay_metadata)
+
+        provider_function_name = replay_metadata.get("provider_function_name")
+        provider_call_id = replay_metadata.get("provider_call_id")
+        exact_metadata = (
+            bool(replay_metadata)
+            and not replay_metadata.get("_legacy_fallback", False)
+            and not _is_degraded_gemini_tool_call_metadata(replay_metadata)
+        )
+        replay_metadata["_exact_metadata"] = exact_metadata
+
+        if self._is_gemini_3_model(model_id):
+            if not provider_function_name:
+                diagnostic = self._build_protocol_diagnostic(
+                    "missing_provider_function_name",
+                    "Gemini tool replay metadata is missing provider_function_name.",
+                    metadata={"tool_call_id": tool_call_id},
+                )
+                return replay_metadata, diagnostic
+            if exact_metadata and not provider_call_id:
+                diagnostic = self._build_protocol_diagnostic(
+                    "missing_provider_call_id",
+                    "Gemini tool replay metadata is missing provider_call_id.",
+                    metadata={"tool_call_id": tool_call_id},
+                )
+                return replay_metadata, diagnostic
+            return replay_metadata, None
+
+        if not provider_function_name:
+            function_name = "unknown_function"
+            if tool_call_id.startswith("call_"):
+                parts = tool_call_id.split("_")
+                if len(parts) >= 3:
+                    function_name = "_".join(parts[1:-1])
+            replay_metadata["provider_function_name"] = function_name
+
+        return replay_metadata, None
+
+    def _create_function_response_part(
+        self,
+        *,
+        function_name: str,
+        content: Any,
+        provider_call_id: Optional[str] = None,
+    ):
+        response_payload = {"result": content}
+        function_response_cls = getattr(types, "FunctionResponse", None)
+        part_cls = getattr(types, "Part", None)
+
+        if function_response_cls is not None and part_cls is not None:
+            try:
+                kwargs = {
+                    "name": function_name,
+                    "response": response_payload,
+                }
+                if provider_call_id:
+                    kwargs["id"] = provider_call_id
+                function_response = function_response_cls(**kwargs)
+                return part_cls(function_response=function_response)
+            except Exception:
+                pass
+
+        return types.Part.from_function_response(
+            name=function_name,
+            response=response_payload,
+        )
+
+    def _create_function_call_part(
+        self,
+        *,
+        function_name: str,
+        parsed_args: Dict[str, Any],
+        provider_call_id: Optional[str] = None,
+    ):
+        function_call_cls = getattr(types, "FunctionCall", None)
+        part_cls = getattr(types, "Part", None)
+
+        if function_call_cls is not None and part_cls is not None:
+            try:
+                kwargs = {
+                    "name": function_name,
+                    "args": parsed_args,
+                }
+                if provider_call_id:
+                    kwargs["id"] = provider_call_id
+                function_call = function_call_cls(**kwargs)
+                return part_cls(function_call=function_call)
+            except Exception:
+                pass
+
+        return types.Part.from_function_call(
+            name=function_name,
+            args=parsed_args,
+        )
+
+    def _build_tool_response_parts(
+        self,
+        model_id: str,
+        msg: Dict[str, Any],
+        replay_messages: Optional[List[Any]] = None,
+    ):
+        tool_call_id = msg.get("tool_call_id")
+        if not tool_call_id:
+            return None, None
+
+        replay_metadata, diagnostic = self._resolve_tool_response_replay_metadata(
+            model_id,
+            msg,
+            replay_messages=replay_messages,
+        )
+        if diagnostic:
+            return None, diagnostic
+
+        provider_function_name = replay_metadata.get("provider_function_name")
+        provider_call_id = replay_metadata.get("provider_call_id")
+
+        part = self._create_function_response_part(
+            function_name=provider_function_name,
+            content=msg.get("content"),
+            provider_call_id=provider_call_id,
+        )
+        return [part], None
+
+    def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
+        diagnostics: List[ReplayDiagnostic] = []
+        degraded = False
+
+        if not self._is_gemini_3_model(model):
+            return ReplayValidationResult(ok=True)
+
+        normalized_messages = [self._normalize_message_dict(msg) for msg in messages]
+
+        for msg in normalized_messages:
+            role = msg.get("role")
+            if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                for tool_call in msg["tool_calls"]:
+                    metadata = _extract_gemini_tool_call_metadata(tool_call)
+                    if not metadata:
+                        degraded = True
+                        continue
+                    is_degraded_metadata = _is_degraded_gemini_tool_call_metadata(metadata)
+                    if is_degraded_metadata:
+                        degraded = True
+                    if not metadata.get("provider_call_id"):
+                        diagnostics.append(
+                            self._build_protocol_diagnostic(
+                                "missing_provider_call_id",
+                                "Gemini replay metadata is missing provider_call_id.",
+                                metadata={"tool_call_id": getattr(tool_call, "id", None) if not isinstance(tool_call, dict) else tool_call.get("id")},
+                            )
+                        )
+                    if not metadata.get("provider_function_name"):
+                        diagnostics.append(
+                            self._build_protocol_diagnostic(
+                                "missing_provider_function_name",
+                                "Gemini replay metadata is missing provider_function_name.",
+                                metadata={"tool_call_id": getattr(tool_call, "id", None) if not isinstance(tool_call, dict) else tool_call.get("id")},
+                            )
+                        )
+                    if not metadata.get("thought_signature") and _is_exact_gemini_tool_call_metadata(metadata):
+                        diagnostics.append(
+                            self._build_protocol_diagnostic(
+                                "missing_thought_signature",
+                                "Gemini replay metadata is missing thought_signature.",
+                                metadata={"tool_call_id": getattr(tool_call, "id", None) if not isinstance(tool_call, dict) else tool_call.get("id")},
+                            )
+                        )
+
+            if role == "tool" and msg.get("tool_call_id"):
+                replay_metadata, diagnostic = self._resolve_tool_response_replay_metadata(
+                    model,
+                    msg,
+                    replay_messages=normalized_messages,
+                )
+                if diagnostic:
+                    diagnostics.append(diagnostic)
+                    continue
+                if replay_metadata and not replay_metadata.get("_exact_metadata", True):
+                    degraded = True
+
+        return ReplayValidationResult(
+            ok=not any(diag.severity == "error" for diag in diagnostics),
+            degraded=degraded,
+            diagnostics=tuple(diagnostics),
+        )
+
+    def build_replay_view(self, model: str, messages: list, **kwargs):
+        validation = self.validate_replay_window(model, messages, **kwargs)
+        if not validation.ok:
+            error_codes = ", ".join(diag.code for diag in validation.diagnostics if diag.severity == "error")
+            raise LLMError(f"Gemini replay window validation failed: {error_codes}")
+        normalized_messages = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                normalized_messages.append(msg)
+            elif hasattr(msg, "model_dump"):
+                normalized_messages.append(msg.model_dump())
+            else:
+                normalized_messages.append(msg)
+        replay_mode = "provider_exact_turn"
+        if validation.degraded:
+            replay_mode = "degraded_legacy_turn"
+        return ReplayBuildResult(
+            request_view=self._preprocess_messages_for_gemini(normalized_messages),
+            replay_mode=replay_mode,
+            degraded=validation.degraded,
+            diagnostics=validation.diagnostics,
+        )
+
     def _parse_tool_call_args(self, args: Any) -> Dict[str, Any]:
         """Parse tool call arguments into a dictionary."""
         if isinstance(args, dict):
@@ -571,6 +1090,7 @@ class GeminiProvider(Provider):
         for tool_call in tool_calls:
             func_name = None
             raw_args: Any = "{}"
+            provider_call_id = None
 
             if isinstance(tool_call, ChatCompletionMessageToolCall):
                 func_name = tool_call.function.name
@@ -583,11 +1103,24 @@ class GeminiProvider(Provider):
             if not func_name:
                 continue
 
+            metadata = _extract_gemini_tool_call_metadata(tool_call)
+            provider_call_id = metadata.get("provider_call_id")
             parsed_args = self._parse_tool_call_args(raw_args)
-            signature, _ = self._resolve_tool_call_signature(model_id, tool_call)
-            function_call_part = types.Part.from_function_call(
-                name=func_name,
-                args=parsed_args
+            signature, placeholder = self._resolve_tool_call_signature(model_id, tool_call)
+
+            if (
+                self._is_gemini_3_model(model_id)
+                and _is_exact_gemini_tool_call_metadata(metadata)
+                and not signature
+            ):
+                raise LLMError(
+                    f"Gemini replay metadata for tool_call {getattr(tool_call, 'id', None) if not isinstance(tool_call, dict) else tool_call.get('id')} is missing thought_signature"
+                )
+
+            function_call_part = self._create_function_call_part(
+                function_name=func_name,
+                parsed_args=parsed_args,
+                provider_call_id=provider_call_id,
             )
             if signature:
                 self._attach_thought_signature(function_call_part, signature)
@@ -774,8 +1307,15 @@ class GeminiProvider(Provider):
     async def chat_completions_create(self, model: str, messages: list, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """Create a chat completion (single-turn or streaming) using a Gemini model."""
 
-        # Preprocess messages to ensure Gemini compatibility
-        messages = self._preprocess_messages_for_gemini(messages)
+        replay_request_view = kwargs.pop("_replay_request_view", None)
+        replay_mode = kwargs.pop("_replay_mode", None)
+
+        if replay_request_view is not None and replay_mode in {"provider_exact_turn", "degraded_legacy_turn"}:
+            messages = replay_request_view
+        else:
+            # Validate and preprocess replay window before building provider-native history
+            replay_build = self.build_replay_view(model, messages, **kwargs)
+            messages = replay_build.request_view
 
         # Determine if streaming
         stream = kwargs.get("stream", False)
@@ -917,21 +1457,15 @@ class GeminiProvider(Provider):
                     # Tool messages should use function response format for Gemini
                     # Create proper function response part
                     if "tool_call_id" in msg:
-                        # Extract function name from tool_call_id if possible
-                        # Format: call_function_name_hash -> function_name
-                        tool_call_id = msg["tool_call_id"]
-                        function_name = "unknown_function"
-                        if tool_call_id.startswith("call_"):
-                            parts = tool_call_id.split("_")
-                            if len(parts) >= 3:
-                                function_name = "_".join(parts[1:-1])  # Everything between "call_" and the hash
-
-                        # Create function response part
-                        function_response_part = types.Part.from_function_response(
-                            name=function_name,
-                            response={"result": msg["content"]}
+                        replay_parts, diagnostic = self._build_tool_response_parts(
+                            model_id,
+                            msg,
+                            replay_messages=convo_history,
                         )
-                        history_msgs.append(types.Content(role="user", parts=[function_response_part]))
+                        if diagnostic:
+                            raise LLMError(diagnostic.message)
+                        if replay_parts:
+                            history_msgs.append(types.Content(role="user", parts=replay_parts))
                     else:
                         # Fallback to text format if no tool_call_id
                         tool_content = f"Tool result: {msg['content']}"
@@ -981,18 +1515,15 @@ class GeminiProvider(Provider):
                     elif role == "tool":
                         # Use function response format
                         if "tool_call_id" in msg:
-                            tool_call_id = msg["tool_call_id"]
-                            function_name = "unknown_function"
-                            if tool_call_id.startswith("call_"):
-                                parts = tool_call_id.split("_")
-                                if len(parts) >= 3:
-                                    function_name = "_".join(parts[1:-1])
-
-                            function_response_part = types.Part.from_function_response(
-                                name=function_name,
-                                response={"result": msg["content"]}
+                            replay_parts, diagnostic = self._build_tool_response_parts(
+                                model_id,
+                                msg,
+                                replay_messages=messages,
                             )
-                            contents.append(types.Content(role="user", parts=[function_response_part]))
+                            if diagnostic:
+                                raise LLMError(diagnostic.message)
+                            if replay_parts:
+                                contents.append(types.Content(role="user", parts=replay_parts))
                         else:
                             tool_content = f"Tool result: {msg['content']}"
                             part = types.Part.from_text(text=tool_content)
@@ -1087,13 +1618,13 @@ class GeminiProvider(Provider):
                                 "model": model_id,
                                 "provider": "gemini"
                             }
-                            if finish_reason in _TOOL_CALL_ERROR_FINISH_REASONS:
+                            if finish_reason in _TOOL_CALL_ERROR_FINISH_REASONS | _PROTOCOL_ERROR_FINISH_REASONS:
                                 try:
                                     roles_tail = [getattr(c, "role", None) for c in contents][-12:]
                                 except Exception:
                                     roles_tail = []
                                 logger.warning(
-                                    "Gemini tool-call error finish_reason=%s model=%s tools=%s roles_tail=%s",
+                                    "Gemini abnormal finish_reason=%s model=%s tools=%s roles_tail=%s",
                                     finish_reason,
                                     model_id,
                                     tool_names_for_log,
@@ -1143,18 +1674,15 @@ class GeminiProvider(Provider):
                         continue  # Already handled in config
                     elif role == "tool":
                         if "tool_call_id" in msg:
-                            tool_call_id = msg["tool_call_id"]
-                            function_name = "unknown_function"
-                            if tool_call_id.startswith("call_"):
-                                parts = tool_call_id.split("_")
-                                if len(parts) >= 3:
-                                    function_name = "_".join(parts[1:-1])
-
-                            function_response_part = types.Part.from_function_response(
-                                name=function_name,
-                                response={"result": msg["content"]}
+                            replay_parts, diagnostic = self._build_tool_response_parts(
+                                model_id,
+                                msg,
+                                replay_messages=messages,
                             )
-                            contents.append(types.Content(role="user", parts=[function_response_part]))
+                            if diagnostic:
+                                raise LLMError(diagnostic.message)
+                            if replay_parts:
+                                contents.append(types.Content(role="user", parts=replay_parts))
                         else:
                             tool_content = f"Tool result: {msg['content']}"
                             part = types.Part.from_text(text=tool_content)
@@ -1263,13 +1791,13 @@ class GeminiProvider(Provider):
                             "model": model_id,
                             "provider": "gemini"
                         }
-                        if finish_reason in _TOOL_CALL_ERROR_FINISH_REASONS:
+                        if finish_reason in _TOOL_CALL_ERROR_FINISH_REASONS | _PROTOCOL_ERROR_FINISH_REASONS:
                             try:
                                 roles_tail = [getattr(c, "role", None) for c in (history_msgs or [])][-12:]
                             except Exception:
                                 roles_tail = []
                             logger.warning(
-                                "Gemini tool-call error finish_reason=%s model=%s tools=%s last_user_message_len=%s roles_tail=%s",
+                                "Gemini abnormal finish_reason=%s model=%s tools=%s last_user_message_len=%s roles_tail=%s",
                                 finish_reason,
                                 model_id,
                                 tool_names_for_log,
@@ -1356,6 +1884,7 @@ class GeminiProvider(Provider):
             return None
 
         try:
+            provider_call_id = _extract_provider_call_id(function_call)
             signature = _extract_thought_signature(function_call)
             # Gemini function calls are typically complete in a single chunk
             function = Function(
@@ -1364,10 +1893,14 @@ class GeminiProvider(Provider):
             )
 
             tool_call_obj = ChatCompletionMessageToolCall(
-                id=f"call_{function_call.name}_{hash(str(function_call.args)) % 10000}",  # Generate a unique ID
+                id=provider_call_id or f"call_{function_call.name}_{hash(str(function_call.args)) % 10000}",
                 function=function,
                 type="function",
-                extra_content=_build_tool_call_extra(signature)
+                extra_content=_build_tool_call_extra(
+                    signature,
+                    provider_call_id=provider_call_id,
+                    provider_function_name=function_call.name,
+                )
             )
 
             return [tool_call_obj]
@@ -1417,8 +1950,14 @@ class GeminiProvider(Provider):
             # Accumulate function data
             if hasattr(tool_call_delta, 'function') and tool_call_delta.function:
                 signature = _extract_thought_signature(tool_call_delta.function)
-                if signature:
-                    tool_call["extra_content"] = _build_tool_call_extra(signature)
+                provider_call_id = tool_call["id"] or _extract_provider_call_id(tool_call_delta.function)
+                provider_function_name = getattr(tool_call_delta.function, 'name', None) or tool_call["function"]["name"] or None
+                if signature or provider_call_id or provider_function_name:
+                    tool_call["extra_content"] = _build_tool_call_extra(
+                        signature,
+                        provider_call_id=provider_call_id,
+                        provider_function_name=provider_function_name,
+                    )
 
                 if hasattr(tool_call_delta.function, 'name') and tool_call_delta.function.name:
                     tool_call["function"]["name"] += tool_call_delta.function.name
@@ -1433,8 +1972,14 @@ class GeminiProvider(Provider):
             # Some SDKs may attach signature at the delta level
             if not tool_call.get("extra_content"):
                 signature = _extract_thought_signature(tool_call_delta)
-                if signature:
-                    tool_call["extra_content"] = _build_tool_call_extra(signature)
+                provider_call_id = tool_call["id"] or _extract_provider_call_id(tool_call_delta)
+                provider_function_name = tool_call["function"]["name"] or None
+                if signature or provider_call_id or provider_function_name:
+                    tool_call["extra_content"] = _build_tool_call_extra(
+                        signature,
+                        provider_call_id=provider_call_id,
+                        provider_function_name=provider_function_name,
+                    )
 
         # Check for complete tool calls and convert them
         complete_tool_calls = []

@@ -4,6 +4,13 @@ import importlib
 import os
 import functools
 
+from aisuite.framework.replay_payload import (
+    ReplayBuildResult,
+    ReplayCaptureResult,
+    ProviderReplayCapabilities,
+    ReplayValidationResult,
+)
+
 
 class LLMError(Exception):
     """Custom exception for LLM errors."""
@@ -17,6 +24,34 @@ class Provider(ABC):
     def chat_completions_create(self, model, messages):
         """Abstract method for chat completion calls, to be implemented by each provider."""
         pass
+
+    def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
+        """Return provider replay capabilities.
+
+        Providers that do not need replay-specific behavior can use the default
+        no-op capability set.
+        """
+
+        return ProviderReplayCapabilities()
+
+    def capture_response(self, response, model: str | None = None, **kwargs):
+        """Capture replay-relevant response metadata.
+
+        Default behavior is a no-op so existing providers do not need to
+        implement the replay contract immediately.
+        """
+
+        return ReplayCaptureResult()
+
+    def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
+        """Validate whether the current replay window is usable."""
+
+        return ReplayValidationResult(ok=True)
+
+    def build_replay_view(self, model: str, messages: list, **kwargs):
+        """Build a provider-native replay view from canonical messages."""
+
+        return ReplayBuildResult(request_view=messages, replay_mode="canonical")
 
 
 class ProviderFactory:
