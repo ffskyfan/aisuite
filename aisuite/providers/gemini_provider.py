@@ -1233,9 +1233,18 @@ class GeminiProvider(Provider):
                 "description": func_def.get("description", ""),
             }
 
-            # Add parameters if present
-            if "parameters" in func_def:
-                gemini_func["parameters"] = func_def["parameters"]
+            # Google GenAI's `parameters` field is validated against the SDK's
+            # restricted Schema model, which rejects raw JSON Schema keywords
+            # like `oneOf`. Route dict schemas through `parameters_json_schema`
+            # so richer tool contracts remain valid.
+            if "parameters_json_schema" in func_def:
+                gemini_func["parameters_json_schema"] = func_def["parameters_json_schema"]
+            elif "parameters" in func_def:
+                parameters = func_def["parameters"]
+                if isinstance(parameters, dict):
+                    gemini_func["parameters_json_schema"] = parameters
+                else:
+                    gemini_func["parameters"] = parameters
 
             function_declarations.append(gemini_func)
 

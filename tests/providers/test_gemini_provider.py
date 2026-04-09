@@ -115,6 +115,73 @@ def test_gemini_converter_preserves_provider_replay_metadata(_mock_client_cls):
 
 
 @patch("aisuite.providers.gemini_provider.genai.Client")
+def test_gemini_convert_tool_spec_uses_json_schema_for_dict_parameters(_mock_client_cls):
+    provider = GeminiProvider(api_key="test-gemini-key")
+    openai_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "scene_query",
+                "description": "Structured scene query",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {"nodeId": {"type": "integer"}},
+                                    "required": ["nodeId"],
+                                    "additionalProperties": False,
+                                },
+                            ]
+                        }
+                    },
+                    "required": ["target"],
+                },
+            },
+        }
+    ]
+
+    gemini_tools = provider._convert_tool_spec(openai_tools)
+
+    assert gemini_tools == [
+        {
+            "function_declarations": [
+                {
+                    "name": "scene_query",
+                    "description": "Structured scene query",
+                    "parameters_json_schema": openai_tools[0]["function"]["parameters"],
+                }
+            ]
+        }
+    ]
+
+
+@patch("aisuite.providers.gemini_provider.genai.Client")
+def test_gemini_convert_tool_spec_preserves_non_dict_parameters(_mock_client_cls):
+    provider = GeminiProvider(api_key="test-gemini-key")
+    openai_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "call_native_schema",
+                "description": "Already provider-native",
+                "parameters": SimpleNamespace(type="OBJECT"),
+            },
+        }
+    ]
+
+    gemini_tools = provider._convert_tool_spec(openai_tools)
+
+    declaration = gemini_tools[0]["function_declarations"][0]
+    assert declaration["name"] == "call_native_schema"
+    assert declaration["parameters"] is openai_tools[0]["function"]["parameters"]
+    assert "parameters_json_schema" not in declaration
+
+
+@patch("aisuite.providers.gemini_provider.genai.Client")
 def test_gemini_validate_replay_window_errors_on_missing_signature(_mock_client_cls):
     provider = GeminiProvider(api_key="test-gemini-key")
     messages = [
