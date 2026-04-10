@@ -120,9 +120,19 @@ class AnthropicMessageConverter:
         # Handle Claude-specific state events and streaming chunks.
         if chunk_type == "content_block_stop":
             if provider:
-                tool_calls = provider._finalize_anthropic_tool_calls(
-                    getattr(chunk, "index", None)
-                )
+                index = getattr(chunk, "index", None)
+                content_block = getattr(chunk, "content_block", None)
+
+                # Prefer the SDK's fully parsed tool block when available.
+                # This is more reliable than reconstructing arguments from
+                # streamed partial_json fragments, which may not always form a
+                # valid JSON string when concatenated directly.
+                tool_calls = provider._process_anthropic_tool_use(content_block)
+                if tool_calls:
+                    provider._discard_anthropic_tool_call(index)
+                else:
+                    tool_calls = provider._finalize_anthropic_tool_calls(index)
+
                 if tool_calls:
                     provider._stream_tool_calls_count += len(tool_calls)
                     role = "assistant"
@@ -1037,6 +1047,12 @@ class AnthropicProvider(Provider):
             "received_delta": False,
         }
 
+    def _discard_anthropic_tool_call(self, index):
+        """Drop a pending streaming tool call accumulator entry."""
+        if index is None:
+            return
+        self._streaming_tool_calls.pop(index, None)
+
     def _accumulate_anthropic_tool_calls(self, chunk):
         """
         Accumulate tool call chunks from Anthropic fine-grained streaming.
@@ -1250,17 +1266,29 @@ class AnthropicProvider(Provider):
         Returns:
             List of converted tool calls
         """
-        if not content_block or not hasattr(content_block, 'type') or content_block.type != "tool_use":
+        if (
+            not content_block
+            or not hasattr(content_block, 'type')
+            or content_block.type not in {"tool_use", "server_tool_use"}
+        ):
             return None
 
         try:
+            tool_name = getattr(content_block, "name", None)
+            tool_call_id = getattr(content_block, "id", None)
+            if not tool_name or not tool_call_id:
+                return None
+
+            raw_input = getattr(content_block, "input", None)
+            arguments = "{}" if raw_input is None else json.dumps(raw_input)
+
             function = Function(
-                name=content_block.name,
-                arguments=json.dumps(content_block.input) if hasattr(content_block, 'input') else "{}"
+                name=tool_name,
+                arguments=arguments
             )
 
             tool_call_obj = ChatCompletionMessageToolCall(
-                id=content_block.id,
+                id=tool_call_id,
                 function=function,
                 type="function"
             )

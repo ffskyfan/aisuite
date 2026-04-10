@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -183,6 +184,83 @@ def test_anthropic_stream_tool_use_without_explicit_input_defaults_to_empty_obje
     assert tool_result.choices[0].delta.tool_calls[0].id == "tool_2"
     assert tool_result.choices[0].delta.tool_calls[0].function.name == "set_task_list"
     assert tool_result.choices[0].delta.tool_calls[0].function.arguments == "{}"
+
+    stop_result = provider.converter.convert_stream_response(
+        message_delta_chunk,
+        "claude-sonnet",
+        provider,
+    )
+    assert stop_result is not None
+    assert stop_result.choices[0].stop_info.reason == StopReason.TOOL_CALL
+    assert stop_result.choices[0].stop_info.metadata["tool_calls_count"] == 1
+
+
+@patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")
+def test_anthropic_stream_prefers_final_content_block_input_over_malformed_partial_json(_mock_client_cls):
+    provider = AnthropicProvider(api_key="test-anthropic-key")
+
+    expected_input = {
+        "tasks": [
+            {
+                "title": '修复末尾笔误"讲"→"将"',
+                "status": "NOT_STARTED",
+            }
+        ]
+    }
+
+    start_chunk = SimpleNamespace(
+        type="content_block_start",
+        index=2,
+        content_block=SimpleNamespace(
+            type="tool_use",
+            id="tool_3",
+            name="set_task_list",
+        ),
+    )
+    delta_chunk_1 = SimpleNamespace(
+        type="content_block_delta",
+        index=2,
+        delta=SimpleNamespace(
+            type="input_json_delta",
+            partial_json='{"tasks":[{"title":"修复末尾笔误',
+        ),
+    )
+    delta_chunk_2 = SimpleNamespace(
+        type="content_block_delta",
+        index=2,
+        delta=SimpleNamespace(
+            type="input_json_delta",
+            partial_json='"讲"→"将"","status":"NOT_STARTED"}]}',
+        ),
+    )
+    stop_chunk = SimpleNamespace(
+        type="content_block_stop",
+        index=2,
+        content_block=SimpleNamespace(
+            type="tool_use",
+            id="tool_3",
+            name="set_task_list",
+            input=expected_input,
+        ),
+    )
+    message_delta_chunk = SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason="tool_use"),
+        usage=None,
+    )
+
+    assert provider.converter.convert_stream_response(start_chunk, "claude-sonnet", provider) is None
+    assert provider.converter.convert_stream_response(delta_chunk_1, "claude-sonnet", provider) is None
+    assert provider.converter.convert_stream_response(delta_chunk_2, "claude-sonnet", provider) is None
+
+    tool_result = provider.converter.convert_stream_response(stop_chunk, "claude-sonnet", provider)
+    assert tool_result is not None
+    assert tool_result.choices[0].delta.tool_calls is not None
+    assert len(tool_result.choices[0].delta.tool_calls) == 1
+    tool_call = tool_result.choices[0].delta.tool_calls[0]
+    assert tool_call.id == "tool_3"
+    assert tool_call.function.name == "set_task_list"
+    assert json.loads(tool_call.function.arguments) == expected_input
 
     stop_result = provider.converter.convert_stream_response(
         message_delta_chunk,
