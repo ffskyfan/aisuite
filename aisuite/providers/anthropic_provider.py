@@ -117,12 +117,25 @@ class AnthropicMessageConverter:
         # 获取chunk类型
         chunk_type = getattr(chunk, 'type', 'unknown')
 
-        # Handle Claude-specific state events that should not be passed downstream
-        if chunk_type in ["content_block_stop", "message_stop", "ping"]:
+        # Handle Claude-specific state events and streaming chunks.
+        if chunk_type == "content_block_stop":
+            if provider:
+                tool_calls = provider._finalize_anthropic_tool_calls(
+                    getattr(chunk, "index", None)
+                )
+                if tool_calls:
+                    provider._stream_tool_calls_count += len(tool_calls)
+                    role = "assistant"
+                else:
+                    return None
+            else:
+                return None
+
+        elif chunk_type in ["message_stop", "ping"]:
             return None  # Filter out Claude-specific state events
 
         # Capture input-side usage from message_start (input_tokens, cache fields)
-        if chunk_type == "message_start":
+        elif chunk_type == "message_start":
             if provider:
                 usage_obj = None
                 if hasattr(chunk, 'message') and chunk.message:
@@ -139,7 +152,7 @@ class AnthropicMessageConverter:
                 hasattr(chunk.content_block, 'type')):
                 block_type = chunk.content_block.type
 
-                if block_type == "tool_use":
+                if block_type in ["tool_use", "server_tool_use"]:
                     # Initialize tool call with id and name from content_block_start
                     if provider:
                         provider._initialize_tool_call_from_content_block(chunk.content_block, getattr(chunk, 'index', 0))
@@ -997,14 +1010,31 @@ class AnthropicProvider(Provider):
             content_block: The tool_use content block containing id and name
             index: The index of the content block
         """
-        if not content_block or not hasattr(content_block, 'type') or content_block.type != "tool_use":
+        if (
+            not content_block
+            or not hasattr(content_block, 'type')
+            or content_block.type not in {"tool_use", "server_tool_use"}
+        ):
             return
+
+        initial_input = getattr(content_block, "input", None)
+        serialized_input = ""
+        seeded_from_start = False
+        if initial_input is not None:
+            try:
+                serialized_input = json.dumps(initial_input)
+                seeded_from_start = True
+            except TypeError:
+                serialized_input = ""
+                seeded_from_start = False
 
         # Initialize tool call accumulator with id and name from content_block_start
         self._streaming_tool_calls[index] = {
             "id": getattr(content_block, 'id', ''),
             "name": getattr(content_block, 'name', ''),
-            "input": ""
+            "input": serialized_input,
+            "seeded_from_start": seeded_from_start,
+            "received_delta": False,
         }
 
     def _accumulate_anthropic_tool_calls(self, chunk):
@@ -1029,26 +1059,52 @@ class AnthropicProvider(Provider):
             self._streaming_tool_calls[index] = {
                 "id": "",
                 "name": "",
-                "input": ""
+                "input": "",
+                "seeded_from_start": False,
+                "received_delta": False,
             }
 
         tool_call = self._streaming_tool_calls[index]
 
         # Accumulate partial JSON input
         if hasattr(chunk.delta, 'partial_json'):
+            if tool_call.get("seeded_from_start") and not tool_call.get("received_delta"):
+                tool_call["input"] = ""
             tool_call["input"] += chunk.delta.partial_json
+            tool_call["received_delta"] = True
 
-        # Check for complete tool calls and convert them
+        return self._finalize_anthropic_tool_calls()
+
+    def _finalize_anthropic_tool_calls(self, index=None):
+        """
+        Finalize accumulated Anthropic tool calls.
+
+        Args:
+            index: Optional specific content block index to finalize.
+
+        Returns:
+            List of converted tool calls if any are complete, None otherwise.
+        """
         complete_tool_calls = []
         for idx, tool_call_data in list(self._streaming_tool_calls.items()):
-            if tool_call_data["id"] and tool_call_data["name"] and tool_call_data["input"]:
+            if index is not None and idx != index:
+                continue
+
+            if tool_call_data["id"] and tool_call_data["name"]:
+                raw_arguments = tool_call_data.get("input") or ""
+                if not raw_arguments and not tool_call_data.get("received_delta"):
+                    raw_arguments = "{}"
+
+                if not raw_arguments:
+                    continue
+
                 try:
                     # Try to parse input as JSON to ensure completeness
-                    json.loads(tool_call_data["input"])
+                    json.loads(raw_arguments)
 
                     function = Function(
                         name=tool_call_data["name"],
-                        arguments=tool_call_data["input"]
+                        arguments=raw_arguments
                     )
 
                     tool_call_obj = ChatCompletionMessageToolCall(

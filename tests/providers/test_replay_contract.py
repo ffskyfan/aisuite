@@ -107,6 +107,93 @@ def test_anthropic_build_replay_view_returns_structured_result(_mock_client_cls)
     assert replay_view.request_view["messages"] == [{"role": "user", "content": "hello"}]
 
 
+@patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")
+def test_anthropic_stream_tool_use_is_finalized_on_content_block_stop(_mock_client_cls):
+    provider = AnthropicProvider(api_key="test-anthropic-key")
+
+    start_chunk = SimpleNamespace(
+        type="content_block_start",
+        index=1,
+        content_block=SimpleNamespace(
+            type="tool_use",
+            id="tool_1",
+            name="lookup_weather",
+            input={},
+        ),
+    )
+    stop_chunk = SimpleNamespace(
+        type="content_block_stop",
+        index=1,
+    )
+    message_delta_chunk = SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason="tool_use"),
+        usage=None,
+    )
+
+    assert provider.converter.convert_stream_response(start_chunk, "claude-sonnet", provider) is None
+
+    tool_result = provider.converter.convert_stream_response(stop_chunk, "claude-sonnet", provider)
+    assert tool_result is not None
+    assert tool_result.choices[0].delta.tool_calls is not None
+    assert len(tool_result.choices[0].delta.tool_calls) == 1
+    assert tool_result.choices[0].delta.tool_calls[0].id == "tool_1"
+    assert tool_result.choices[0].delta.tool_calls[0].function.name == "lookup_weather"
+    assert tool_result.choices[0].delta.tool_calls[0].function.arguments == "{}"
+
+    stop_result = provider.converter.convert_stream_response(
+        message_delta_chunk,
+        "claude-sonnet",
+        provider,
+    )
+    assert stop_result is not None
+    assert stop_result.choices[0].stop_info.reason == StopReason.TOOL_CALL
+    assert stop_result.choices[0].stop_info.metadata["tool_calls_count"] == 1
+
+
+@patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")
+def test_anthropic_stream_tool_use_without_explicit_input_defaults_to_empty_object(_mock_client_cls):
+    provider = AnthropicProvider(api_key="test-anthropic-key")
+
+    start_chunk = SimpleNamespace(
+        type="content_block_start",
+        index=1,
+        content_block=SimpleNamespace(
+            type="tool_use",
+            id="tool_2",
+            name="set_task_list",
+        ),
+    )
+    stop_chunk = SimpleNamespace(
+        type="content_block_stop",
+        index=1,
+    )
+    message_delta_chunk = SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason="tool_use"),
+        usage=None,
+    )
+
+    assert provider.converter.convert_stream_response(start_chunk, "claude-sonnet", provider) is None
+
+    tool_result = provider.converter.convert_stream_response(stop_chunk, "claude-sonnet", provider)
+    assert tool_result is not None
+    assert tool_result.choices[0].delta.tool_calls is not None
+    assert len(tool_result.choices[0].delta.tool_calls) == 1
+    assert tool_result.choices[0].delta.tool_calls[0].id == "tool_2"
+    assert tool_result.choices[0].delta.tool_calls[0].function.name == "set_task_list"
+    assert tool_result.choices[0].delta.tool_calls[0].function.arguments == "{}"
+
+    stop_result = provider.converter.convert_stream_response(
+        message_delta_chunk,
+        "claude-sonnet",
+        provider,
+    )
+    assert stop_result is not None
+    assert stop_result.choices[0].stop_info.reason == StopReason.TOOL_CALL
+    assert stop_result.choices[0].stop_info.metadata["tool_calls_count"] == 1
+
+
 def test_message_normalizer_preserves_versioned_replay_payloads():
     tool_replay = build_replay_payload(
         "gemini",
