@@ -1,6 +1,6 @@
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -270,6 +270,161 @@ def test_anthropic_stream_prefers_final_content_block_input_over_malformed_parti
     assert stop_result is not None
     assert stop_result.choices[0].stop_info.reason == StopReason.TOOL_CALL
     assert stop_result.choices[0].stop_info.metadata["tool_calls_count"] == 1
+
+
+@patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")
+def test_anthropic_stream_dedupes_tool_call_emitted_from_delta_and_content_block_stop(_mock_client_cls):
+    provider = AnthropicProvider(api_key="test-anthropic-key")
+
+    start_chunk = SimpleNamespace(
+        type="content_block_start",
+        index=1,
+        content_block=SimpleNamespace(
+            type="tool_use",
+            id="tool_dup_1",
+            name="read_file",
+        ),
+    )
+    delta_chunk = SimpleNamespace(
+        type="content_block_delta",
+        index=1,
+        delta=SimpleNamespace(
+            type="input_json_delta",
+            partial_json='{"file_path":"chapter.aifc"}',
+        ),
+    )
+    stop_chunk = SimpleNamespace(
+        type="content_block_stop",
+        index=1,
+        content_block=SimpleNamespace(
+            type="tool_use",
+            id="tool_dup_1",
+            name="read_file",
+            input={"file_path": "chapter.aifc"},
+        ),
+    )
+    message_delta_chunk = SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason="tool_use"),
+        usage=None,
+    )
+
+    assert provider.converter.convert_stream_response(start_chunk, "claude-sonnet", provider) is None
+
+    delta_result = provider.converter.convert_stream_response(delta_chunk, "claude-sonnet", provider)
+    assert delta_result is not None
+    assert delta_result.choices[0].delta.tool_calls is not None
+    assert len(delta_result.choices[0].delta.tool_calls) == 1
+    assert delta_result.choices[0].delta.tool_calls[0].id == "tool_dup_1"
+
+    stop_result = provider.converter.convert_stream_response(stop_chunk, "claude-sonnet", provider)
+    assert stop_result is None
+
+    final_stop_result = provider.converter.convert_stream_response(
+        message_delta_chunk,
+        "claude-sonnet",
+        provider,
+    )
+    assert final_stop_result is not None
+    assert final_stop_result.choices[0].stop_info.reason == StopReason.TOOL_CALL
+    assert final_stop_result.choices[0].stop_info.metadata["tool_calls_count"] == 1
+
+
+@patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")
+def test_anthropic_message_stop_recovers_tool_use_from_sdk_snapshot(_mock_client_cls):
+    provider = AnthropicProvider(api_key="test-anthropic-key")
+
+    message_stop_chunk = SimpleNamespace(
+        type="message_stop",
+        message=SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="tool_use",
+                    id="tool_4",
+                    name="edit_file",
+                    input={"file_path": "chapter.aifc", "diff_content": ["@@\n-old\n+new"]},
+                )
+            ]
+        ),
+    )
+
+    result = provider.converter.convert_stream_response(message_stop_chunk, "claude-sonnet", provider)
+
+    assert result is not None
+    assert provider._stream_tool_calls_count == 1
+    tool_calls = result.choices[0].delta.tool_calls
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "edit_file"
+    assert json.loads(tool_calls[0].function.arguments)["file_path"] == "chapter.aifc"
+
+
+@patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")
+@pytest.mark.asyncio
+async def test_anthropic_chat_stream_uses_sdk_stream_helper_and_final_message_recovery(_mock_client_cls):
+    provider = AnthropicProvider(api_key="test-anthropic-key")
+
+    final_message = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="tool_use",
+                id="tool_5",
+                name="edit_file",
+                input={"file_path": "chapter.aifc", "diff_content": ["@@\n-old\n+new"]},
+            )
+        ]
+    )
+
+    class FakeAsyncStream:
+        def __init__(self, final_message):
+            self._final_message = final_message
+            self.request_id = "req_test_123"
+
+        def __aiter__(self):
+            async def _iterate():
+                if False:
+                    yield None
+            return _iterate()
+
+        async def get_final_message(self):
+            return self._final_message
+
+    class FakeAsyncStreamManager:
+        def __init__(self, stream):
+            self._stream = stream
+
+        async def __aenter__(self):
+            return self._stream
+
+        async def __aexit__(self, exc_type, exc, exc_tb):
+            return None
+
+    stream_mock = Mock(return_value=FakeAsyncStreamManager(FakeAsyncStream(final_message)))
+    create_mock = AsyncMock()
+    provider.client = SimpleNamespace(
+        messages=SimpleNamespace(
+            stream=stream_mock,
+            create=create_mock,
+        )
+    )
+
+    response_stream = await provider.chat_completions_create(
+        "claude-sonnet",
+        [{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+
+    streamed_responses = [chunk async for chunk in response_stream]
+
+    assert create_mock.await_count == 0
+    assert stream_mock.call_count == 1
+    assert len(streamed_responses) == 1
+    tool_calls = streamed_responses[0].choices[0].delta.tool_calls
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].id == "tool_5"
+    assert tool_calls[0].function.name == "edit_file"
+    assert json.loads(tool_calls[0].function.arguments)["file_path"] == "chapter.aifc"
 
 
 def test_message_normalizer_preserves_versioned_replay_payloads():

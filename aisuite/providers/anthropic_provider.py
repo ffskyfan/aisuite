@@ -36,6 +36,15 @@ DEFAULT_MAX_TOKENS = 4096
 ANTHROPIC_THINKING_REPLAY_KIND = "anthropic_thinking_block"
 
 
+def _truncate_for_log(value, max_chars=240):
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else repr(value)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}...(truncated,len={len(text)})"
+
+
 def _build_anthropic_thinking_replay_payload(thinking_block_data):
     return build_replay_payload(
         "anthropic",
@@ -122,18 +131,89 @@ class AnthropicMessageConverter:
             if provider:
                 index = getattr(chunk, "index", None)
                 content_block = getattr(chunk, "content_block", None)
+                content_block_type = getattr(content_block, "type", None)
+                is_tool_block = content_block_type in {"tool_use", "server_tool_use"}
 
-                # Prefer the SDK's fully parsed tool block when available.
-                # This is more reliable than reconstructing arguments from
-                # streamed partial_json fragments, which may not always form a
-                # valid JSON string when concatenated directly.
-                tool_calls = provider._process_anthropic_tool_use(content_block)
-                if tool_calls:
-                    provider._discard_anthropic_tool_call(index)
+                if is_tool_block:
+                    # Prefer the SDK's fully parsed tool block when available.
+                    # This is more reliable than reconstructing arguments from
+                    # streamed partial_json fragments, which may not always form a
+                    # valid JSON string when concatenated directly.
+                    tool_calls = provider._dedupe_stream_tool_calls(
+                        provider._process_anthropic_tool_use(content_block),
+                        index=index,
+                        source="content_block_stop",
+                    )
+                    if tool_calls:
+                        anthropic_logger.info(
+                            "[ANTHROPIC_TOOL_STOP] finalized_from_content_block "
+                            f"index={index} tool_calls={len(tool_calls)}"
+                        )
+                        provider._discard_anthropic_tool_call(index)
+                    else:
+                        tool_calls = provider._finalize_anthropic_tool_calls(index, emit_diagnostics=True)
+                        if tool_calls:
+                            anthropic_logger.info(
+                                "[ANTHROPIC_TOOL_STOP] finalized_from_accumulator "
+                                f"index={index} tool_calls={len(tool_calls)}"
+                            )
+
+                    if tool_calls:
+                        provider._stream_tool_calls_count += len(tool_calls)
+                        role = "assistant"
+                    else:
+                        anthropic_logger.warning(
+                            "[ANTHROPIC_TOOL_STOP] finalize_failed "
+                            f"index={index} content_block_present={bool(content_block)} "
+                            f"content_block_type={content_block_type} "
+                            f"content_block_name={getattr(content_block, 'name', None)} "
+                            f"content_block_id={getattr(content_block, 'id', None)} "
+                            f"content_block_has_input={hasattr(content_block, 'input') if content_block else False} "
+                            f"pending={provider._describe_pending_anthropic_tool_calls(index=index)}"
+                        )
+                        return None
+                elif provider._has_pending_anthropic_tool_call(index):
+                    tool_calls = provider._dedupe_stream_tool_calls(
+                        provider._finalize_anthropic_tool_calls(index, emit_diagnostics=True),
+                        index=index,
+                        source="content_block_stop_pending",
+                    )
+                    if tool_calls:
+                        anthropic_logger.info(
+                            "[ANTHROPIC_TOOL_STOP] finalized_from_accumulator "
+                            f"index={index} tool_calls={len(tool_calls)}"
+                        )
+                        provider._stream_tool_calls_count += len(tool_calls)
+                        role = "assistant"
+                    else:
+                        anthropic_logger.warning(
+                            "[ANTHROPIC_TOOL_STOP] finalize_failed "
+                            f"index={index} content_block_present={bool(content_block)} "
+                            f"content_block_type={content_block_type} "
+                            f"content_block_name={getattr(content_block, 'name', None)} "
+                            f"content_block_id={getattr(content_block, 'id', None)} "
+                            f"content_block_has_input={hasattr(content_block, 'input') if content_block else False} "
+                            f"pending={provider._describe_pending_anthropic_tool_calls(index=index)}"
+                        )
+                        return None
                 else:
-                    tool_calls = provider._finalize_anthropic_tool_calls(index)
+                    return None
+            else:
+                return None
 
+        elif chunk_type == "message_stop":
+            if provider and provider._stream_tool_calls_count == 0:
+                tool_calls = provider._dedupe_stream_tool_calls(
+                    provider._recover_anthropic_tool_calls_from_message(
+                        getattr(chunk, "message", None)
+                    ),
+                    source="message_stop",
+                )
                 if tool_calls:
+                    anthropic_logger.info(
+                        "[ANTHROPIC_TOOL_STOP] recovered_from_message_stop "
+                        f"tool_calls={len(tool_calls)}"
+                    )
                     provider._stream_tool_calls_count += len(tool_calls)
                     role = "assistant"
                 else:
@@ -141,7 +221,7 @@ class AnthropicMessageConverter:
             else:
                 return None
 
-        elif chunk_type in ["message_stop", "ping"]:
+        elif chunk_type == "ping":
             return None  # Filter out Claude-specific state events
 
         # Capture input-side usage from message_start (input_tokens, cache fields)
@@ -258,6 +338,16 @@ class AnthropicMessageConverter:
                     stop_info = stop_reason_manager.map_stop_reason(
                         "anthropic", original_stop_reason, metadata
                     )
+
+                    if (
+                        provider
+                        and original_stop_reason == "tool_use"
+                        and provider._stream_tool_calls_count == 0
+                    ):
+                        anthropic_logger.warning(
+                            "[ANTHROPIC_TOOL_STOP_MISSING] stop_reason=tool_use but no structured tool_calls "
+                            f"pending={provider._describe_pending_anthropic_tool_calls()}"
+                        )
 
                     anthropic_logger.info(f"Stop Reason: {original_stop_reason} -> {stop_info.reason.value} (has_content: {metadata.get('has_content', False)})")
                     anthropic_logger.info(f"[PROVIDER] Created stop_info object: {stop_info}")
@@ -766,6 +856,8 @@ class AnthropicProvider(Provider):
         self._stream_reasoning_length = 0
         # Structured state for accumulating usage across streaming events
         self._stream_usage_state = self._make_empty_stream_usage_state()
+        # Track tool calls that have already been emitted downstream in the current stream.
+        self._emitted_stream_tool_call_ids = set()
 
     def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
         return ProviderReplayCapabilities(
@@ -966,24 +1058,44 @@ class AnthropicProvider(Provider):
                 self._stream_tool_calls_count = 0
                 self._stream_reasoning_length = 0
                 self._stream_usage_state = self._make_empty_stream_usage_state()
+                self._emitted_stream_tool_call_ids = set()
 
-                response = await self.client.messages.create(
+                response = self.client.messages.stream(
                     model=model,
                     system=system_message,
                     messages=converted_messages,
-                    stream=True,
                     **kwargs
                 )
 
                 async def stream_generator():
                     chunk_count = 0
                     yielded_count = 0
-                    async for chunk in response:
-                        chunk_count += 1
-                        result = self.converter.convert_stream_response(chunk, model, self)
-                        if result is not None:  # Only yield non-None results
-                            yielded_count += 1
-                            yield result
+                    async with response as stream_response:
+                        async for chunk in stream_response:
+                            chunk_count += 1
+                            result = self.converter.convert_stream_response(chunk, model, self)
+                            if result is not None:  # Only yield non-None results
+                                yielded_count += 1
+                                yield result
+
+                        if self._stream_tool_calls_count == 0:
+                            final_message = await stream_response.get_final_message()
+                            recovered_tool_calls = self._dedupe_stream_tool_calls(
+                                self._recover_anthropic_tool_calls_from_message(final_message),
+                                source="final_message",
+                            )
+                            if recovered_tool_calls:
+                                anthropic_logger.info(
+                                    "[ANTHROPIC_TOOL_STOP] recovered_from_final_message "
+                                    f"tool_calls={len(recovered_tool_calls)}"
+                                )
+                                self._stream_tool_calls_count += len(recovered_tool_calls)
+                                yielded_count += 1
+                                yield self._build_stream_tool_call_response(
+                                    model,
+                                    recovered_tool_calls,
+                                    request_id=getattr(stream_response, "request_id", None),
+                                )
                     anthropic_logger.debug(f"STREAM_END: total_chunks={chunk_count}, yielded={yielded_count}")
 
                 return stream_generator()
@@ -1053,6 +1165,56 @@ class AnthropicProvider(Provider):
             return
         self._streaming_tool_calls.pop(index, None)
 
+    def _dedupe_stream_tool_calls(self, tool_calls, *, index=None, source=None):
+        """Filter already-emitted streaming tool calls and register new ones."""
+        if not tool_calls:
+            return None
+
+        deduped_tool_calls = []
+        duplicate_ids = []
+        for tool_call in tool_calls:
+            tool_call_id = getattr(tool_call, "id", None)
+            if tool_call_id and tool_call_id in self._emitted_stream_tool_call_ids:
+                duplicate_ids.append(tool_call_id)
+                continue
+            if tool_call_id:
+                self._emitted_stream_tool_call_ids.add(tool_call_id)
+            deduped_tool_calls.append(tool_call)
+
+        if duplicate_ids:
+            anthropic_logger.info(
+                "[ANTHROPIC_TOOL_DUPLICATE_SKIP] "
+                f"source={source} index={index} duplicate_ids={duplicate_ids}"
+            )
+            if index is not None:
+                self._discard_anthropic_tool_call(index)
+
+        return deduped_tool_calls or None
+
+    def _has_pending_anthropic_tool_call(self, index):
+        """Return whether a given streaming tool call accumulator entry exists."""
+        if index is None:
+            return False
+        return index in self._streaming_tool_calls
+
+    def _describe_pending_anthropic_tool_calls(self, index=None):
+        """Return a compact log-friendly snapshot of pending Anthropic tool calls."""
+        snapshot = []
+        for idx, tool_call_data in self._streaming_tool_calls.items():
+            if index is not None and idx != index:
+                continue
+            raw_arguments = tool_call_data.get("input") or ""
+            snapshot.append({
+                "index": idx,
+                "id": tool_call_data.get("id"),
+                "name": tool_call_data.get("name"),
+                "received_delta": bool(tool_call_data.get("received_delta")),
+                "seeded_from_start": bool(tool_call_data.get("seeded_from_start")),
+                "raw_len": len(raw_arguments),
+                "raw_preview": _truncate_for_log(raw_arguments),
+            })
+        return snapshot
+
     def _accumulate_anthropic_tool_calls(self, chunk):
         """
         Accumulate tool call chunks from Anthropic fine-grained streaming.
@@ -1089,14 +1251,19 @@ class AnthropicProvider(Provider):
             tool_call["input"] += chunk.delta.partial_json
             tool_call["received_delta"] = True
 
-        return self._finalize_anthropic_tool_calls()
+        return self._dedupe_stream_tool_calls(
+            self._finalize_anthropic_tool_calls(),
+            index=index,
+            source="input_json_delta",
+        )
 
-    def _finalize_anthropic_tool_calls(self, index=None):
+    def _finalize_anthropic_tool_calls(self, index=None, emit_diagnostics=False):
         """
         Finalize accumulated Anthropic tool calls.
 
         Args:
             index: Optional specific content block index to finalize.
+            emit_diagnostics: Whether to emit JSON parse diagnostics when finalization fails.
 
         Returns:
             List of converted tool calls if any are complete, None otherwise.
@@ -1135,11 +1302,79 @@ class AnthropicProvider(Provider):
                     # Remove completed tool call from accumulator
                     del self._streaming_tool_calls[idx]
 
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    if emit_diagnostics:
+                        anthropic_logger.warning(
+                            "[ANTHROPIC_TOOL_JSON_DECODE] "
+                            f"index={idx} "
+                            f"name={tool_call_data.get('name')} "
+                            f"id={tool_call_data.get('id')} "
+                            f"pos={e.pos} line={e.lineno} col={e.colno} msg={e.msg} "
+                            f"received_delta={tool_call_data.get('received_delta')} "
+                            f"seeded_from_start={tool_call_data.get('seeded_from_start')} "
+                            f"raw_len={len(raw_arguments)} "
+                            f"raw_preview={_truncate_for_log(raw_arguments)}"
+                        )
+                        anthropic_logger.warning(
+                            "[ANTHROPIC_TOOL_JSON_FULL_BEGIN] "
+                            f"index={idx} "
+                            f"name={tool_call_data.get('name')} "
+                            f"id={tool_call_data.get('id')} "
+                            f"raw_len={len(raw_arguments)}"
+                        )
+                        anthropic_logger.warning(raw_arguments)
+                        anthropic_logger.warning(
+                            "[ANTHROPIC_TOOL_JSON_FULL_END] "
+                            f"index={idx} "
+                            f"name={tool_call_data.get('name')} "
+                            f"id={tool_call_data.get('id')}"
+                        )
                     # Input is not complete yet, continue accumulating
                     continue
 
         return complete_tool_calls if complete_tool_calls else None
+
+    def _recover_anthropic_tool_calls_from_message(self, message):
+        """Extract tool calls from a fully accumulated Anthropic message snapshot."""
+        if not message or not getattr(message, "content", None):
+            return None
+
+        recovered_tool_calls = []
+        for content_block in message.content:
+            tool_calls = self._process_anthropic_tool_use(content_block)
+            if tool_calls:
+                recovered_tool_calls.extend(tool_calls)
+
+        return recovered_tool_calls or None
+
+    def _build_stream_tool_call_response(self, model, tool_calls, request_id=None):
+        """Build a synthetic streaming response that carries recovered tool calls."""
+        metadata = {
+            "id": request_id,
+            "created": None,
+            "model": model,
+        }
+
+        usage = self.converter._normalize_usage_obj(self._build_stream_usage())
+        if usage:
+            metadata["usage"] = usage
+
+        return ChatCompletionResponse(
+            choices=[
+                StreamChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        content=None,
+                        role="assistant",
+                        tool_calls=tool_calls,
+                        reasoning_content=None,
+                    ),
+                    finish_reason=None,
+                    stop_info=None,
+                )
+            ],
+            metadata=metadata,
+        )
 
     def _accumulate_thinking_content(self, thinking_text):
         """Accumulate thinking content from streaming chunks."""
@@ -1277,6 +1512,11 @@ class AnthropicProvider(Provider):
             tool_name = getattr(content_block, "name", None)
             tool_call_id = getattr(content_block, "id", None)
             if not tool_name or not tool_call_id:
+                anthropic_logger.warning(
+                    "[ANTHROPIC_TOOL_BLOCK_INVALID] "
+                    f"type={getattr(content_block, 'type', None)} "
+                    f"name={tool_name} id={tool_call_id}"
+                )
                 return None
 
             raw_input = getattr(content_block, "input", None)
@@ -1295,6 +1535,14 @@ class AnthropicProvider(Provider):
 
             return [tool_call_obj]
 
-        except Exception:
+        except Exception as e:
+            anthropic_logger.warning(
+                "[ANTHROPIC_TOOL_BLOCK_PROCESS_FAILED] "
+                f"type={getattr(content_block, 'type', None)} "
+                f"name={getattr(content_block, 'name', None)} "
+                f"id={getattr(content_block, 'id', None)} "
+                f"input_type={type(getattr(content_block, 'input', None)).__name__} "
+                f"error={type(e).__name__}: {e}"
+            )
             # If there's any error processing the tool use, return None
             return None
