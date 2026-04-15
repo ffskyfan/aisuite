@@ -1,8 +1,12 @@
 import json
 import os
-from typing import Any, Dict, Generator, List, Optional, Union
+from collections.abc import Mapping
+from types import SimpleNamespace
+from typing import Any, AsyncGenerator, AsyncIterator, Dict, List, Optional, Union
 
+import httpx
 from zai import ZhipuAiClient
+from zai.core import drop_prefix_image_data
 
 from aisuite.framework.chat_completion_response import (
     ChatCompletionResponse,
@@ -53,7 +57,135 @@ class GlmProvider(Provider):
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
 
-    def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
+    @staticmethod
+    def _to_namespace(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return SimpleNamespace(
+                **{key: GlmProvider._to_namespace(item) for key, item in value.items()}
+            )
+        if isinstance(value, list):
+            return [GlmProvider._to_namespace(item) for item in value]
+        return value
+
+    def _build_http_body(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, Any]],
+        stream: bool,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        request_kwargs = dict(kwargs)
+        temperature = request_kwargs.get("temperature")
+        if temperature is not None:
+            if temperature <= 0:
+                request_kwargs["do_sample"] = False
+                request_kwargs["temperature"] = 0.01
+            elif temperature >= 1:
+                request_kwargs["temperature"] = 0.99
+
+        top_p = request_kwargs.get("top_p")
+        if top_p is not None:
+            if top_p >= 1:
+                request_kwargs["top_p"] = 0.99
+            elif top_p <= 0:
+                request_kwargs["top_p"] = 0.01
+
+        prepared_messages = []
+        for message in messages:
+            prepared = dict(message)
+            if prepared.get("content"):
+                prepared["content"] = drop_prefix_image_data(prepared["content"])
+            prepared_messages.append(prepared)
+
+        body = {
+            "model": model,
+            "messages": prepared_messages,
+            "stream": stream,
+            **request_kwargs,
+        }
+        return self.client._prepare_json_data(body)
+
+    def _request_url(self, path: str) -> str:
+        return str(self.client._prepare_url(path))
+
+    def _request_headers(self) -> Dict[str, str]:
+        return dict(self.client._default_headers)
+
+    async def _async_post_json(self, body: Dict[str, Any]) -> Any:
+        async with httpx.AsyncClient(
+            timeout=self.client.timeout,
+            limits=self.client._limits,
+        ) as client:
+            response = await client.post(
+                self._request_url("/chat/completions"),
+                headers=self._request_headers(),
+                json=body,
+            )
+            response.raise_for_status()
+            return self._to_namespace(response.json())
+
+    async def _iter_sse_json(self, response: httpx.Response) -> AsyncIterator[Any]:
+        event = None
+        data_lines: List[str] = []
+
+        async for line in response.aiter_lines():
+            line = line.rstrip("\n")
+            if not line:
+                if not data_lines and event is None:
+                    continue
+
+                data = "\n".join(data_lines)
+                event = None
+                data_lines = []
+
+                if data.startswith("[DONE]"):
+                    break
+
+                payload = json.loads(data)
+                if isinstance(payload, Mapping) and payload.get("error"):
+                    raise LLMError(
+                        f"An error occurred during GLM streaming: {payload['error']}"
+                    )
+                yield self._to_namespace(payload)
+                continue
+
+            if line.startswith(":"):
+                continue
+
+            field, _, value = line.partition(":")
+            if value.startswith(" "):
+                value = value[1:]
+
+            if field == "event":
+                event = value
+            elif field == "data":
+                data_lines.append(value)
+
+    async def _async_stream_json(self, body: Dict[str, Any]) -> AsyncIterator[Any]:
+        async with httpx.AsyncClient(
+            timeout=self.client.timeout,
+            limits=self.client._limits,
+        ) as client:
+            request = client.build_request(
+                "POST",
+                self._request_url("/chat/completions"),
+                headers=self._request_headers(),
+                json=body,
+            )
+            response = await client.send(request, stream=True)
+            stream_iter = self._iter_sse_json(response)
+            try:
+                response.raise_for_status()
+                async for chunk in stream_iter:
+                    yield chunk
+            finally:
+                await stream_iter.aclose()
+                await response.aclose()
+
+    def get_replay_capabilities(
+        self, model: str | None = None
+    ) -> ProviderReplayCapabilities:
         return ProviderReplayCapabilities(
             needs_exact_turn_replay=False,
             needs_provider_call_id_binding=True,
@@ -62,7 +194,9 @@ class GlmProvider(Provider):
             empty_actionless_stop_is_retryable=False,
         )
 
-    def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
+    def validate_replay_window(
+        self, model: str, messages: list, **kwargs
+    ) -> ReplayValidationResult:
         diagnostics: list[ReplayDiagnostic] = []
         normalized_messages: list[dict[str, Any]] = []
         for msg in messages:
@@ -442,12 +576,15 @@ class GlmProvider(Provider):
 
         return complete_tool_calls if complete_tool_calls else None
 
-    def chat_completions_create(
+    async def chat_completions_create(
         self, model, messages, stream: bool = False, **kwargs
-    ) -> Union[ChatCompletionResponse, Generator[ChatCompletionResponse, None, None]]:
+    ) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         replay_request_view = kwargs.pop("_replay_request_view", None)
         replay_mode = kwargs.pop("_replay_mode", None)
-        if replay_request_view is not None and replay_mode == "canonical_with_reasoning":
+        if (
+            replay_request_view is not None
+            and replay_mode == "canonical_with_reasoning"
+        ):
             prepared_messages = replay_request_view
         else:
             replay_build = self.build_replay_view(model, messages, **kwargs)
@@ -460,17 +597,17 @@ class GlmProvider(Provider):
                 self._stream_content_length = 0
                 self._stream_tool_calls_count = 0
 
-                response = self.client.chat.completions.create(
+                body = self._build_http_body(
                     model=model,
                     messages=prepared_messages,
                     stream=True,
-                    **prepared_kwargs,
+                    kwargs=prepared_kwargs,
                 )
 
-                def stream_generator():
+                async def stream_generator():
                     stream_usage = None
 
-                    for chunk in response:
+                    async for chunk in self._async_stream_json(body):
                         if getattr(chunk, "usage", None):
                             stream_usage = (
                                 self._normalize_usage(chunk.usage) or stream_usage
@@ -481,11 +618,12 @@ class GlmProvider(Provider):
 
                         choices = []
                         for choice in chunk.choices:
-                            if getattr(choice.delta, "content", None):
-                                self._stream_content_length += len(choice.delta.content)
+                            delta = getattr(choice, "delta", SimpleNamespace())
+                            if getattr(delta, "content", None):
+                                self._stream_content_length += len(delta.content)
 
                             converted_tool_calls = (
-                                self._accumulate_and_convert_tool_calls(choice.delta)
+                                self._accumulate_and_convert_tool_calls(delta)
                             )
                             if converted_tool_calls:
                                 self._stream_tool_calls_count += len(
@@ -493,42 +631,44 @@ class GlmProvider(Provider):
                                 )
 
                             stop_info = None
-                            if choice.finish_reason:
-                                if choice.finish_reason == "stop":
+                            finish_reason = getattr(choice, "finish_reason", None)
+                            if finish_reason:
+                                chunk_model = getattr(chunk, "model", None) or model
+                                if finish_reason == "stop":
                                     stop_info = stop_reason_manager.map_stop_reason(
                                         "openai",
-                                        choice.finish_reason,
+                                        finish_reason,
                                         {
                                             "has_content": self._stream_content_length
                                             > 0
                                             or self._stream_tool_calls_count > 0,
                                             "content_length": self._stream_content_length,
                                             "tool_calls_count": self._stream_tool_calls_count,
-                                            "finish_reason": choice.finish_reason,
-                                            "model": chunk.model or model,
+                                            "finish_reason": finish_reason,
+                                            "model": chunk_model,
                                             "provider": "glm",
                                         },
                                     )
                                     stop_info.metadata["provider"] = "glm"
                                 else:
                                     stop_info = self._create_stop_info(
-                                        choice.finish_reason,
-                                        {"delta": choice.delta},
-                                        chunk.model or model,
+                                        finish_reason,
+                                        {"delta": delta},
+                                        chunk_model,
                                     )
 
                             choices.append(
                                 StreamChoice(
-                                    index=choice.index,
+                                    index=getattr(choice, "index", 0),
                                     delta=ChoiceDelta(
-                                        content=choice.delta.content,
-                                        role=choice.delta.role,
+                                        content=getattr(delta, "content", None),
+                                        role=getattr(delta, "role", None),
                                         reasoning_content=getattr(
-                                            choice.delta, "reasoning_content", None
+                                            delta, "reasoning_content", None
                                         ),
                                         tool_calls=converted_tool_calls,
                                     ),
-                                    finish_reason=choice.finish_reason,
+                                    finish_reason=finish_reason,
                                     stop_info=stop_info,
                                 )
                             )
@@ -538,19 +678,26 @@ class GlmProvider(Provider):
                             "created": getattr(chunk, "created", None),
                             "model": getattr(chunk, "model", None) or model,
                         }
-                        if any(c.finish_reason for c in chunk.choices) and stream_usage:
+                        if (
+                            any(
+                                getattr(choice, "finish_reason", None)
+                                for choice in chunk.choices
+                            )
+                            and stream_usage
+                        ):
                             metadata["usage"] = stream_usage
 
                         yield ChatCompletionResponse(choices=choices, metadata=metadata)
 
                 return stream_generator()
 
-            response = self.client.chat.completions.create(
+            body = self._build_http_body(
                 model=model,
                 messages=prepared_messages,
                 stream=False,
-                **prepared_kwargs,
+                kwargs=prepared_kwargs,
             )
+            response = await self._async_post_json(body)
 
             choices = []
             for choice in response.choices:
