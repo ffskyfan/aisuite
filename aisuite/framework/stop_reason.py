@@ -157,6 +157,14 @@ class OpenAIStopMapper(ProviderStopMapper):
                 StopReason.SAFETY_REFUSAL, original_reason, metadata
             )
 
+        elif original_reason == "network_error":
+            metadata = metadata or {}
+            metadata.setdefault("error_class", "network_error")
+            metadata.setdefault("error_message", "上游网络错误或流式连接中断")
+            return self._create_stop_info(
+                StopReason.ERROR, original_reason, metadata
+            )
+
         else:
             logger.warning(f"Unknown OpenAI stop reason: {original_reason}")
             return self._create_stop_info(

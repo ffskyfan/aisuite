@@ -377,6 +377,22 @@ class GlmProvider(Provider):
             diagnostics=validation.diagnostics,
         )
 
+    def _raise_for_terminal_error_finish_reason(
+        self,
+        finish_reason: Optional[str],
+        *,
+        model: Optional[str],
+        stream: bool,
+    ) -> None:
+        if finish_reason != "network_error":
+            return
+
+        mode = "streaming" if stream else "non-streaming"
+        raise LLMError(
+            f"GLM returned finish_reason=network_error during {mode} completion"
+            f" (model={model or 'unknown'})"
+        )
+
     def _create_stop_info(
         self, finish_reason: Optional[str], choice_data: dict = None, model: str = None
     ):
@@ -388,6 +404,8 @@ class GlmProvider(Provider):
         tool_calls_count = 0
 
         if choice_data:
+            stream_content_length = choice_data.get("stream_content_length")
+            stream_tool_calls_count = choice_data.get("stream_tool_calls_count")
             message = choice_data.get("message") or choice_data.get("delta")
             if message:
                 content = getattr(message, "content", None)
@@ -403,6 +421,14 @@ class GlmProvider(Provider):
                 if tool_calls:
                     tool_calls_count = len(tool_calls)
                     has_content = True
+
+            if isinstance(stream_content_length, int) and stream_content_length > 0:
+                content_length = max(content_length, stream_content_length)
+                has_content = True
+
+            if isinstance(stream_tool_calls_count, int) and stream_tool_calls_count > 0:
+                tool_calls_count = max(tool_calls_count, stream_tool_calls_count)
+                has_content = True
 
         metadata = {
             "has_content": has_content,
@@ -634,6 +660,11 @@ class GlmProvider(Provider):
                             finish_reason = getattr(choice, "finish_reason", None)
                             if finish_reason:
                                 chunk_model = getattr(chunk, "model", None) or model
+                                self._raise_for_terminal_error_finish_reason(
+                                    finish_reason,
+                                    model=chunk_model,
+                                    stream=True,
+                                )
                                 if finish_reason == "stop":
                                     stop_info = stop_reason_manager.map_stop_reason(
                                         "openai",
@@ -653,7 +684,11 @@ class GlmProvider(Provider):
                                 else:
                                     stop_info = self._create_stop_info(
                                         finish_reason,
-                                        {"delta": delta},
+                                        {
+                                            "delta": delta,
+                                            "stream_content_length": self._stream_content_length,
+                                            "stream_tool_calls_count": self._stream_tool_calls_count,
+                                        },
                                         chunk_model,
                                     )
 
@@ -702,6 +737,11 @@ class GlmProvider(Provider):
             choices = []
             for choice in response.choices:
                 finish_reason = getattr(choice, "finish_reason", None)
+                self._raise_for_terminal_error_finish_reason(
+                    finish_reason,
+                    model=model,
+                    stream=False,
+                )
                 choices.append(
                     Choice(
                         index=choice.index,

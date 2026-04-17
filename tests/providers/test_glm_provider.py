@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from aisuite.framework.message_normalizer import MessageNormalizer
+from aisuite.provider import LLMError
 from aisuite.providers.glm_provider import GlmProvider
 
 
@@ -209,6 +210,122 @@ async def test_glm_provider_streaming(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_glm_provider_streaming_preserves_accumulated_tool_call_count(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+
+    provider = GlmProvider()
+
+    chunks = [
+        _ns(
+            id="chunk-1",
+            created=1,
+            model="glm-5",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    delta=_ns(
+                        content=None,
+                        role="assistant",
+                        reasoning_content=None,
+                        tool_calls=[
+                            _ns(
+                                index=0,
+                                id="call_1",
+                                type="function",
+                                function=_ns(
+                                    name="lookup_weather",
+                                    arguments='{"city":"Shanghai"}',
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        ),
+        _ns(
+            id="chunk-2",
+            created=2,
+            model="glm-5",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason="tool_calls",
+                    delta=_ns(
+                        content=None,
+                        role=None,
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    async def fake_stream_json(_body):
+        for chunk in chunks:
+            yield chunk
+
+    monkeypatch.setattr(provider, "_async_stream_json", fake_stream_json)
+
+    stream = await provider.chat_completions_create(
+        model="glm-5",
+        messages=[{"role": "user", "content": "Hello!"}],
+        stream=True,
+    )
+    streamed_chunks = [chunk async for chunk in stream]
+
+    assert streamed_chunks[0].choices[0].delta.tool_calls is not None
+    assert streamed_chunks[-1].choices[0].stop_info.reason.value == "tool_call"
+    assert streamed_chunks[-1].choices[0].stop_info.metadata["tool_calls_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_glm_provider_streaming_raises_on_network_error(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+
+    provider = GlmProvider()
+
+    chunks = [
+        _ns(
+            id="chunk-1",
+            created=1,
+            model="glm-5",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason="network_error",
+                    delta=_ns(
+                        content=None,
+                        role="assistant",
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    async def fake_stream_json(_body):
+        for chunk in chunks:
+            yield chunk
+
+    monkeypatch.setattr(provider, "_async_stream_json", fake_stream_json)
+
+    stream = await provider.chat_completions_create(
+        model="glm-5",
+        messages=[{"role": "user", "content": "Hello!"}],
+        stream=True,
+    )
+
+    with pytest.raises(LLMError, match="network_error"):
+        async for _chunk in stream:
+            pass
+
+
+@pytest.mark.asyncio
 async def test_glm_provider_parses_async_sse(monkeypatch):
     monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
     provider = GlmProvider()
@@ -369,3 +486,37 @@ def test_glm_capture_response_returns_structured_result(monkeypatch):
 
     assert captured.canonical_message.content == "done"
     assert captured.replay_metadata["reasoning_content"]["provider"] == "glm"
+
+
+@pytest.mark.asyncio
+async def test_glm_provider_non_stream_raises_on_network_error(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+
+    provider = GlmProvider()
+
+    mock_response = _ns(
+        id="glm-response-id",
+        created=1234567890,
+        model="glm-5",
+        usage=_ns(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        choices=[
+            _ns(
+                index=0,
+                finish_reason="network_error",
+                message=_ns(
+                    content="",
+                    role="assistant",
+                    reasoning_content=None,
+                    tool_calls=None,
+                ),
+            )
+        ],
+    )
+    mock_post = AsyncMock(return_value=mock_response)
+    monkeypatch.setattr(provider, "_async_post_json", mock_post)
+
+    with pytest.raises(LLMError, match="network_error"):
+        await provider.chat_completions_create(
+            model="glm-5",
+            messages=[{"role": "user", "content": "Hello!"}],
+        )

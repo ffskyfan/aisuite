@@ -32,6 +32,13 @@ def test_stop_reason_maps_gemini_protocol_errors():
     assert stop_info.metadata["error_class"] == "protocol_error"
 
 
+def test_stop_reason_maps_openai_network_error_to_error():
+    stop_info = stop_reason_manager.map_stop_reason("openai", "network_error", {})
+    assert stop_info.reason == StopReason.ERROR
+    assert stop_info.metadata["error_class"] == "network_error"
+    assert stop_info.metadata["error_message"] == "上游网络错误或流式连接中断"
+
+
 @patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
 def test_openai_build_replay_view_reads_versioned_responses_payload(_mock_client_cls):
     provider = OpenaiProvider(api_key="test-openai-key")
