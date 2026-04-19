@@ -61,6 +61,9 @@ async def test_glm_provider_non_stream(monkeypatch):
                 "reasoning_content": {
                     "thinking": "previous reasoning trace",
                     "provider": "glm",
+                    "raw_data": provider._build_reasoning_replay_payload(
+                        "previous reasoning trace"
+                    ),
                 },
             },
             {"role": "user", "content": "Hello!"},
@@ -207,6 +210,10 @@ async def test_glm_provider_streaming(monkeypatch):
     assert streamed_chunks[-1].choices[0].finish_reason == "stop"
     assert streamed_chunks[-1].metadata["usage"]["total_tokens"] == 15
     assert streamed_chunks[-1].choices[0].stop_info.reason.value == "complete"
+    accumulated_thinking = provider._get_accumulated_thinking()
+    assert accumulated_thinking["thinking"] == "think-1"
+    assert accumulated_thinking["raw_data"]["provider"] == "glm"
+    assert accumulated_thinking["raw_data"]["payload"]["reasoning_content"] == "think-1"
 
 
 @pytest.mark.asyncio
@@ -439,6 +446,9 @@ def test_glm_build_replay_view_preserves_reasoning_content(monkeypatch):
                     "reasoning_content": {
                         "thinking": "cached reasoning",
                         "provider": "glm",
+                        "raw_data": provider._build_reasoning_replay_payload(
+                            "cached reasoning"
+                        ),
                     },
                 },
                 {"role": "user", "content": "hi"},
@@ -447,6 +457,30 @@ def test_glm_build_replay_view_preserves_reasoning_content(monkeypatch):
 
     assert replay_build.replay_mode == "canonical_with_reasoning"
     assert replay_build.request_view[0]["reasoning_content"] == "cached reasoning"
+
+
+def test_glm_build_replay_view_drops_reasoning_without_raw_payload(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+
+    with patch("aisuite.providers.glm_provider.ZhipuAiClient"):
+        provider = GlmProvider()
+
+        replay_build = provider.build_replay_view(
+            "glm-5",
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": {
+                        "thinking": "legacy reasoning",
+                        "provider": "glm",
+                    },
+                },
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+    assert "reasoning_content" not in replay_build.request_view[0]
 
 
 def test_glm_validate_replay_window_reports_missing_tool_call_id(monkeypatch):
@@ -461,6 +495,30 @@ def test_glm_validate_replay_window_reports_missing_tool_call_id(monkeypatch):
 
     assert result.ok is False
     assert any(diag.code == "missing_tool_call_id" for diag in result.diagnostics)
+
+
+def test_glm_validate_replay_window_marks_missing_reasoning_raw_replay_as_degraded(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+
+    with patch("aisuite.providers.glm_provider.ZhipuAiClient"):
+        provider = GlmProvider()
+        result = provider.validate_replay_window(
+            "glm-5",
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": {
+                        "thinking": "legacy reasoning",
+                        "provider": "glm",
+                    },
+                }
+            ],
+        )
+
+    assert result.ok is True
+    assert result.degraded is True
+    assert any(diag.code == "missing_reasoning_raw_replay" for diag in result.diagnostics)
 
 
 def test_glm_capture_response_returns_structured_result(monkeypatch):

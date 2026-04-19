@@ -54,6 +54,7 @@ class GlmProvider(Provider):
         self.client = ZhipuAiClient(**client_config)
 
         self._streaming_tool_calls: Dict[int, Dict[str, Any]] = {}
+        self._streaming_reasoning = ""
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
 
@@ -250,9 +251,25 @@ class GlmProvider(Provider):
                                 metadata={"tool_call_id": tool_call_id},
                             )
                         )
+            if role == "assistant" and msg.get("reasoning_content") is not None and not self._has_valid_reasoning_replay_payload(
+                msg.get("reasoning_content")
+            ):
+                diagnostics.append(
+                    ReplayDiagnostic(
+                        code="missing_reasoning_raw_replay",
+                        message=(
+                            "GLM preserved thinking requires assistant reasoning_content "
+                            "to carry provider-native raw replay payload."
+                        ),
+                        severity="warning",
+                        provider="glm",
+                        metadata={"role": "assistant"},
+                    )
+                )
 
         return ReplayValidationResult(
             ok=not any(diag.severity == "error" for diag in diagnostics),
+            degraded=any(diag.severity == "warning" for diag in diagnostics),
             diagnostics=tuple(diagnostics),
         )
 
@@ -301,9 +318,11 @@ class GlmProvider(Provider):
 
             reasoning_content = prepared.get("reasoning_content")
             if reasoning_content is not None:
-                prepared["reasoning_content"] = self._extract_reasoning_input(
-                    reasoning_content
-                )
+                extracted_reasoning = self._extract_reasoning_input(reasoning_content)
+                if extracted_reasoning is None:
+                    prepared.pop("reasoning_content", None)
+                else:
+                    prepared["reasoning_content"] = extracted_reasoning
 
             prepared_messages.append(prepared)
 
@@ -334,33 +353,48 @@ class GlmProvider(Provider):
         return prepared
 
     def _extract_reasoning_input(self, reasoning_content: Any) -> Optional[str]:
+        return self._extract_reasoning_replay_text(reasoning_content)
+
+    def _extract_reasoning_replay_text(self, reasoning_content: Any) -> Optional[str]:
         if reasoning_content is None:
             return None
 
+        raw_data = None
         if isinstance(reasoning_content, ReasoningContent):
             raw_data = reasoning_content.raw_data or {}
-            envelope = get_replay_payload(raw_data)
-            if envelope and envelope.get("provider") == "glm":
-                payload = unwrap_replay_payload(raw_data)
-                if isinstance(payload, dict) and payload.get("reasoning_content"):
-                    return payload["reasoning_content"]
-            return raw_data.get("reasoning_content") or reasoning_content.thinking
-
-        if isinstance(reasoning_content, dict):
+        elif isinstance(reasoning_content, dict):
             raw_data = reasoning_content.get("raw_data") or {}
-            envelope = get_replay_payload(raw_data)
-            if envelope and envelope.get("provider") == "glm":
-                payload = unwrap_replay_payload(raw_data)
-                if isinstance(payload, dict) and payload.get("reasoning_content"):
-                    return payload["reasoning_content"]
-            return (
-                raw_data.get("reasoning_content")
-                or reasoning_content.get("thinking")
-                or reasoning_content.get("text")
-                or str(reasoning_content)
-            )
+        else:
+            return None
 
-        return str(reasoning_content)
+        envelope = get_replay_payload(raw_data)
+        if envelope and envelope.get("provider") == "glm":
+            payload = unwrap_replay_payload(raw_data)
+            if isinstance(payload, dict) and payload.get("reasoning_content"):
+                return payload["reasoning_content"]
+
+        legacy_reasoning_content = raw_data.get("reasoning_content")
+        if isinstance(legacy_reasoning_content, str) and legacy_reasoning_content:
+            return legacy_reasoning_content
+
+        return None
+
+    def _has_valid_reasoning_replay_payload(self, reasoning_content: Any) -> bool:
+        return self._extract_reasoning_replay_text(reasoning_content) is not None
+
+    def _accumulate_reasoning_content(self, reasoning_text: str) -> None:
+        if reasoning_text:
+            self._streaming_reasoning += reasoning_text
+
+    def _get_accumulated_thinking(self) -> Dict[str, Any]:
+        thinking_text = self._streaming_reasoning
+        self._streaming_reasoning = ""
+        if not thinking_text:
+            return {"thinking": "", "raw_data": None}
+        return {
+            "thinking": thinking_text,
+            "raw_data": self._build_reasoning_replay_payload(thinking_text),
+        }
 
     def build_replay_view(self, model: str, messages: list, **kwargs):
         validation = self.validate_replay_window(model, messages, **kwargs)
@@ -620,6 +654,7 @@ class GlmProvider(Provider):
         try:
             if stream:
                 self._streaming_tool_calls = {}
+                self._streaming_reasoning = ""
                 self._stream_content_length = 0
                 self._stream_tool_calls_count = 0
 
@@ -647,6 +682,10 @@ class GlmProvider(Provider):
                             delta = getattr(choice, "delta", SimpleNamespace())
                             if getattr(delta, "content", None):
                                 self._stream_content_length += len(delta.content)
+                            if getattr(delta, "reasoning_content", None):
+                                self._accumulate_reasoning_content(
+                                    delta.reasoning_content
+                                )
 
                             converted_tool_calls = (
                                 self._accumulate_and_convert_tool_calls(delta)
