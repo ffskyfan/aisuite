@@ -31,9 +31,13 @@ class DeepseekProvider(Provider):
         config.setdefault("api_key", os.getenv("DEEPSEEK_API_KEY"))
         if not config["api_key"]:
             raise ValueError(
-                "DeepSeek API key is missing. Please provide it in the config or set the OPENAI_API_KEY environment variable."
+                "DeepSeek API key is missing. Please provide it in the config or set the DEEPSEEK_API_KEY environment variable."
             )
-        config["base_url"] = "https://api.deepseek.com"
+        config["base_url"] = (
+            config.get("base_url")
+            or os.getenv("DEEPSEEK_BASE_URL")
+            or "https://api.deepseek.com"
+        )
 
         # NOTE: We could choose to remove above lines for api_key since OpenAI will automatically
         # infer certain values from the environment variables.
@@ -346,6 +350,27 @@ class DeepseekProvider(Provider):
             },
         }
 
+    def _prepare_request_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize DeepSeek-specific request controls for the OpenAI SDK."""
+        prepared = dict(kwargs)
+
+        thinking = prepared.pop("thinking", None)
+        if thinking is not None:
+            extra_body = dict(prepared.get("extra_body") or {})
+            extra_body["thinking"] = thinking
+            prepared["extra_body"] = extra_body
+
+        reasoning = prepared.pop("reasoning", None)
+        if reasoning is not None and "reasoning_effort" not in prepared:
+            if isinstance(reasoning, dict):
+                reasoning_effort = reasoning.get("effort")
+            else:
+                reasoning_effort = reasoning
+            if reasoning_effort:
+                prepared["reasoning_effort"] = reasoning_effort
+
+        return prepared
+
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         # Any exception raised by OpenAI will be returned to the caller.
@@ -358,6 +383,8 @@ class DeepseekProvider(Provider):
             replay_build = self.build_replay_view(model, messages, **kwargs)
             prepared_messages = replay_build.request_view
 
+        request_kwargs = self._prepare_request_kwargs(kwargs)
+
         if stream:
             # Reset streaming state
             self._streaming_tool_calls = {}
@@ -365,7 +392,7 @@ class DeepseekProvider(Provider):
             self._stream_tool_calls_count = 0
 
             # Ensure usage is included in streaming responses
-            stream_kwargs = kwargs.copy()
+            stream_kwargs = request_kwargs.copy()
             stream_options = stream_kwargs.get("stream_options") or {}
             if "include_usage" not in stream_options:
                 stream_options["include_usage"] = True
@@ -451,7 +478,7 @@ class DeepseekProvider(Provider):
                 model=model,
                 messages=prepared_messages,
                 stream=False,
-                **kwargs,  # Pass any additional arguments to the OpenAI API
+                **request_kwargs,  # Pass any additional arguments to the OpenAI API
             )
 
             # Create choices with stop_info

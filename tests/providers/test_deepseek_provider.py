@@ -22,7 +22,7 @@ async def test_deepseek_provider_non_stream_replays_reasoning_content():
     mock_response = _ns(
         id="deepseek-response-id",
         created=1234567890,
-        model="deepseek-reasoner",
+        model="deepseek-v4-pro",
         usage=_ns(
             prompt_cache_hit_tokens=3,
             prompt_cache_miss_tokens=7,
@@ -60,7 +60,7 @@ async def test_deepseek_provider_non_stream_replays_reasoning_content():
                 },
                 {"role": "user", "content": "Hello!"},
             ],
-            model="deepseek-reasoner",
+            model="deepseek-v4-pro",
             temperature=0.2,
         )
 
@@ -73,7 +73,7 @@ async def test_deepseek_provider_non_stream_replays_reasoning_content():
             },
             {"role": "user", "content": "Hello!"},
         ],
-        model="deepseek-reasoner",
+        model="deepseek-v4-pro",
         stream=False,
         temperature=0.2,
     )
@@ -89,7 +89,7 @@ def test_deepseek_build_replay_view_preserves_reasoning_content():
     provider = DeepseekProvider(api_key="test-api-key")
 
     replay_build = provider.build_replay_view(
-        "deepseek-reasoner",
+        "deepseek-v4-pro",
         [
             {
                 "role": "assistant",
@@ -117,7 +117,7 @@ def test_deepseek_validate_replay_window_reports_missing_tool_call_id():
     provider = DeepseekProvider(api_key="test-api-key")
 
     result = provider.validate_replay_window(
-        "deepseek-chat",
+        "deepseek-v4-flash",
         [{"role": "tool", "content": "result"}],
     )
 
@@ -150,9 +150,53 @@ def test_deepseek_capture_response_returns_structured_result():
         ]
     )
 
-    captured = provider.capture_response(response, model="deepseek-reasoner")
+    captured = provider.capture_response(response, model="deepseek-v4-pro")
 
     assert captured.canonical_message.content == "done"
     assert (
         captured.replay_metadata["reasoning_content"]["provider"] == "deepseek"
     )
+
+
+def test_deepseek_provider_preserves_custom_base_url():
+    with patch("aisuite.providers.deepseek_provider.openai.AsyncOpenAI") as mock_client:
+        DeepseekProvider(api_key="test-api-key", base_url="https://api.deepseek.com/beta")
+
+    assert mock_client.call_args.kwargs["base_url"] == "https://api.deepseek.com/beta"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_moves_thinking_to_extra_body():
+    provider = DeepseekProvider(api_key="test-api-key")
+    mock_response = _ns(
+        id="deepseek-response-id",
+        created=1234567890,
+        model="deepseek-v4-flash",
+        usage=None,
+        choices=[
+            _ns(
+                index=0,
+                finish_reason="stop",
+                message=_ns(
+                    content="done",
+                    role="assistant",
+                    reasoning_content=None,
+                    tool_calls=None,
+                ),
+            )
+        ],
+    )
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=mock_response),
+    ) as mock_create:
+        await provider.chat_completions_create(
+            messages=[{"role": "user", "content": "Hello!"}],
+            model="deepseek-v4-flash",
+            thinking={"type": "disabled"},
+        )
+
+    mock_create.assert_called_once()
+    assert mock_create.call_args.kwargs["extra_body"] == {"thinking": {"type": "disabled"}}

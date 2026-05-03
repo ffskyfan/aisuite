@@ -132,7 +132,7 @@ async def chat_with_streaming(provider, messages):
     
     # First API call with streaming
     response = await provider.chat_completions_create(
-        model="deepseek-chat",
+        model="deepseek-v4-flash",
         messages=messages,
         tools=TOOLS,
         stream=True
@@ -184,7 +184,7 @@ async def chat_with_streaming(provider, messages):
         print("\n🤖 Assistant (after tool calls): ", end="", flush=True)
         
         response = await provider.chat_completions_create(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=messages,
             stream=True
         )
@@ -204,7 +204,7 @@ async def chat_without_streaming(provider, messages):
     
     # API call without streaming
     response = await provider.chat_completions_create(
-        model="deepseek-chat",
+        model="deepseek-v4-flash",
         messages=messages,
         tools=TOOLS,
         stream=False
@@ -238,7 +238,7 @@ async def chat_without_streaming(provider, messages):
         
         # Get final response
         response = await provider.chat_completions_create(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=messages,
             stream=False
         )

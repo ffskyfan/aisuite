@@ -33,7 +33,7 @@ async def test_deepseek_streaming_response(deepseek_client):
     
     # Capture streamed response
     stream = await deepseek_client.chat.completions.create(
-        model="deepseek:deepseek-chat",
+        model="deepseek:deepseek-v4-flash",
         messages=messages,
         stream=True
     )
@@ -93,7 +93,7 @@ async def test_stream_timeout(deepseek_client):
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
             deepseek_client.chat.completions.create(
-            model="deepseek:deepseek-chat",
+            model="deepseek:deepseek-v4-flash",
                 messages=messages,
                 stream=True
             ),

@@ -8,7 +8,7 @@ export DEEPSEEK_API_KEY="your-deepseek-api-key"
 
 ## Create a Chat Completion
 
-(Note: The DeepSeek uses an API format consistent with OpenAI, hence why we need to install OpenAI, there is no DeepSeek Library at least not for now)
+DeepSeek uses an API format compatible with OpenAI, so the `openai` Python client is required.
 
 Install the `openai` Python client:
 
@@ -28,7 +28,7 @@ import aisuite as ai
 client = ai.Client()
 
 provider = "deepseek"
-model_id = "deepseek-chat"
+model_id = "deepseek-v4-flash"
 
 messages = [
     {"role": "system", "content": "You are a helpful assistant."},
@@ -41,6 +41,34 @@ response = client.chat.completions.create(
 )
 
 print(response.choices[0].message.content)
+```
+
+## DeepSeek V4 Models
+
+The current DeepSeek API model IDs are:
+
+- `deepseek-v4-flash`: fast, economical default.
+- `deepseek-v4-pro`: higher quality model for harder reasoning, coding, and agent work.
+
+DeepSeek V4 defaults to thinking mode. To explicitly control it through `aisuite`, pass `thinking`; the provider will forward it via the OpenAI SDK `extra_body` field:
+
+```python
+response = client.chat.completions.create(
+    model="deepseek:deepseek-v4-flash",
+    messages=messages,
+    thinking={"type": "disabled"},
+)
+```
+
+For thinking mode, use `reasoning_effort` with `high` or `max`:
+
+```python
+response = client.chat.completions.create(
+    model="deepseek:deepseek-v4-pro",
+    messages=messages,
+    thinking={"type": "enabled"},
+    reasoning_effort="high",
+)
 ```
 
 Happy coding! If you’d like to contribute, please read our [Contributing Guide](../CONTRIBUTING.md).
