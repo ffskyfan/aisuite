@@ -48,6 +48,7 @@ class DeepseekProvider(Provider):
 
         # State for accumulating streaming tool calls
         self._streaming_tool_calls = {}
+        self._streaming_reasoning = ""
 
         # Track accumulated content for streaming responses
         # Used to provide accurate metadata in stop_info
@@ -63,9 +64,47 @@ class DeepseekProvider(Provider):
             empty_actionless_stop_is_retryable=False,
         )
 
+    def _is_thinking_enabled(self, kwargs: Dict[str, Any]) -> bool:
+        thinking = kwargs.get("thinking")
+        extra_body = kwargs.get("extra_body")
+        if thinking is None and isinstance(extra_body, dict):
+            thinking = extra_body.get("thinking")
+        if isinstance(thinking, dict):
+            return thinking.get("type") == "enabled"
+        return bool(thinking)
+
+    def _has_reasoning_input(self, reasoning_content: Any) -> bool:
+        if reasoning_content is None:
+            return False
+        if isinstance(reasoning_content, str):
+            return bool(reasoning_content.strip())
+        if isinstance(reasoning_content, ReasoningContent):
+            value = self._extract_reasoning_input(reasoning_content)
+            return isinstance(value, str) and bool(value.strip())
+        if isinstance(reasoning_content, dict):
+            raw_data = reasoning_content.get("raw_data") or {}
+            envelope = get_replay_payload(raw_data)
+            if envelope and envelope.get("provider") == "deepseek":
+                payload = unwrap_replay_payload(raw_data)
+                if isinstance(payload, dict) and isinstance(
+                    payload.get("reasoning_content"), str
+                ):
+                    return bool(payload["reasoning_content"].strip())
+            for key in ("reasoning_content", "thinking", "text"):
+                value = reasoning_content.get(key)
+                if isinstance(value, str) and value.strip():
+                    return True
+            if isinstance(raw_data, dict):
+                value = raw_data.get("reasoning_content")
+                if isinstance(value, str) and value.strip():
+                    return True
+            return False
+        return False
+
     def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
         diagnostics: list[ReplayDiagnostic] = []
         normalized_messages: list[dict[str, Any]] = []
+        thinking_enabled = self._is_thinking_enabled(kwargs)
         for msg in messages:
             if isinstance(msg, dict):
                 normalized_messages.append(msg)
@@ -117,6 +156,20 @@ class DeepseekProvider(Provider):
                                 metadata={"tool_call_id": tool_call_id},
                             )
                         )
+                if thinking_enabled and not self._has_reasoning_input(
+                    msg.get("reasoning_content")
+                ):
+                    diagnostics.append(
+                        ReplayDiagnostic(
+                            code="missing_reasoning_content",
+                            message=(
+                                "DeepSeek thinking mode requires assistant "
+                                "tool-call replay to include reasoning_content."
+                            ),
+                            provider="deepseek",
+                            metadata={"role": "assistant"},
+                        )
+                    )
 
         return ReplayValidationResult(
             ok=not any(diag.severity == "error" for diag in diagnostics),
@@ -183,6 +236,20 @@ class DeepseekProvider(Provider):
             )
 
         return str(reasoning_content)
+
+    def _accumulate_reasoning_content(self, reasoning_text: str) -> None:
+        if reasoning_text:
+            self._streaming_reasoning += reasoning_text
+
+    def _get_accumulated_thinking(self) -> Dict[str, Any]:
+        thinking_text = self._streaming_reasoning
+        self._streaming_reasoning = ""
+        if not thinking_text:
+            return {"thinking": "", "raw_data": None}
+        return {
+            "thinking": thinking_text,
+            "raw_data": self._build_reasoning_replay_payload(thinking_text),
+        }
 
     def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         prepared_messages = []
@@ -388,6 +455,7 @@ class DeepseekProvider(Provider):
         if stream:
             # Reset streaming state
             self._streaming_tool_calls = {}
+            self._streaming_reasoning = ""
             self._stream_content_length = 0
             self._stream_tool_calls_count = 0
 
@@ -419,6 +487,9 @@ class DeepseekProvider(Provider):
                             # Accumulate content and tool calls for accurate metadata
                             if choice.delta.content:
                                 self._stream_content_length += len(choice.delta.content)
+                            reasoning_content = getattr(choice.delta, "reasoning_content", None)
+                            if reasoning_content:
+                                self._accumulate_reasoning_content(reasoning_content)
 
                             accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
                             if accumulated_tool_calls:
@@ -450,7 +521,7 @@ class DeepseekProvider(Provider):
                                         content=choice.delta.content,
                                         role=choice.delta.role,
                                         tool_calls=accumulated_tool_calls,
-                                        reasoning_content=getattr(choice.delta, "reasoning_content", None),
+                                        reasoning_content=reasoning_content,
                                     ),
                                     finish_reason=choice.finish_reason,
                                     stop_info=stop_info,

@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from aisuite.framework.message_normalizer import MessageNormalizer
 from aisuite.framework.message import ReasoningContent
 from aisuite.providers.deepseek_provider import DeepseekProvider
 
@@ -113,6 +114,21 @@ def test_deepseek_build_replay_view_preserves_reasoning_content():
     assert replay_build.request_view[0]["reasoning_content"] == "cached reasoning"
 
 
+def test_deepseek_message_normalizer_preserves_reasoning_content():
+    normalized = MessageNormalizer.normalize_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": {"thinking": "keep me"},
+            }
+        ],
+        "deepseek:deepseek-v4-pro",
+    )
+
+    assert normalized[0]["reasoning_content"]["thinking"] == "keep me"
+
+
 def test_deepseek_validate_replay_window_reports_missing_tool_call_id():
     provider = DeepseekProvider(api_key="test-api-key")
 
@@ -123,6 +139,59 @@ def test_deepseek_validate_replay_window_reports_missing_tool_call_id():
 
     assert result.ok is False
     assert any(diag.code == "missing_tool_call_id" for diag in result.diagnostics)
+
+
+def test_deepseek_validate_replay_window_requires_reasoning_for_thinking_tool_calls():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    result = provider.validate_replay_window(
+        "deepseek-v4-pro",
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "user", "content": "continue"},
+        ],
+        extra_body={"thinking": {"type": "enabled"}},
+    )
+
+    assert result.ok is False
+    assert any(diag.code == "missing_reasoning_content" for diag in result.diagnostics)
+
+
+def test_deepseek_validate_replay_window_allows_non_thinking_tool_calls_without_reasoning():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    result = provider.validate_replay_window(
+        "deepseek-v4-pro",
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "user", "content": "continue"},
+        ],
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+
+    assert result.ok is True
 
 
 def test_deepseek_capture_response_returns_structured_result():
@@ -200,3 +269,90 @@ async def test_deepseek_provider_moves_thinking_to_extra_body():
 
     mock_create.assert_called_once()
     assert mock_create.call_args.kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_streaming_accumulates_reasoning_content():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    chunks = [
+        _ns(
+            id="chunk-1",
+            created=1,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason=None,
+                    delta=_ns(
+                        content=None,
+                        role="assistant",
+                        reasoning_content="think-1",
+                        tool_calls=None,
+                    ),
+                )
+            ],
+        ),
+        _ns(
+            id="chunk-2",
+            created=2,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason=None,
+                    delta=_ns(
+                        content="done",
+                        role=None,
+                        reasoning_content=" think-2",
+                        tool_calls=None,
+                    ),
+                )
+            ],
+        ),
+        _ns(
+            id="chunk-3",
+            created=3,
+            model="deepseek-v4-pro",
+            usage=_ns(prompt_tokens=11, completion_tokens=4, total_tokens=15),
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason="stop",
+                    delta=_ns(
+                        content=None,
+                        role=None,
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    async def fake_response():
+        for chunk in chunks:
+            yield chunk
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=fake_response()),
+    ):
+        stream = await provider.chat_completions_create(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Hello!"}],
+            stream=True,
+        )
+        streamed_chunks = [chunk async for chunk in stream]
+
+    assert streamed_chunks[0].choices[0].delta.reasoning_content == "think-1"
+    assert streamed_chunks[1].choices[0].delta.reasoning_content == " think-2"
+    assert streamed_chunks[-1].metadata["usage"]["total_tokens"] == 15
+
+    accumulated_thinking = provider._get_accumulated_thinking()
+    assert accumulated_thinking["thinking"] == "think-1 think-2"
+    assert accumulated_thinking["raw_data"]["provider"] == "deepseek"
+    assert accumulated_thinking["raw_data"]["payload"]["reasoning_content"] == "think-1 think-2"

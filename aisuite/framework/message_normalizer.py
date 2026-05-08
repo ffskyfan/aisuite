@@ -30,6 +30,7 @@ class MessageNormalizer:
             "preserve_reasoning": True,  # GPT-5 can preserve reasoning
         },
         "glm": {"remove_fields": ["refusal"], "preserve_reasoning": True},
+        "deepseek": {"remove_fields": ["refusal"], "preserve_reasoning": True},
         "anthropic": {
             "remove_fields": [],
             "preserve_reasoning": False,  # Claude handles reasoning differently
