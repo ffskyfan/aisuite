@@ -81,6 +81,9 @@ class DeepseekProvider(Provider):
         if isinstance(reasoning_content, ReasoningContent):
             value = self._extract_reasoning_input(reasoning_content)
             return isinstance(value, str) and bool(value.strip())
+        if hasattr(reasoning_content, "thinking"):
+            value = self._extract_reasoning_input(reasoning_content)
+            return isinstance(value, str) and bool(value.strip())
         if isinstance(reasoning_content, dict):
             raw_data = reasoning_content.get("raw_data") or {}
             envelope = get_replay_payload(raw_data)
@@ -220,6 +223,18 @@ class DeepseekProvider(Provider):
                 if isinstance(payload, dict) and payload.get("reasoning_content"):
                     return payload["reasoning_content"]
             return raw_data.get("reasoning_content") or reasoning_content.thinking
+
+        if hasattr(reasoning_content, "thinking"):
+            raw_data = getattr(reasoning_content, "raw_data", None) or {}
+            envelope = get_replay_payload(raw_data)
+            if envelope and envelope.get("provider") == "deepseek":
+                payload = unwrap_replay_payload(raw_data)
+                if isinstance(payload, dict) and payload.get("reasoning_content"):
+                    return payload["reasoning_content"]
+            if isinstance(raw_data, dict) and raw_data.get("reasoning_content"):
+                return raw_data["reasoning_content"]
+            thinking = getattr(reasoning_content, "thinking", None)
+            return thinking if isinstance(thinking, str) else None
 
         if isinstance(reasoning_content, dict):
             raw_data = reasoning_content.get("raw_data") or {}

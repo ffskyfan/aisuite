@@ -114,6 +114,44 @@ def test_deepseek_build_replay_view_preserves_reasoning_content():
     assert replay_build.request_view[0]["reasoning_content"] == "cached reasoning"
 
 
+def test_deepseek_build_replay_view_accepts_duck_typed_reasoning_content():
+    provider = DeepseekProvider(api_key="test-api-key")
+    stored_reasoning = _ns(
+        thinking="cached reasoning",
+        provider="deepseek",
+        raw_data={
+            "provider": "deepseek",
+            "version": 1,
+            "kind": "deepseek_reasoning_text",
+            "payload": {"reasoning_content": "cached reasoning"},
+        },
+    )
+
+    replay_build = provider.build_replay_view(
+        "deepseek-v4-pro",
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": stored_reasoning,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "user", "content": "continue"},
+        ],
+        extra_body={"thinking": {"type": "enabled"}},
+    )
+
+    assert replay_build.replay_mode == "canonical_with_reasoning"
+    assert replay_build.request_view[0]["reasoning_content"] == "cached reasoning"
+
+
 def test_deepseek_message_normalizer_preserves_reasoning_content():
     normalized = MessageNormalizer.normalize_messages(
         [
