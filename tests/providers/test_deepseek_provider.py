@@ -394,3 +394,81 @@ async def test_deepseek_provider_streaming_accumulates_reasoning_content():
     assert accumulated_thinking["thinking"] == "think-1 think-2"
     assert accumulated_thinking["raw_data"]["provider"] == "deepseek"
     assert accumulated_thinking["raw_data"]["payload"]["reasoning_content"] == "think-1 think-2"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_streaming_marks_pending_malformed_tool_call_retryable():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    chunks = [
+        _ns(
+            id="chunk-1",
+            created=1,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason=None,
+                    delta=_ns(
+                        content=None,
+                        role="assistant",
+                        reasoning_content=None,
+                        tool_calls=[
+                            _ns(
+                                index=0,
+                                id="call_1",
+                                type="function",
+                                function=_ns(name="edit_file", arguments='{"path":'),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        ),
+        _ns(
+            id="chunk-2",
+            created=2,
+            model="deepseek-v4-pro",
+            usage=_ns(prompt_tokens=11, completion_tokens=4, total_tokens=15),
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason="tool_calls",
+                    delta=_ns(
+                        content=None,
+                        role=None,
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    async def fake_response():
+        for chunk in chunks:
+            yield chunk
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=fake_response()),
+    ):
+        stream = await provider.chat_completions_create(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Hello!"}],
+            stream=True,
+        )
+        streamed_chunks = [chunk async for chunk in stream]
+
+    assert streamed_chunks[-1].choices[0].finish_reason == "tool_calls"
+    assert streamed_chunks[-1].choices[0].delta.tool_calls is None
+    assert streamed_chunks[-1].choices[0].stop_info.reason.value == "tool_call_error"
+    assert (
+        streamed_chunks[-1].choices[0].stop_info.metadata["error_class"]
+        == "malformed_streaming_tool_call_arguments"
+    )
+    assert streamed_chunks[-1].choices[0].stop_info.metadata["retryable"] is True
+    assert streamed_chunks[-1].choices[0].stop_info.metadata["pending_tool_calls"][0]["function_name"] == "edit_file"
+    assert streamed_chunks[-1].choices[0].stop_info.metadata["pending_tool_calls"][0]["parse_error"]

@@ -16,7 +16,7 @@ from aisuite.framework.replay_payload import (
     get_replay_payload,
     unwrap_replay_payload,
 )
-from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.framework.stop_reason import StopInfo, StopReason, stop_reason_manager
 
 
 class DeepseekProvider(Provider):
@@ -453,6 +453,66 @@ class DeepseekProvider(Provider):
 
         return prepared
 
+    @staticmethod
+    def _truncate_string(value: str, limit: int = 500) -> str:
+        if len(value) <= limit:
+            return value
+        return value[:limit] + f"...<truncated {len(value) - limit} chars>"
+
+    def _summarize_pending_tool_call_errors(self) -> List[Dict[str, Any]]:
+        pending: List[Dict[str, Any]] = []
+        for index, tool_call in sorted(
+            self._streaming_tool_calls.items(), key=lambda item: str(item[0])
+        ):
+            function = tool_call.get("function") or {}
+            arguments = function.get("arguments") or ""
+            parse_error = None
+            if arguments:
+                try:
+                    json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    parse_error = f"{exc.msg} at position {exc.pos}"
+            else:
+                parse_error = "missing function.arguments"
+
+            pending.append(
+                {
+                    "index": index,
+                    "id": tool_call.get("id") or None,
+                    "type": tool_call.get("type") or None,
+                    "function_name": function.get("name") or None,
+                    "arguments_len": len(arguments),
+                    "arguments_preview": self._truncate_string(arguments, 240),
+                    "parse_error": parse_error,
+                }
+            )
+        return pending
+
+    def _build_pending_tool_call_error_stop_info(
+        self,
+        *,
+        finish_reason: str,
+        model: str,
+    ) -> StopInfo:
+        pending_tool_calls = self._summarize_pending_tool_call_errors()
+        metadata = {
+            "has_content": self._stream_content_length > 0,
+            "content_length": self._stream_content_length,
+            "tool_calls_count": self._stream_tool_calls_count,
+            "pending_tool_calls_count": len(pending_tool_calls),
+            "pending_tool_calls": pending_tool_calls,
+            "finish_reason": finish_reason,
+            "model": model,
+            "provider": "deepseek",
+            "error_class": "malformed_streaming_tool_call_arguments",
+            "error_message": "模型生成了工具调用，但工具参数不是合法 JSON",
+            "retryable": True,
+        }
+        return StopInfo(
+            reason=StopReason.TOOL_CALL_ERROR,
+            original_reason=finish_reason,
+            metadata=metadata,
+        )
 
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         # Any exception raised by OpenAI will be returned to the caller.
@@ -490,7 +550,9 @@ class DeepseekProvider(Provider):
 
             async def stream_generator():
                 stream_usage = None
+                chunk_index = 0
                 async for chunk in response:
+                    chunk_index += 1
                     # Capture usage from streaming chunks (only appears on final chunk)
                     if hasattr(chunk, "usage") and chunk.usage:
                         stream_usage = self._normalize_usage(chunk.usage) or stream_usage
@@ -525,6 +587,15 @@ class DeepseekProvider(Provider):
                                     }
                                     stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
                                     stop_info.metadata["provider"] = "deepseek"
+                                elif (
+                                    choice.finish_reason == "tool_calls"
+                                    and not accumulated_tool_calls
+                                    and self._streaming_tool_calls
+                                ):
+                                    stop_info = self._build_pending_tool_call_error_stop_info(
+                                        finish_reason=choice.finish_reason,
+                                        model=chunk.model,
+                                    )
                                 else:
                                     choice_data = {"delta": choice.delta}
                                     stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
