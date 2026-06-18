@@ -512,6 +512,63 @@ def test_openai_validate_replay_window_reports_missing_tool_call_id(_mock_client
 
 
 @patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
+def test_openai_prefixed_gpt5_model_uses_responses_capabilities(_mock_client_cls):
+    provider = OpenaiProvider(api_key="test-openai-key")
+
+    assert provider._should_use_responses_api("openai/gpt-5.4", {}) is True
+    assert provider._supports_reasoning("openai/gpt-5.4") is True
+
+    prepared = provider._prepare_reasoning_kwargs(
+        "openai/gpt-5.4",
+        {
+            "max_tokens": 1024,
+            "reasoning": {"effort": "low"},
+            "verbosity": "medium",
+        },
+    )
+
+    assert prepared["max_completion_tokens"] == 1024
+    assert prepared["reasoning"] == {"effort": "low"}
+    assert prepared["verbosity"] == "medium"
+
+
+@patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
+def test_openai_chat_tool_call_cleaning_drops_internal_extra_content(_mock_client_cls):
+    provider = OpenaiProvider(api_key="test-openai-key")
+    cleaned_messages, _ = provider._clean_messages_for_openai(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_ide_context",
+                            "arguments": "{}",
+                        },
+                        "extra_content": None,
+                        "unexpected_internal_field": "drop me",
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert cleaned_messages[0]["tool_calls"] == [
+        {
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_ide_context",
+                "arguments": "{}",
+            },
+        }
+    ]
+
+
+@patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
 @patch("aisuite.providers.openai_provider.OpenaiProvider.build_replay_view")
 @pytest.mark.asyncio
 async def test_openai_chat_completions_create_uses_replay_override_for_responses(
@@ -544,6 +601,132 @@ async def test_openai_chat_completions_create_uses_replay_override_for_responses
 
     assert result.choices[0].message.content == "done"
     assert mock_create.await_args.kwargs["input"] == override_input
+
+
+@patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
+@pytest.mark.asyncio
+async def test_openai_prefixed_gpt5_chat_create_uses_responses_api(_mock_client_cls):
+    provider = OpenaiProvider(api_key="test-openai-key")
+    response = SimpleNamespace(
+        output_text="done",
+        output=[],
+        id="resp_1",
+        model="openai/gpt-5.4",
+        usage=None,
+    )
+
+    with (
+        patch.object(
+            provider.client.responses,
+            "create",
+            new=AsyncMock(return_value=response),
+        ) as mock_responses_create,
+        patch.object(
+            provider.client.chat.completions,
+            "create",
+            new=AsyncMock(side_effect=AssertionError("chat completions should not be used")),
+        ),
+    ):
+        result = await provider.chat_completions_create(
+            "openai/gpt-5.4",
+            [{"role": "user", "content": "hello"}],
+            max_tokens=1024,
+            reasoning={"effort": "low"},
+        )
+
+    assert result.choices[0].message.content == "done"
+    assert mock_responses_create.await_args.kwargs["model"] == "openai/gpt-5.4"
+    assert mock_responses_create.await_args.kwargs["max_output_tokens"] == 1024
+    assert "max_completion_tokens" not in mock_responses_create.await_args.kwargs
+
+
+@patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
+@pytest.mark.asyncio
+async def test_openai_responses_stream_reads_text_from_completed_response(_mock_client_cls):
+    provider = OpenaiProvider(api_key="test-openai-key")
+    completed_response = SimpleNamespace(
+        id="resp_1",
+        model="openai/gpt-5.4",
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(type="output_text", text="hello from completed")
+                ],
+            )
+        ],
+        usage=None,
+    )
+
+    async def stream():
+        yield SimpleNamespace(
+            type="response.completed",
+            response=completed_response,
+            response_id="resp_1",
+        )
+
+    with patch.object(
+        provider.client.responses,
+        "create",
+        new=AsyncMock(return_value=stream()),
+    ):
+        response_stream = await provider.chat_completions_create(
+            "openai/gpt-5.4",
+            [{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+        chunks = [chunk async for chunk in response_stream]
+
+    assert chunks[0].choices[0].delta.content == "hello from completed"
+    assert chunks[-1].choices[0].stop_info.metadata["has_content"] is True
+    assert chunks[-1].choices[0].stop_info.metadata["content_length"] == len("hello from completed")
+
+
+@patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
+@pytest.mark.asyncio
+async def test_openai_responses_stream_reads_tool_call_from_completed_response(_mock_client_cls):
+    provider = OpenaiProvider(api_key="test-openai-key")
+    completed_response = SimpleNamespace(
+        id="resp_1",
+        model="openai/gpt-5.4",
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                id="fc_123",
+                call_id="call_123",
+                name="get_ide_context",
+                arguments='{"path":"chapter.aifc"}',
+            )
+        ],
+        usage=None,
+    )
+
+    async def stream():
+        yield SimpleNamespace(
+            type="response.completed",
+            response=completed_response,
+            response_id="resp_1",
+        )
+
+    with patch.object(
+        provider.client.responses,
+        "create",
+        new=AsyncMock(return_value=stream()),
+    ):
+        response_stream = await provider.chat_completions_create(
+            "openai/gpt-5.4",
+            [{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+        chunks = [chunk async for chunk in response_stream]
+
+    tool_calls = chunks[0].choices[0].delta.tool_calls
+    assert tool_calls is not None
+    assert tool_calls[0].id == "call_123"
+    assert tool_calls[0].function.name == "get_ide_context"
+    assert tool_calls[0].function.arguments == '{"path":"chapter.aifc"}'
+    assert chunks[-1].choices[0].stop_info.metadata["has_content"] is True
+    assert chunks[-1].choices[0].stop_info.metadata["tool_calls_count"] == 1
 
 
 @patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")

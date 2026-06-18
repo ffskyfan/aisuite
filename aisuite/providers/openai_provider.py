@@ -66,6 +66,23 @@ class OpenaiProvider(Provider):
         self._stream_tool_calls_count = 0
         self._stream_reasoning_buffer = ""
 
+    @staticmethod
+    def _canonical_model_name(model: str) -> str:
+        """Return the OpenAI model id without provider routing prefixes."""
+        normalized = str(model or "").strip()
+        lowered = normalized.lower()
+        for prefix in ("openai/", "openai:"):
+            if lowered.startswith(prefix):
+                return normalized[len(prefix):]
+        return normalized
+
+    def _is_gpt5_model(self, model: str) -> bool:
+        return self._canonical_model_name(model).lower().startswith("gpt-5")
+
+    def _is_o_series_reasoning_model(self, model: str) -> bool:
+        model_name = self._canonical_model_name(model).lower()
+        return model_name.startswith("o1-") or model_name.startswith("o3")
+
     def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
         return ProviderReplayCapabilities(
             needs_exact_turn_replay=False,
@@ -222,14 +239,40 @@ class OpenaiProvider(Provider):
 
         processed_tool_calls = []
         for tc in tool_calls:
-            tc_copy = tc.copy()
-            if 'id' in tc_copy and tc_copy['id']:
-                original_id = tc_copy['id']
+            if isinstance(tc, dict):
+                tc_data = tc
+            elif hasattr(tc, "model_dump"):
+                tc_data = tc.model_dump()
+            else:
+                tc_data = {
+                    "id": getattr(tc, "id", None),
+                    "type": getattr(tc, "type", "function"),
+                    "function": getattr(tc, "function", None),
+                }
+
+            function_data = tc_data.get("function") if isinstance(tc_data, dict) else None
+            if not isinstance(function_data, dict):
+                function_data = {
+                    "name": getattr(function_data, "name", None),
+                    "arguments": getattr(function_data, "arguments", ""),
+                }
+
+            tool_call_id = tc_data.get("id")
+            if tool_call_id:
+                original_id = str(tool_call_id)
                 truncated_id = self._truncate_tool_call_id(original_id)
-                tc_copy['id'] = truncated_id
                 # Store mapping for later restoration
                 id_mapping[truncated_id] = original_id
-            processed_tool_calls.append(tc_copy)
+                tool_call_id = truncated_id
+
+            processed_tool_calls.append({
+                "id": tool_call_id,
+                "type": tc_data.get("type") or "function",
+                "function": {
+                    "name": function_data.get("name"),
+                    "arguments": function_data.get("arguments") or "",
+                },
+            })
 
         return processed_tool_calls
 
@@ -308,21 +351,13 @@ class OpenaiProvider(Provider):
 
     def _supports_reasoning(self, model: str) -> bool:
         """Check if the model supports reasoning parameters."""
-        # o1 series models support reasoning_effort
-        if model.startswith('o1-'):
-            return True
-        # o3 series models support reasoning_effort (including o3, o3-mini, etc.)
-        if model.startswith('o3') or model.startswith('o3-'):
-            return True
-        # GPT-5 series models support reasoning parameter
-        if model.startswith('gpt-5'):
-            return True
-        # Regular GPT models (gpt-4o, gpt-4, etc.) do not support reasoning
-        return False
+        return self._is_gpt5_model(model) or self._is_o_series_reasoning_model(model)
 
     def _prepare_reasoning_kwargs(self, model: str, kwargs: dict) -> dict:
         """Prepare reasoning-related kwargs based on model type."""
         prepared_kwargs = kwargs.copy()
+        is_gpt5 = self._is_gpt5_model(model)
+        is_o_series_reasoning = self._is_o_series_reasoning_model(model)
 
         # If model doesn't support reasoning, remove reasoning-related parameters
         if not self._supports_reasoning(model):
@@ -332,17 +367,14 @@ class OpenaiProvider(Provider):
             return prepared_kwargs
 
         # For reasoning models, handle special parameter requirements
-        if (model.startswith('gpt-5') or
-            model.startswith('o1-') or
-            model.startswith('o3') or
-            model.startswith('o3-')):
+        if is_gpt5 or is_o_series_reasoning:
             # These models don't support max_tokens, use max_completion_tokens instead
             if 'max_tokens' in prepared_kwargs:
                 max_tokens_value = prepared_kwargs.pop('max_tokens')
                 prepared_kwargs['max_completion_tokens'] = max_tokens_value
 
             # GPT-5 has specific parameter restrictions
-            if model.startswith('gpt-5'):
+            if is_gpt5:
                 # GPT-5 may have temperature restrictions (based on CloseAI findings)
                 # Remove temperature if it's not the default value to avoid potential issues
                 if 'temperature' in prepared_kwargs and prepared_kwargs['temperature'] != 1.0:
@@ -353,10 +385,10 @@ class OpenaiProvider(Provider):
         # Handle reasoning parameters for supported models
         if 'reasoning' in kwargs:
             reasoning = kwargs['reasoning']
-            if model.startswith('gpt-5'):
+            if is_gpt5:
                 # GPT-5 uses reasoning parameter with effort field
                 prepared_kwargs['reasoning'] = reasoning
-            elif model.startswith('o1-') or model.startswith('o3') or model.startswith('o3-'):
+            elif is_o_series_reasoning:
                 # o1/o3 series use reasoning_effort parameter
                 if isinstance(reasoning, dict) and 'effort' in reasoning:
                     prepared_kwargs['reasoning_effort'] = reasoning['effort']
@@ -367,11 +399,11 @@ class OpenaiProvider(Provider):
                     prepared_kwargs.pop('reasoning', None)
 
         # Handle reasoning_effort parameter for o1/o3 models
-        if 'reasoning_effort' in kwargs and (model.startswith('o1-') or model.startswith('o3') or model.startswith('o3-')):
+        if 'reasoning_effort' in kwargs and is_o_series_reasoning:
             prepared_kwargs['reasoning_effort'] = kwargs['reasoning_effort']
 
         # Handle verbosity parameter for GPT-5 models
-        if 'verbosity' in kwargs and model.startswith('gpt-5'):
+        if 'verbosity' in kwargs and is_gpt5:
             prepared_kwargs['verbosity'] = kwargs['verbosity']
 
         return prepared_kwargs
@@ -549,7 +581,7 @@ class OpenaiProvider(Provider):
         - GPT-5 系列：默认使用 Responses（推荐）
         - 其他模型：走 Chat Completions
         """
-        if model.startswith('gpt-5'):
+        if self._is_gpt5_model(model):
             return True
         return False
 
@@ -652,6 +684,69 @@ class OpenaiProvider(Provider):
 
         return input_items
 
+    @staticmethod
+    def _response_output_item_type(item: Any) -> Optional[str]:
+        if isinstance(item, dict):
+            return item.get("type")
+        return getattr(item, "type", None)
+
+    @classmethod
+    def _extract_text_from_responses_output_item(cls, item: Any) -> Optional[str]:
+        if cls._response_output_item_type(item) != "message":
+            return None
+
+        content_parts = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+        if not content_parts:
+            return None
+
+        text_parts: List[str] = []
+        for content_part in content_parts:
+            if isinstance(content_part, dict):
+                part_type = content_part.get("type")
+                text = content_part.get("text")
+            else:
+                part_type = getattr(content_part, "type", None)
+                text = getattr(content_part, "text", None)
+
+            if part_type == "output_text" and text:
+                text_parts.append(text)
+
+        return "".join(text_parts) if text_parts else None
+
+    @classmethod
+    def _convert_responses_function_call_item(cls, item: Any) -> Optional[ChatCompletionMessageToolCall]:
+        if cls._response_output_item_type(item) != "function_call":
+            return None
+
+        if isinstance(item, dict):
+            call_id = item.get("call_id") or item.get("id")
+            name = item.get("name")
+            arguments = item.get("arguments") or ""
+        else:
+            call_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+            name = getattr(item, "name", None)
+            arguments = getattr(item, "arguments", "") or ""
+
+        if not call_id or not name:
+            return None
+
+        return ChatCompletionMessageToolCall(
+            id=call_id,
+            function=Function(name=name, arguments=arguments),
+            type="function",
+        )
+
+    @classmethod
+    def _extract_responses_output_items(cls, response_obj: Any) -> List[Any]:
+        if response_obj is None:
+            return []
+        output = response_obj.get("output") if isinstance(response_obj, dict) else getattr(response_obj, "output", None)
+        return list(output or [])
+
+    @classmethod
+    def _responses_tool_call_keys(cls, tool_call: ChatCompletionMessageToolCall) -> set:
+        return {key for key in (getattr(tool_call, "id", None),) if key}
+
     def build_replay_view(self, model: str, messages: list, **kwargs):
         validation = self.validate_replay_window(model, messages, **kwargs)
         if not validation.ok:
@@ -694,6 +789,9 @@ class OpenaiProvider(Provider):
         # 准备 kwargs：去掉 messages，处理 tools（透传）
         responses_kwargs = kwargs.copy()
         responses_kwargs.pop('messages', None)
+        if 'max_completion_tokens' in responses_kwargs:
+            max_tokens_value = responses_kwargs.pop('max_completion_tokens')
+            responses_kwargs.setdefault('max_output_tokens', max_tokens_value)
         # 工具转换为 Responses API 期望的扁平格式（如存在 function 包裹则展开），并透传 strict
         if 'tools' in responses_kwargs:
             responses_kwargs['tools'] = self._convert_tools_for_responses_api(responses_kwargs['tools'])
@@ -714,6 +812,34 @@ class OpenaiProvider(Provider):
 
             async def stream_gen():
                 nonlocal stream_usage
+                emitted_text_from_delta = False
+                emitted_tool_call_ids = set()
+
+                def _response_metadata_from_event(chunk, response_obj=None):
+                    return {
+                        'id': (
+                            getattr(chunk, 'response_id', None)
+                            or getattr(chunk, 'id', None)
+                            or getattr(response_obj, 'id', None)
+                        ),
+                        'model': getattr(chunk, 'model', None) or getattr(response_obj, 'model', None),
+                    }
+
+                def _stream_text_response(text, chunk, response_obj=None):
+                    self._stream_content_length += len(text)
+                    return ChatCompletionResponse(
+                        choices=[StreamChoice(index=0, delta=ChoiceDelta(content=text, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
+                        metadata=_response_metadata_from_event(chunk, response_obj)
+                    )
+
+                def _stream_tool_call_response(tool_call, chunk, response_obj=None):
+                    self._stream_tool_calls_count += 1
+                    emitted_tool_call_ids.update(self._responses_tool_call_keys(tool_call))
+                    return ChatCompletionResponse(
+                        choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=[tool_call], reasoning_content=None), finish_reason=None)],
+                        metadata=_response_metadata_from_event(chunk, response_obj)
+                    )
+
                 async for chunk in response:
                     ctype = getattr(chunk, 'type', None)
 
@@ -735,6 +861,7 @@ class OpenaiProvider(Provider):
                     elif ctype == 'response.output_text.delta' and hasattr(chunk, 'delta'):
                         # Accumulate content length
                         if chunk.delta:
+                            emitted_text_from_delta = True
                             self._stream_content_length += len(chunk.delta)
                         yield ChatCompletionResponse(
                             choices=[StreamChoice(index=0, delta=ChoiceDelta(content=chunk.delta, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
@@ -751,20 +878,44 @@ class OpenaiProvider(Provider):
                                 choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=tool_calls, reasoning_content=None), finish_reason=None)],
                                 metadata={'id': getattr(chunk, 'response_id', None), 'model': getattr(chunk, 'model', None)}
                             )
+                    elif ctype == 'response.output_item.done':
+                        item = getattr(chunk, 'item', None)
+                        item_text = self._extract_text_from_responses_output_item(item)
+                        if item_text and not emitted_text_from_delta:
+                            yield _stream_text_response(item_text, chunk)
+
+                        tool_call = self._convert_responses_function_call_item(item)
+                        if tool_call:
+                            tool_call_keys = self._responses_tool_call_keys(tool_call)
+                            if not tool_call_keys.intersection(emitted_tool_call_ids):
+                                yield _stream_tool_call_response(tool_call, chunk)
                     elif ctype in ['response.completed', 'response.done']:
+                        completed_response = getattr(chunk, 'response', None)
+                        for item in self._extract_responses_output_items(completed_response):
+                            item_text = self._extract_text_from_responses_output_item(item)
+                            if item_text and not emitted_text_from_delta:
+                                emitted_text_from_delta = True
+                                yield _stream_text_response(item_text, chunk, completed_response)
+
+                            tool_call = self._convert_responses_function_call_item(item)
+                            if tool_call:
+                                tool_call_keys = self._responses_tool_call_keys(tool_call)
+                                if not tool_call_keys.intersection(emitted_tool_call_ids):
+                                    yield _stream_tool_call_response(tool_call, chunk, completed_response)
+
                         # Create accurate stop_info with accumulated metadata
                         metadata = {
                             "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
                             "content_length": self._stream_content_length,
                             "tool_calls_count": self._stream_tool_calls_count,
                             "finish_reason": 'stop',
-                            "model": getattr(chunk, 'model', None),
+                            "model": getattr(chunk, 'model', None) or getattr(completed_response, 'model', None),
                             "provider": "openai"
                         }
                         stop_info = stop_reason_manager.map_stop_reason("openai", 'stop', metadata)
                         response_metadata = {
-                            'id': getattr(chunk, 'response_id', None),
-                            'model': getattr(chunk, 'model', None)
+                            'id': getattr(chunk, 'response_id', None) or getattr(completed_response, 'id', None),
+                            'model': getattr(chunk, 'model', None) or getattr(completed_response, 'model', None)
                         }
                         if stream_usage:
                             response_metadata['usage'] = stream_usage
