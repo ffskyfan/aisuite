@@ -273,6 +273,31 @@ def test_deepseek_provider_preserves_custom_base_url():
 
 
 @pytest.mark.asyncio
+async def test_deepseek_provider_closes_async_client():
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            self.closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        async def close(self):
+            self.closed = True
+
+    fake_client = FakeAsyncOpenAI()
+
+    with patch(
+        "aisuite.providers.deepseek_provider.openai.AsyncOpenAI",
+        return_value=fake_client,
+    ):
+        provider = DeepseekProvider(api_key="test-api-key")
+
+    await provider.aclose()
+
+    assert fake_client.closed is True
+
+
+@pytest.mark.asyncio
 async def test_deepseek_provider_moves_thinking_to_extra_body():
     provider = DeepseekProvider(api_key="test-api-key")
     mock_response = _ns(

@@ -66,6 +66,15 @@ class OpenaiProvider(Provider):
         self._stream_tool_calls_count = 0
         self._stream_reasoning_buffer = ""
 
+    async def aclose(self):
+        is_closed = getattr(self.client, "is_closed", None)
+        if callable(is_closed):
+            is_closed = is_closed()
+        if is_closed:
+            return
+
+        await self.client.close()
+
     @staticmethod
     def _canonical_model_name(model: str) -> str:
         """Return the OpenAI model id without provider routing prefixes."""

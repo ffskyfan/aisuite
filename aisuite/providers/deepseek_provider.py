@@ -55,6 +55,15 @@ class DeepseekProvider(Provider):
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
 
+    async def aclose(self):
+        is_closed = getattr(self.client, "is_closed", None)
+        if callable(is_closed):
+            is_closed = is_closed()
+        if is_closed:
+            return
+
+        await self.client.close()
+
     def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
         return ProviderReplayCapabilities(
             needs_exact_turn_replay=False,

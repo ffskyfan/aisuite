@@ -5,6 +5,14 @@ import pytest
 from aisuite import Client
 
 
+class _AsyncClosableProvider:
+    def __init__(self):
+        self.closed = False
+
+    async def aclose(self):
+        self.closed = True
+
+
 @pytest.fixture(scope="module")
 def provider_configs():
     return {
@@ -43,6 +51,17 @@ def provider_configs():
             "api_key": "vercel-api-key",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_client_aclose_closes_providers():
+    client = Client(provider_configs={})
+    provider = _AsyncClosableProvider()
+    client.providers["test"] = provider
+
+    await client.aclose()
+
+    assert provider.closed is True
 
 
 @pytest.mark.parametrize(

@@ -63,6 +63,16 @@ class Client:
         self.provider_configs.update(provider_configs)
         self._initialize_providers()  # NOTE: This will override existing provider instances.
 
+    async def aclose(self):
+        for provider in list(self.providers.values()):
+            close = getattr(provider, "aclose", None) or getattr(provider, "close", None)
+            if not callable(close):
+                continue
+
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
     @property
     def chat(self):
         """Return the chat API interface."""
