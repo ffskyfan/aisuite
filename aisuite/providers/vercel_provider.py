@@ -1,4 +1,5 @@
 import os
+import inspect
 from typing import Any, AsyncGenerator, Dict, Optional, Union
 
 from aisuite.framework.chat_completion_response import ChatCompletionResponse
@@ -266,6 +267,16 @@ class VercelProvider(Provider):
         if protocol not in self._protocol_providers:
             self._protocol_providers[protocol] = self._create_protocol_provider(protocol)
         return self._protocol_providers[protocol]
+
+    async def aclose(self) -> None:
+        for provider in list(self._protocol_providers.values()):
+            close = getattr(provider, "aclose", None) or getattr(provider, "close", None)
+            if not callable(close):
+                continue
+
+            result = close()
+            if inspect.isawaitable(result):
+                await result
 
     def _resolve_replay_target(
         self, model: Optional[str], kwargs: Optional[Dict[str, Any]] = None

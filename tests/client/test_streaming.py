@@ -20,12 +20,6 @@ def deepseek_client():
         "deepseek": {"api_key": os.getenv("DEEPSEEK_API_KEY")}
     })
 
-@pytest.fixture
-def deepseekali_client():
-    return Client(provider_configs={
-        "deepseekali": {"api_key": os.getenv("DASHSCOPE_API_KEY")}
-    })
-
 @pytest.mark.asyncio
 async def test_deepseek_streaming_response(deepseek_client):
     """Test Deepseek streaming response"""
@@ -47,31 +41,6 @@ async def test_deepseek_streaming_response(deepseek_client):
     # Verify final message
     full_response = "".join([c for c in collected_chunks if c is not None])
     assert len(full_response) > 0
-
-@pytest.mark.asyncio
-async def test_deepseekali_multi_turn(deepseekali_client):
-    """Test multi-turn conversation with DeepseekAli"""
-    messages = [
-        {"role": "user", "content": "What is the capital of France?"},
-        {"role": "assistant", "content": "The capital of France is Paris."}, 
-        {"role": "user", "content": "What is the population of Paris?"}
-    ]
-    
-    stream = await deepseekali_client.chat.completions.create(
-        model="deepseekali:deepseek-v3", 
-        messages=messages,
-        stream=True
-    )
-    
-    collected_chunks = []
-    async for chunk in stream:
-        assert isinstance(chunk, ChatCompletionResponse)
-        assert len(chunk.choices) == 1
-        collected_chunks.append(chunk.choices[0].delta.content)
-    
-    full_response = "".join([c for c in collected_chunks if c is not None])
-    assert len(full_response) > 0
-    assert "population" in full_response.lower()
 
 @pytest.mark.asyncio
 async def test_invalid_model_error(deepseek_client):

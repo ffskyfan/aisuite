@@ -21,6 +21,7 @@ class _FakeAsyncProvider:
         self.validation_calls = []
         self.capture_calls = []
         self.build_calls = []
+        self.closed = False
 
     async def chat_completions_create(self, model, messages, stream=False, **kwargs):
         self.calls.append(
@@ -67,6 +68,9 @@ class _FakeAsyncProvider:
             request_view={"protocol": self.protocol, "model": model, "messages": messages},
             replay_mode=f"{self.protocol}_replay",
         )
+
+    async def aclose(self):
+        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -208,3 +212,17 @@ def test_closeai_replay_contract_delegates_to_anthropic_provider():
     assert replay_build.request_view["model"] == "claude-sonnet-4-20250514"
     assert captured.replay_metadata["protocol"] == "anthropic"
     assert fake_provider.capture_calls[0]["model"] == "claude-sonnet-4-20250514"
+
+
+@pytest.mark.asyncio
+async def test_closeai_provider_closes_cached_protocol_providers():
+    provider = CloseaiProvider(api_key="test-closeai-key")
+    openai_provider = _FakeAsyncProvider("openai")
+    anthropic_provider = _FakeAsyncProvider("anthropic")
+    provider._protocol_providers["openai"] = openai_provider
+    provider._protocol_providers["anthropic"] = anthropic_provider
+
+    await provider.aclose()
+
+    assert openai_provider.closed is True
+    assert anthropic_provider.closed is True

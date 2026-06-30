@@ -39,6 +39,31 @@ def test_stop_reason_maps_openai_network_error_to_error():
     assert stop_info.metadata["error_message"] == "上游网络错误或流式连接中断"
 
 
+@pytest.mark.asyncio
+async def test_anthropic_provider_closes_async_client():
+    class FakeAsyncAnthropic:
+        def __init__(self, **kwargs):
+            self.closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        async def close(self):
+            self.closed = True
+
+    fake_client = FakeAsyncAnthropic()
+
+    with patch(
+        "aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic",
+        return_value=fake_client,
+    ):
+        provider = AnthropicProvider(api_key="test-anthropic-key")
+
+    await provider.aclose()
+
+    assert fake_client.closed is True
+
+
 @patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
 def test_openai_build_replay_view_reads_versioned_responses_payload(_mock_client_cls):
     provider = OpenaiProvider(api_key="test-openai-key")

@@ -21,6 +21,7 @@ class _FakeAsyncProvider:
         self.validation_calls = []
         self.capture_calls = []
         self.build_calls = []
+        self.closed = False
 
     async def chat_completions_create(self, model, messages, stream=False, **kwargs):
         self.calls.append(
@@ -67,6 +68,9 @@ class _FakeAsyncProvider:
             request_view={"protocol": self.protocol, "model": model, "messages": messages},
             replay_mode=f"{self.protocol}_replay",
         )
+
+    async def aclose(self):
+        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -227,3 +231,17 @@ def test_vercel_replay_contract_delegates_with_normalized_model():
     assert replay_build.request_view["model"] == "anthropic/claude-sonnet-4.6"
     assert captured.replay_metadata["protocol"] == "anthropic"
     assert fake_provider.capture_calls[0]["model"] == "anthropic/claude-sonnet-4.6"
+
+
+@pytest.mark.asyncio
+async def test_vercel_provider_closes_cached_protocol_providers():
+    provider = VercelProvider(api_key="test-vercel-key")
+    openai_provider = _FakeAsyncProvider("openai")
+    anthropic_provider = _FakeAsyncProvider("anthropic")
+    provider._protocol_providers["openai"] = openai_provider
+    provider._protocol_providers["anthropic"] = anthropic_provider
+
+    await provider.aclose()
+
+    assert openai_provider.closed is True
+    assert anthropic_provider.closed is True
