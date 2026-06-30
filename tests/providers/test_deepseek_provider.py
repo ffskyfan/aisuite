@@ -12,6 +12,24 @@ def _ns(**kwargs):
     return SimpleNamespace(**kwargs)
 
 
+class _ClosableAsyncStream:
+    def __init__(self, chunks):
+        self.closed = False
+        self._chunks = iter(chunks)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def aclose(self):
+        self.closed = True
+
+
 @pytest.fixture(autouse=True)
 def set_api_key_env_var(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-api-key")
@@ -274,9 +292,12 @@ def test_deepseek_provider_preserves_custom_base_url():
 
 @pytest.mark.asyncio
 async def test_deepseek_provider_closes_async_client():
+    created = {}
+
     class FakeAsyncOpenAI:
         def __init__(self, **kwargs):
             self.closed = False
+            created["http_client"] = kwargs["http_client"]
 
         def is_closed(self):
             return self.closed
@@ -284,17 +305,20 @@ async def test_deepseek_provider_closes_async_client():
         async def close(self):
             self.closed = True
 
-    fake_client = FakeAsyncOpenAI()
-
     with patch(
         "aisuite.providers.deepseek_provider.openai.AsyncOpenAI",
-        return_value=fake_client,
+        FakeAsyncOpenAI,
     ):
         provider = DeepseekProvider(api_key="test-api-key")
 
+    assert created["http_client"] is provider._http_client
+    assert created["http_client"].__class__.__name__ != "AsyncHttpxClientWrapper"
+    assert provider._owns_http_client is True
+
     await provider.aclose()
 
-    assert fake_client.closed is True
+    assert provider.client.closed is True
+    assert created["http_client"].is_closed is True
 
 
 @pytest.mark.asyncio
@@ -419,6 +443,48 @@ async def test_deepseek_provider_streaming_accumulates_reasoning_content():
     assert accumulated_thinking["thinking"] == "think-1 think-2"
     assert accumulated_thinking["raw_data"]["provider"] == "deepseek"
     assert accumulated_thinking["raw_data"]["payload"]["reasoning_content"] == "think-1 think-2"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_closes_stream_response_after_iteration():
+    provider = DeepseekProvider(api_key="test-api-key")
+    stream_response = _ClosableAsyncStream(
+        [
+            _ns(
+                id="chunk-1",
+                created=1,
+                model="deepseek-v4-flash",
+                usage=None,
+                choices=[
+                    _ns(
+                        index=0,
+                        finish_reason="stop",
+                        delta=_ns(
+                            content="done",
+                            role="assistant",
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                    )
+                ],
+            )
+        ]
+    )
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=stream_response),
+    ):
+        stream = await provider.chat_completions_create(
+            model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "Hello!"}],
+            stream=True,
+        )
+        chunks = [chunk async for chunk in stream]
+
+    assert chunks[0].choices[0].delta.content == "done"
+    assert stream_response.closed is True
 
 
 @pytest.mark.asyncio

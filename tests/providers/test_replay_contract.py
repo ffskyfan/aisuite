@@ -40,6 +40,97 @@ def test_stop_reason_maps_openai_network_error_to_error():
 
 
 @pytest.mark.asyncio
+async def test_openai_provider_closes_chat_stream_response_after_iteration():
+    class ClosableAsyncStream:
+        def __init__(self, chunks):
+            self.closed = False
+            self._chunks = iter(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._chunks)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def aclose(self):
+            self.closed = True
+
+    provider = OpenaiProvider(api_key="test-openai-key")
+    stream_response = ClosableAsyncStream(
+        [
+            SimpleNamespace(
+                id="chunk-1",
+                created=1,
+                model="gpt-4o",
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        finish_reason="stop",
+                        delta=SimpleNamespace(
+                            content="done",
+                            role="assistant",
+                            tool_calls=None,
+                            reasoning_content=None,
+                        ),
+                    )
+                ],
+            )
+        ]
+    )
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=stream_response),
+    ):
+        response_stream = await provider.chat_completions_create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "Hello!"}],
+            stream=True,
+        )
+        chunks = [chunk async for chunk in response_stream]
+
+    assert chunks[0].choices[0].delta.content == "done"
+    assert stream_response.closed is True
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_closes_owned_http_client():
+    created = {}
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            self.closed = False
+            created["http_client"] = kwargs["http_client"]
+
+        def is_closed(self):
+            return self.closed
+
+        async def close(self):
+            self.closed = True
+
+    with patch(
+        "aisuite.providers.openai_provider.openai.AsyncOpenAI",
+        FakeAsyncOpenAI,
+    ):
+        provider = OpenaiProvider(api_key="test-openai-key")
+
+    assert created["http_client"] is provider._http_client
+    assert created["http_client"].__class__.__name__ != "AsyncHttpxClientWrapper"
+    assert provider._owns_http_client is True
+
+    await provider.aclose()
+
+    assert provider.client.closed is True
+    assert created["http_client"].is_closed is True
+
+
+@pytest.mark.asyncio
 async def test_anthropic_provider_closes_async_client():
     class FakeAsyncAnthropic:
         def __init__(self, **kwargs):

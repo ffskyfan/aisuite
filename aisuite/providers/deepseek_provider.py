@@ -1,6 +1,7 @@
 import openai
 import os
 import json
+import inspect
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from aisuite.provider import Provider, LLMError
@@ -43,6 +44,14 @@ class DeepseekProvider(Provider):
         # infer certain values from the environment variables.
         # Eg: OPENAI_API_KEY, OPENAI_ORG_ID, OPENAI_PROJECT_ID. Except for OPEN_AI_BASE_URL which has to be the deepseek url
 
+        self._http_client = config.get("http_client")
+        self._owns_http_client = self._http_client is None
+        if self._http_client is None:
+            # Pass an explicit client so the OpenAI SDK does not create an
+            # AsyncHttpxClientWrapper that relies on __del__ for cleanup.
+            self._http_client = openai.DefaultAsyncHttpxClient()
+            config["http_client"] = self._http_client
+
         # Pass the entire config to the OpenAI client constructor
         self.client = openai.AsyncOpenAI(**config)
 
@@ -56,13 +65,35 @@ class DeepseekProvider(Provider):
         self._stream_tool_calls_count = 0
 
     async def aclose(self):
-        is_closed = getattr(self.client, "is_closed", None)
+        try:
+            is_closed = getattr(self.client, "is_closed", None)
+            if callable(is_closed):
+                is_closed = is_closed()
+            if not is_closed:
+                await self.client.close()
+        finally:
+            await self._close_owned_http_client()
+
+    async def _close_owned_http_client(self) -> None:
+        if not self._owns_http_client or self._http_client is None:
+            return
+
+        is_closed = getattr(self._http_client, "is_closed", None)
         if callable(is_closed):
             is_closed = is_closed()
         if is_closed:
             return
 
-        await self.client.close()
+        await self._http_client.aclose()
+
+    async def _close_stream_response(self, response) -> None:
+        close = getattr(response, "aclose", None) or getattr(response, "close", None)
+        if not callable(close):
+            return
+
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
     def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
         return ProviderReplayCapabilities(
@@ -558,85 +589,88 @@ class DeepseekProvider(Provider):
             )
 
             async def stream_generator():
-                stream_usage = None
-                chunk_index = 0
-                async for chunk in response:
-                    chunk_index += 1
-                    # Capture usage from streaming chunks (only appears on final chunk)
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        stream_usage = self._normalize_usage(chunk.usage) or stream_usage
+                try:
+                    stream_usage = None
+                    chunk_index = 0
+                    async for chunk in response:
+                        chunk_index += 1
+                        # Capture usage from streaming chunks (only appears on final chunk)
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            stream_usage = self._normalize_usage(chunk.usage) or stream_usage
 
-                    if chunk.choices:
-                        # Create choices with stop_info
-                        choices = []
-                        for choice in chunk.choices:
-                            # Accumulate content and tool calls for accurate metadata
-                            if choice.delta.content:
-                                self._stream_content_length += len(choice.delta.content)
-                            reasoning_content = getattr(choice.delta, "reasoning_content", None)
-                            if reasoning_content:
-                                self._accumulate_reasoning_content(reasoning_content)
+                        if chunk.choices:
+                            # Create choices with stop_info
+                            choices = []
+                            for choice in chunk.choices:
+                                # Accumulate content and tool calls for accurate metadata
+                                if choice.delta.content:
+                                    self._stream_content_length += len(choice.delta.content)
+                                reasoning_content = getattr(choice.delta, "reasoning_content", None)
+                                if reasoning_content:
+                                    self._accumulate_reasoning_content(reasoning_content)
 
-                            accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
-                            if accumulated_tool_calls:
-                                self._stream_tool_calls_count += len(accumulated_tool_calls)
+                                accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
+                                if accumulated_tool_calls:
+                                    self._stream_tool_calls_count += len(accumulated_tool_calls)
 
-                            # Create stop_info if finish_reason is present
-                            stop_info = None
-                            if choice.finish_reason:
-                                # Use accumulated values for final stop_info
-                                if choice.finish_reason == "stop":
-                                    metadata = {
-                                        "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
-                                        "content_length": self._stream_content_length,
-                                        "tool_calls_count": self._stream_tool_calls_count,
-                                        "finish_reason": choice.finish_reason,
-                                        "model": chunk.model,
-                                        "provider": "deepseek",
-                                    }
-                                    stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
-                                    stop_info.metadata["provider"] = "deepseek"
-                                elif (
-                                    choice.finish_reason == "tool_calls"
-                                    and not accumulated_tool_calls
-                                    and self._streaming_tool_calls
-                                ):
-                                    stop_info = self._build_pending_tool_call_error_stop_info(
+                                # Create stop_info if finish_reason is present
+                                stop_info = None
+                                if choice.finish_reason:
+                                    # Use accumulated values for final stop_info
+                                    if choice.finish_reason == "stop":
+                                        metadata = {
+                                            "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                                            "content_length": self._stream_content_length,
+                                            "tool_calls_count": self._stream_tool_calls_count,
+                                            "finish_reason": choice.finish_reason,
+                                            "model": chunk.model,
+                                            "provider": "deepseek",
+                                        }
+                                        stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
+                                        stop_info.metadata["provider"] = "deepseek"
+                                    elif (
+                                        choice.finish_reason == "tool_calls"
+                                        and not accumulated_tool_calls
+                                        and self._streaming_tool_calls
+                                    ):
+                                        stop_info = self._build_pending_tool_call_error_stop_info(
+                                            finish_reason=choice.finish_reason,
+                                            model=chunk.model,
+                                        )
+                                    else:
+                                        choice_data = {"delta": choice.delta}
+                                        stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
+
+                                choices.append(
+                                    StreamChoice(
+                                        index=choice.index,
+                                        delta=ChoiceDelta(
+                                            content=choice.delta.content,
+                                            role=choice.delta.role,
+                                            tool_calls=accumulated_tool_calls,
+                                            reasoning_content=reasoning_content,
+                                        ),
                                         finish_reason=choice.finish_reason,
-                                        model=chunk.model,
+                                        stop_info=stop_info,
                                     )
-                                else:
-                                    choice_data = {"delta": choice.delta}
-                                    stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
-
-                            choices.append(
-                                StreamChoice(
-                                    index=choice.index,
-                                    delta=ChoiceDelta(
-                                        content=choice.delta.content,
-                                        role=choice.delta.role,
-                                        tool_calls=accumulated_tool_calls,
-                                        reasoning_content=reasoning_content,
-                                    ),
-                                    finish_reason=choice.finish_reason,
-                                    stop_info=stop_info,
                                 )
+
+                            # Determine if this is the final chunk
+                            is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
+                            metadata = {
+                                "id": chunk.id,
+                                "created": chunk.created,
+                                "model": chunk.model,
+                            }
+                            if is_final_chunk and stream_usage:
+                                metadata["usage"] = stream_usage
+
+                            yield ChatCompletionResponse(
+                                choices=choices,
+                                metadata=metadata,
                             )
-
-                        # Determine if this is the final chunk
-                        is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
-                        metadata = {
-                            "id": chunk.id,
-                            "created": chunk.created,
-                            "model": chunk.model,
-                        }
-                        if is_final_chunk and stream_usage:
-                            metadata["usage"] = stream_usage
-
-                        yield ChatCompletionResponse(
-                            choices=choices,
-                            metadata=metadata,
-                        )
+                finally:
+                    await self._close_stream_response(response)
 
             return stream_generator()
         else:

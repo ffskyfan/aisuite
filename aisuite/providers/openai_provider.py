@@ -2,6 +2,7 @@ import openai
 import os
 import json
 import hashlib
+import inspect
 from typing import AsyncGenerator, Union, List, Dict, Any, Optional
 
 from aisuite.provider import Provider, LLMError
@@ -52,6 +53,14 @@ class OpenaiProvider(Provider):
         # infer certain values from the environment variables.
         # Eg: OPENAI_API_KEY, OPENAI_ORG_ID, OPENAI_PROJECT_ID, OPENAI_BASE_URL, etc.
 
+        self._http_client = config.get("http_client")
+        self._owns_http_client = self._http_client is None
+        if self._http_client is None:
+            # Pass an explicit client so the OpenAI SDK does not create an
+            # AsyncHttpxClientWrapper that relies on __del__ for cleanup.
+            self._http_client = openai.DefaultAsyncHttpxClient()
+            config["http_client"] = self._http_client
+
         # Pass the entire config to the OpenAI client constructor
         self.client = openai.AsyncOpenAI(**config)
 
@@ -67,13 +76,35 @@ class OpenaiProvider(Provider):
         self._stream_reasoning_buffer = ""
 
     async def aclose(self):
-        is_closed = getattr(self.client, "is_closed", None)
+        try:
+            is_closed = getattr(self.client, "is_closed", None)
+            if callable(is_closed):
+                is_closed = is_closed()
+            if not is_closed:
+                await self.client.close()
+        finally:
+            await self._close_owned_http_client()
+
+    async def _close_owned_http_client(self) -> None:
+        if not self._owns_http_client or self._http_client is None:
+            return
+
+        is_closed = getattr(self._http_client, "is_closed", None)
         if callable(is_closed):
             is_closed = is_closed()
         if is_closed:
             return
 
-        await self.client.close()
+        await self._http_client.aclose()
+
+    async def _close_stream_response(self, response) -> None:
+        close = getattr(response, "aclose", None) or getattr(response, "close", None)
+        if not callable(close):
+            return
+
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
     @staticmethod
     def _canonical_model_name(model: str) -> str:
@@ -820,118 +851,121 @@ class OpenaiProvider(Provider):
             stream_usage = None
 
             async def stream_gen():
-                nonlocal stream_usage
-                emitted_text_from_delta = False
-                emitted_tool_call_ids = set()
+                try:
+                    nonlocal stream_usage
+                    emitted_text_from_delta = False
+                    emitted_tool_call_ids = set()
 
-                def _response_metadata_from_event(chunk, response_obj=None):
-                    return {
-                        'id': (
-                            getattr(chunk, 'response_id', None)
-                            or getattr(chunk, 'id', None)
-                            or getattr(response_obj, 'id', None)
-                        ),
-                        'model': getattr(chunk, 'model', None) or getattr(response_obj, 'model', None),
-                    }
+                    def _response_metadata_from_event(chunk, response_obj=None):
+                        return {
+                            'id': (
+                                getattr(chunk, 'response_id', None)
+                                or getattr(chunk, 'id', None)
+                                or getattr(response_obj, 'id', None)
+                            ),
+                            'model': getattr(chunk, 'model', None) or getattr(response_obj, 'model', None),
+                        }
 
-                def _stream_text_response(text, chunk, response_obj=None):
-                    self._stream_content_length += len(text)
-                    return ChatCompletionResponse(
-                        choices=[StreamChoice(index=0, delta=ChoiceDelta(content=text, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
-                        metadata=_response_metadata_from_event(chunk, response_obj)
-                    )
-
-                def _stream_tool_call_response(tool_call, chunk, response_obj=None):
-                    self._stream_tool_calls_count += 1
-                    emitted_tool_call_ids.update(self._responses_tool_call_keys(tool_call))
-                    return ChatCompletionResponse(
-                        choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=[tool_call], reasoning_content=None), finish_reason=None)],
-                        metadata=_response_metadata_from_event(chunk, response_obj)
-                    )
-
-                async for chunk in response:
-                    ctype = getattr(chunk, 'type', None)
-
-                    # Capture usage information if available on this event
-                    usage_obj = None
-                    if hasattr(chunk, "usage"):
-                        usage_obj = getattr(chunk, "usage")
-                    elif hasattr(chunk, "response") and hasattr(chunk.response, "usage"):
-                        usage_obj = chunk.response.usage
-                    if usage_obj:
-                        stream_usage = self._normalize_usage(usage_obj) or stream_usage
-
-                    reasoning_delta = self._extract_reasoning_delta_from_chunk(chunk)
-                    if reasoning_delta:
-                        yield ChatCompletionResponse(
-                            choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=None, reasoning_content=reasoning_delta), finish_reason=None)],
-                            metadata={'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'id', None), 'model': getattr(chunk, 'model', None)}
+                    def _stream_text_response(text, chunk, response_obj=None):
+                        self._stream_content_length += len(text)
+                        return ChatCompletionResponse(
+                            choices=[StreamChoice(index=0, delta=ChoiceDelta(content=text, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
+                            metadata=_response_metadata_from_event(chunk, response_obj)
                         )
-                    elif ctype == 'response.output_text.delta' and hasattr(chunk, 'delta'):
-                        # Accumulate content length
-                        if chunk.delta:
-                            emitted_text_from_delta = True
-                            self._stream_content_length += len(chunk.delta)
-                        yield ChatCompletionResponse(
-                            choices=[StreamChoice(index=0, delta=ChoiceDelta(content=chunk.delta, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
-                            metadata={'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'id', None), 'model': getattr(chunk, 'model', None)}
+
+                    def _stream_tool_call_response(tool_call, chunk, response_obj=None):
+                        self._stream_tool_calls_count += 1
+                        emitted_tool_call_ids.update(self._responses_tool_call_keys(tool_call))
+                        return ChatCompletionResponse(
+                            choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=[tool_call], reasoning_content=None), finish_reason=None)],
+                            metadata=_response_metadata_from_event(chunk, response_obj)
                         )
-                    elif ctype == 'response.function_call_arguments.delta' and hasattr(chunk, 'delta'):
-                        # 复用 Chat 路径的积累器
-                        mock_delta = type('MockDelta', (), {'tool_calls': [type('MTC', (), {'index': getattr(chunk, 'output_index', 0), 'id': chunk.item_id, 'function': type('MF', (), {'arguments': chunk.delta, 'name': ''})(), 'type': 'function'})()]})()
-                        tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
-                        if tool_calls:
-                            # Accumulate tool calls count
-                            self._stream_tool_calls_count += len(tool_calls)
+
+                    async for chunk in response:
+                        ctype = getattr(chunk, 'type', None)
+
+                        # Capture usage information if available on this event
+                        usage_obj = None
+                        if hasattr(chunk, "usage"):
+                            usage_obj = getattr(chunk, "usage")
+                        elif hasattr(chunk, "response") and hasattr(chunk.response, "usage"):
+                            usage_obj = chunk.response.usage
+                        if usage_obj:
+                            stream_usage = self._normalize_usage(usage_obj) or stream_usage
+
+                        reasoning_delta = self._extract_reasoning_delta_from_chunk(chunk)
+                        if reasoning_delta:
                             yield ChatCompletionResponse(
-                                choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=tool_calls, reasoning_content=None), finish_reason=None)],
-                                metadata={'id': getattr(chunk, 'response_id', None), 'model': getattr(chunk, 'model', None)}
+                                choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=None, reasoning_content=reasoning_delta), finish_reason=None)],
+                                metadata={'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'id', None), 'model': getattr(chunk, 'model', None)}
                             )
-                    elif ctype == 'response.output_item.done':
-                        item = getattr(chunk, 'item', None)
-                        item_text = self._extract_text_from_responses_output_item(item)
-                        if item_text and not emitted_text_from_delta:
-                            yield _stream_text_response(item_text, chunk)
-
-                        tool_call = self._convert_responses_function_call_item(item)
-                        if tool_call:
-                            tool_call_keys = self._responses_tool_call_keys(tool_call)
-                            if not tool_call_keys.intersection(emitted_tool_call_ids):
-                                yield _stream_tool_call_response(tool_call, chunk)
-                    elif ctype in ['response.completed', 'response.done']:
-                        completed_response = getattr(chunk, 'response', None)
-                        for item in self._extract_responses_output_items(completed_response):
+                        elif ctype == 'response.output_text.delta' and hasattr(chunk, 'delta'):
+                            # Accumulate content length
+                            if chunk.delta:
+                                emitted_text_from_delta = True
+                                self._stream_content_length += len(chunk.delta)
+                            yield ChatCompletionResponse(
+                                choices=[StreamChoice(index=0, delta=ChoiceDelta(content=chunk.delta, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
+                                metadata={'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'id', None), 'model': getattr(chunk, 'model', None)}
+                            )
+                        elif ctype == 'response.function_call_arguments.delta' and hasattr(chunk, 'delta'):
+                            # 复用 Chat 路径的积累器
+                            mock_delta = type('MockDelta', (), {'tool_calls': [type('MTC', (), {'index': getattr(chunk, 'output_index', 0), 'id': chunk.item_id, 'function': type('MF', (), {'arguments': chunk.delta, 'name': ''})(), 'type': 'function'})()]})()
+                            tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
+                            if tool_calls:
+                                # Accumulate tool calls count
+                                self._stream_tool_calls_count += len(tool_calls)
+                                yield ChatCompletionResponse(
+                                    choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=tool_calls, reasoning_content=None), finish_reason=None)],
+                                    metadata={'id': getattr(chunk, 'response_id', None), 'model': getattr(chunk, 'model', None)}
+                                )
+                        elif ctype == 'response.output_item.done':
+                            item = getattr(chunk, 'item', None)
                             item_text = self._extract_text_from_responses_output_item(item)
                             if item_text and not emitted_text_from_delta:
-                                emitted_text_from_delta = True
-                                yield _stream_text_response(item_text, chunk, completed_response)
+                                yield _stream_text_response(item_text, chunk)
 
                             tool_call = self._convert_responses_function_call_item(item)
                             if tool_call:
                                 tool_call_keys = self._responses_tool_call_keys(tool_call)
                                 if not tool_call_keys.intersection(emitted_tool_call_ids):
-                                    yield _stream_tool_call_response(tool_call, chunk, completed_response)
+                                    yield _stream_tool_call_response(tool_call, chunk)
+                        elif ctype in ['response.completed', 'response.done']:
+                            completed_response = getattr(chunk, 'response', None)
+                            for item in self._extract_responses_output_items(completed_response):
+                                item_text = self._extract_text_from_responses_output_item(item)
+                                if item_text and not emitted_text_from_delta:
+                                    emitted_text_from_delta = True
+                                    yield _stream_text_response(item_text, chunk, completed_response)
 
-                        # Create accurate stop_info with accumulated metadata
-                        metadata = {
-                            "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
-                            "content_length": self._stream_content_length,
-                            "tool_calls_count": self._stream_tool_calls_count,
-                            "finish_reason": 'stop',
-                            "model": getattr(chunk, 'model', None) or getattr(completed_response, 'model', None),
-                            "provider": "openai"
-                        }
-                        stop_info = stop_reason_manager.map_stop_reason("openai", 'stop', metadata)
-                        response_metadata = {
-                            'id': getattr(chunk, 'response_id', None) or getattr(completed_response, 'id', None),
-                            'model': getattr(chunk, 'model', None) or getattr(completed_response, 'model', None)
-                        }
-                        if stream_usage:
-                            response_metadata['usage'] = stream_usage
-                        yield ChatCompletionResponse(
-                            choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role=None, tool_calls=None, reasoning_content=None), finish_reason='stop', stop_info=stop_info)],
-                            metadata=response_metadata
-                        )
+                                tool_call = self._convert_responses_function_call_item(item)
+                                if tool_call:
+                                    tool_call_keys = self._responses_tool_call_keys(tool_call)
+                                    if not tool_call_keys.intersection(emitted_tool_call_ids):
+                                        yield _stream_tool_call_response(tool_call, chunk, completed_response)
+
+                            # Create accurate stop_info with accumulated metadata
+                            metadata = {
+                                "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                                "content_length": self._stream_content_length,
+                                "tool_calls_count": self._stream_tool_calls_count,
+                                "finish_reason": 'stop',
+                                "model": getattr(chunk, 'model', None) or getattr(completed_response, 'model', None),
+                                "provider": "openai"
+                            }
+                            stop_info = stop_reason_manager.map_stop_reason("openai", 'stop', metadata)
+                            response_metadata = {
+                                'id': getattr(chunk, 'response_id', None) or getattr(completed_response, 'id', None),
+                                'model': getattr(chunk, 'model', None) or getattr(completed_response, 'model', None)
+                            }
+                            if stream_usage:
+                                response_metadata['usage'] = stream_usage
+                            yield ChatCompletionResponse(
+                                choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role=None, tool_calls=None, reasoning_content=None), finish_reason='stop', stop_info=stop_info)],
+                                metadata=response_metadata
+                            )
+                finally:
+                    await self._close_stream_response(response)
             return stream_gen()
         else:
             resp = await self.client.responses.create(
@@ -1083,72 +1117,75 @@ class OpenaiProvider(Provider):
                 **stream_kwargs  # Use prepared kwargs that are compatible with the model
             )
             async def stream_generator():
-                stream_usage = None
-                async for chunk in response:
-                    # Capture usage from the streaming chunk if available (typically on final chunk)
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        stream_usage = self._normalize_usage(chunk.usage) or stream_usage
+                try:
+                    stream_usage = None
+                    async for chunk in response:
+                        # Capture usage from the streaming chunk if available (typically on final chunk)
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            stream_usage = self._normalize_usage(chunk.usage) or stream_usage
 
-                    if chunk.choices:
-                        # Create choices with stop_info
-                        choices = []
-                        for choice in chunk.choices:
-                            # Accumulate content and tool calls for accurate metadata
-                            if choice.delta.content:
-                                self._stream_content_length += len(choice.delta.content)
+                        if chunk.choices:
+                            # Create choices with stop_info
+                            choices = []
+                            for choice in chunk.choices:
+                                # Accumulate content and tool calls for accurate metadata
+                                if choice.delta.content:
+                                    self._stream_content_length += len(choice.delta.content)
 
-                            # Process tool calls and restore original IDs
-                            accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
-                            if accumulated_tool_calls and id_mapping:
-                                accumulated_tool_calls = self._restore_tool_call_ids(accumulated_tool_calls, id_mapping)
-                            if accumulated_tool_calls:
-                                self._stream_tool_calls_count += len(accumulated_tool_calls)
+                                # Process tool calls and restore original IDs
+                                accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
+                                if accumulated_tool_calls and id_mapping:
+                                    accumulated_tool_calls = self._restore_tool_call_ids(accumulated_tool_calls, id_mapping)
+                                if accumulated_tool_calls:
+                                    self._stream_tool_calls_count += len(accumulated_tool_calls)
 
-                            # Create stop_info if finish_reason is present
-                            stop_info = None
-                            if choice.finish_reason:
-                                # Use accumulated values for final stop_info
-                                if choice.finish_reason == 'stop':
-                                    metadata = {
-                                        "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
-                                        "content_length": self._stream_content_length,
-                                        "tool_calls_count": self._stream_tool_calls_count,
-                                        "finish_reason": choice.finish_reason,
-                                        "model": chunk.model,
-                                        "provider": "openai"
-                                    }
-                                    stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
-                                else:
-                                    choice_data = {"delta": choice.delta}
-                                    stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
+                                # Create stop_info if finish_reason is present
+                                stop_info = None
+                                if choice.finish_reason:
+                                    # Use accumulated values for final stop_info
+                                    if choice.finish_reason == 'stop':
+                                        metadata = {
+                                            "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                                            "content_length": self._stream_content_length,
+                                            "tool_calls_count": self._stream_tool_calls_count,
+                                            "finish_reason": choice.finish_reason,
+                                            "model": chunk.model,
+                                            "provider": "openai"
+                                        }
+                                        stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
+                                    else:
+                                        choice_data = {"delta": choice.delta}
+                                        stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
 
-                            choices.append(StreamChoice(
-                                index=choice.index,
-                                delta=ChoiceDelta(
-                                    content=choice.delta.content,
-                                    role=choice.delta.role,
-                                    tool_calls=accumulated_tool_calls,
-                                    reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # 流式时保持原始格式
-                                ),
-                                finish_reason=choice.finish_reason,
-                                stop_info=stop_info
-                            ))
+                                choices.append(StreamChoice(
+                                    index=choice.index,
+                                    delta=ChoiceDelta(
+                                        content=choice.delta.content,
+                                        role=choice.delta.role,
+                                        tool_calls=accumulated_tool_calls,
+                                        reasoning_content=getattr(choice.delta, 'reasoning_content', None)  # 流式时保持原始格式
+                                    ),
+                                    finish_reason=choice.finish_reason,
+                                    stop_info=stop_info
+                                ))
 
-                        # Determine if this is the final chunk (has finish_reason or usage)
-                        is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
+                            # Determine if this is the final chunk (has finish_reason or usage)
+                            is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
 
-                        metadata = {
-                            'id': chunk.id,
-                            'created': chunk.created,
-                            'model': chunk.model
-                        }
-                        if is_final_chunk and stream_usage:
-                            metadata['usage'] = stream_usage
+                            metadata = {
+                                'id': chunk.id,
+                                'created': chunk.created,
+                                'model': chunk.model
+                            }
+                            if is_final_chunk and stream_usage:
+                                metadata['usage'] = stream_usage
 
-                        yield ChatCompletionResponse(
-                            choices=choices,
-                            metadata=metadata
-                        )
+                            yield ChatCompletionResponse(
+                                choices=choices,
+                                metadata=metadata
+                            )
+                finally:
+                    await self._close_stream_response(response)
             return stream_generator()
         else:
             # Clean messages for OpenAI API (remove reasoning_content and truncate tool_call IDs)
