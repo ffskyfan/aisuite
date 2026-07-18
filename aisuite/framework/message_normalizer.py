@@ -31,6 +31,7 @@ class MessageNormalizer:
         },
         "glm": {"remove_fields": ["refusal"], "preserve_reasoning": True},
         "deepseek": {"remove_fields": ["refusal"], "preserve_reasoning": True},
+        "kimi": {"remove_fields": ["refusal"], "preserve_reasoning": True},
         "anthropic": {
             "remove_fields": [],
             "preserve_reasoning": False,  # Claude handles reasoning differently
@@ -112,6 +113,8 @@ class MessageNormalizer:
                 return "gemini"
             elif provider_part == "deepseek":
                 return "deepseek"
+            elif provider_part == "kimi":
+                return "kimi"
 
         # Fallback to model name detection for backward compatibility
         # Check for Claude/Anthropic models

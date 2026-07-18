@@ -5,8 +5,18 @@ import inspect
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from aisuite.provider import Provider, LLMError
-from aisuite.framework.chat_completion_response import ChatCompletionResponse, Choice, ChoiceDelta, StreamChoice
-from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
+from aisuite.framework.chat_completion_response import (
+    ChatCompletionResponse,
+    Choice,
+    ChoiceDelta,
+    StreamChoice,
+)
+from aisuite.framework.message import (
+    Message,
+    ChatCompletionMessageToolCall,
+    Function,
+    ReasoningContent,
+)
 from aisuite.framework.replay_payload import (
     ProviderReplayCapabilities,
     ReplayBuildResult,
@@ -21,6 +31,7 @@ from aisuite.framework.stop_reason import StopInfo, StopReason, stop_reason_mana
 
 
 class DeepseekProvider(Provider):
+    PROVIDER_NAME = "deepseek"
     REASONING_REPLAY_KIND = "deepseek_reasoning_text"
 
     def __init__(self, **config):
@@ -95,7 +106,9 @@ class DeepseekProvider(Provider):
         if inspect.isawaitable(result):
             await result
 
-    def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
+    def get_replay_capabilities(
+        self, model: str | None = None
+    ) -> ProviderReplayCapabilities:
         return ProviderReplayCapabilities(
             needs_exact_turn_replay=False,
             needs_provider_call_id_binding=True,
@@ -144,7 +157,9 @@ class DeepseekProvider(Provider):
             return False
         return False
 
-    def validate_replay_window(self, model: str, messages: list, **kwargs) -> ReplayValidationResult:
+    def validate_replay_window(
+        self, model: str, messages: list, **kwargs
+    ) -> ReplayValidationResult:
         diagnostics: list[ReplayDiagnostic] = []
         normalized_messages: list[dict[str, Any]] = []
         thinking_enabled = self._is_thinking_enabled(kwargs)
@@ -342,7 +357,9 @@ class DeepseekProvider(Provider):
             diagnostics=validation.diagnostics,
         )
 
-    def _create_stop_info(self, finish_reason: str, choice_data: dict = None, model: str = None) -> dict:
+    def _create_stop_info(
+        self, finish_reason: str, choice_data: dict = None, model: str = None
+    ) -> dict:
         """Create StopInfo from OpenAI-compatible finish_reason."""
         if not finish_reason:
             return None
@@ -353,20 +370,41 @@ class DeepseekProvider(Provider):
         tool_calls_count = 0
 
         if choice_data:
+            stream_content_length = choice_data.get("stream_content_length")
+            stream_tool_calls_count = choice_data.get("stream_tool_calls_count")
+
             # Check message content
             message = choice_data.get("message") or choice_data.get("delta")
             if message:
-                content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else None)
+                content = getattr(message, "content", None) or (
+                    message.get("content") if isinstance(message, dict) else None
+                )
                 if content:
                     has_content = True
                     content_length = len(content)
 
                 # Check tool calls
-                tool_calls = getattr(message, "tool_calls", None) or (message.get("tool_calls") if isinstance(message, dict) else None)
+                tool_calls = getattr(message, "tool_calls", None) or (
+                    message.get("tool_calls") if isinstance(message, dict) else None
+                )
                 if tool_calls:
                     tool_calls_count = len(tool_calls)
                     if tool_calls_count > 0:
                         has_content = True  # Tool calls count as content
+
+            if isinstance(stream_content_length, int) and stream_content_length > 0:
+                content_length = max(content_length, stream_content_length)
+                has_content = True
+
+            if (
+                isinstance(stream_tool_calls_count, int)
+                and stream_tool_calls_count > 0
+            ):
+                # The terminal chunk can repeat tool calls or contain an empty
+                # delta. Use the accumulated count without double-counting the
+                # calls visible in the current delta.
+                tool_calls_count = max(tool_calls_count, stream_tool_calls_count)
+                has_content = True
 
         metadata = {
             "has_content": has_content,
@@ -374,13 +412,15 @@ class DeepseekProvider(Provider):
             "tool_calls_count": tool_calls_count,
             "finish_reason": finish_reason,
             "model": model,
-            "provider": "deepseek"
+            "provider": self.PROVIDER_NAME,
         }
 
         # Use OpenAI mapping since DeepSeek is OpenAI-compatible, but preserve DeepSeek provider identity
-        stop_info = stop_reason_manager.map_stop_reason("openai", finish_reason, metadata)
+        stop_info = stop_reason_manager.map_stop_reason(
+            "openai", finish_reason, metadata
+        )
         # Override provider in metadata to correctly identify as DeepSeek
-        stop_info.metadata["provider"] = "deepseek"
+        stop_info.metadata["provider"] = self.PROVIDER_NAME
         return stop_info
 
     def _normalize_usage(self, usage_obj):
@@ -436,10 +476,16 @@ class DeepseekProvider(Provider):
             if cached_tokens is None:
                 cached_tokens = _deep_get(data, "input_tokens_details", "cached_tokens")
             if cached_tokens is None:
-                cached_tokens = _deep_get(usage_obj, "prompt_tokens_details", "cached_tokens")
+                cached_tokens = _deep_get(
+                    usage_obj, "prompt_tokens_details", "cached_tokens"
+                )
             if cached_tokens is None:
-                cached_tokens = _deep_get(usage_obj, "input_tokens_details", "cached_tokens")
-            cache_read_input_tokens = int(cached_tokens) if cached_tokens is not None else 0
+                cached_tokens = _deep_get(
+                    usage_obj, "input_tokens_details", "cached_tokens"
+                )
+            cache_read_input_tokens = (
+                int(cached_tokens) if cached_tokens is not None else 0
+            )
 
         if cache_read_input_tokens < 0:
             cache_read_input_tokens = 0
@@ -543,7 +589,7 @@ class DeepseekProvider(Provider):
             "pending_tool_calls": pending_tool_calls,
             "finish_reason": finish_reason,
             "model": model,
-            "provider": "deepseek",
+            "provider": self.PROVIDER_NAME,
             "error_class": "malformed_streaming_tool_call_arguments",
             "error_message": "模型生成了工具调用，但工具参数不是合法 JSON",
             "retryable": True,
@@ -554,12 +600,17 @@ class DeepseekProvider(Provider):
             metadata=metadata,
         )
 
-    async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
+    async def chat_completions_create(
+        self, model, messages, stream: bool = False, **kwargs
+    ) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         # Any exception raised by OpenAI will be returned to the caller.
         # Maybe we should catch them and raise a custom LLMError.
         replay_request_view = kwargs.pop("_replay_request_view", None)
         replay_mode = kwargs.pop("_replay_mode", None)
-        if replay_request_view is not None and replay_mode == "canonical_with_reasoning":
+        if (
+            replay_request_view is not None
+            and replay_mode == "canonical_with_reasoning"
+        ):
             prepared_messages = replay_request_view
         else:
             replay_build = self.build_replay_view(model, messages, **kwargs)
@@ -596,7 +647,24 @@ class DeepseekProvider(Provider):
                         chunk_index += 1
                         # Capture usage from streaming chunks (only appears on final chunk)
                         if hasattr(chunk, "usage") and chunk.usage:
-                            stream_usage = self._normalize_usage(chunk.usage) or stream_usage
+                            stream_usage = (
+                                self._normalize_usage(chunk.usage) or stream_usage
+                            )
+
+                        # OpenAI-compatible APIs can emit usage in a trailing
+                        # chunk whose choices list is empty. Forward that chunk
+                        # so downstream accounting does not lose token usage.
+                        if not chunk.choices and stream_usage:
+                            yield ChatCompletionResponse(
+                                choices=[],
+                                metadata={
+                                    "id": getattr(chunk, "id", None),
+                                    "created": getattr(chunk, "created", None),
+                                    "model": getattr(chunk, "model", None) or model,
+                                    "usage": stream_usage,
+                                },
+                            )
+                            continue
 
                         if chunk.choices:
                             # Create choices with stop_info
@@ -604,14 +672,26 @@ class DeepseekProvider(Provider):
                             for choice in chunk.choices:
                                 # Accumulate content and tool calls for accurate metadata
                                 if choice.delta.content:
-                                    self._stream_content_length += len(choice.delta.content)
-                                reasoning_content = getattr(choice.delta, "reasoning_content", None)
+                                    self._stream_content_length += len(
+                                        choice.delta.content
+                                    )
+                                reasoning_content = getattr(
+                                    choice.delta, "reasoning_content", None
+                                )
                                 if reasoning_content:
-                                    self._accumulate_reasoning_content(reasoning_content)
+                                    self._accumulate_reasoning_content(
+                                        reasoning_content
+                                    )
 
-                                accumulated_tool_calls = self._accumulate_and_convert_tool_calls(choice.delta)
+                                accumulated_tool_calls = (
+                                    self._accumulate_and_convert_tool_calls(
+                                        choice.delta
+                                    )
+                                )
                                 if accumulated_tool_calls:
-                                    self._stream_tool_calls_count += len(accumulated_tool_calls)
+                                    self._stream_tool_calls_count += len(
+                                        accumulated_tool_calls
+                                    )
 
                                 # Create stop_info if finish_reason is present
                                 stop_info = None
@@ -619,15 +699,21 @@ class DeepseekProvider(Provider):
                                     # Use accumulated values for final stop_info
                                     if choice.finish_reason == "stop":
                                         metadata = {
-                                            "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
+                                            "has_content": self._stream_content_length
+                                            > 0
+                                            or self._stream_tool_calls_count > 0,
                                             "content_length": self._stream_content_length,
                                             "tool_calls_count": self._stream_tool_calls_count,
                                             "finish_reason": choice.finish_reason,
                                             "model": chunk.model,
-                                            "provider": "deepseek",
+                                            "provider": self.PROVIDER_NAME,
                                         }
-                                        stop_info = stop_reason_manager.map_stop_reason("openai", choice.finish_reason, metadata)
-                                        stop_info.metadata["provider"] = "deepseek"
+                                        stop_info = stop_reason_manager.map_stop_reason(
+                                            "openai", choice.finish_reason, metadata
+                                        )
+                                        stop_info.metadata["provider"] = (
+                                            self.PROVIDER_NAME
+                                        )
                                     elif (
                                         choice.finish_reason == "tool_calls"
                                         and not accumulated_tool_calls
@@ -638,8 +724,16 @@ class DeepseekProvider(Provider):
                                             model=chunk.model,
                                         )
                                     else:
-                                        choice_data = {"delta": choice.delta}
-                                        stop_info = self._create_stop_info(choice.finish_reason, choice_data, chunk.model)
+                                        choice_data = {
+                                            "delta": choice.delta,
+                                            "stream_content_length": self._stream_content_length,
+                                            "stream_tool_calls_count": self._stream_tool_calls_count,
+                                        }
+                                        stop_info = self._create_stop_info(
+                                            choice.finish_reason,
+                                            choice_data,
+                                            chunk.model,
+                                        )
 
                                 choices.append(
                                     StreamChoice(
@@ -656,7 +750,10 @@ class DeepseekProvider(Provider):
                                 )
 
                             # Determine if this is the final chunk
-                            is_final_chunk = any(c.finish_reason for c in chunk.choices) or stream_usage is not None
+                            is_final_chunk = (
+                                any(c.finish_reason for c in chunk.choices)
+                                or stream_usage is not None
+                            )
                             metadata = {
                                 "id": chunk.id,
                                 "created": chunk.created,
@@ -695,11 +792,16 @@ class DeepseekProvider(Provider):
                         message=Message(
                             content=choice.message.content,
                             role=choice.message.role,
-                            tool_calls=self._convert_tool_calls(choice.message.tool_calls)
-                            if hasattr(choice.message, "tool_calls") and choice.message.tool_calls
-                            else None,
+                            tool_calls=(
+                                self._convert_tool_calls(choice.message.tool_calls)
+                                if hasattr(choice.message, "tool_calls")
+                                and choice.message.tool_calls
+                                else None
+                            ),
                             refusal=None,
-                            reasoning_content=self._convert_reasoning_content(getattr(choice.message, "reasoning_content", None)),
+                            reasoning_content=self._convert_reasoning_content(
+                                getattr(choice.message, "reasoning_content", None)
+                            ),
                         ),
                         finish_reason=finish_reason,
                         stop_info=stop_info,
@@ -729,7 +831,7 @@ class DeepseekProvider(Provider):
 
         return ReasoningContent(
             thinking=reasoning_content,
-            provider="deepseek",
+            provider=self.PROVIDER_NAME,
             raw_data=self._build_reasoning_replay_payload(reasoning_content),
         )
 
@@ -743,48 +845,55 @@ class DeepseekProvider(Provider):
         Returns:
             List of converted tool calls if any are complete, None otherwise
         """
-        if not hasattr(delta, 'tool_calls') or not delta.tool_calls:
+        if not hasattr(delta, "tool_calls") or not delta.tool_calls:
             return None
 
         # Accumulate tool call chunks
         for tool_call_delta in delta.tool_calls:
-            index = getattr(tool_call_delta, 'index', 0)
+            index = getattr(tool_call_delta, "index", 0)
 
             # Initialize tool call accumulator if not exists
             if index not in self._streaming_tool_calls:
                 self._streaming_tool_calls[index] = {
                     "id": "",
                     "type": "function",
-                    "function": {
-                        "name": "",
-                        "arguments": ""
-                    }
+                    "function": {"name": "", "arguments": ""},
                 }
 
             tool_call = self._streaming_tool_calls[index]
 
             # Accumulate id
-            if hasattr(tool_call_delta, 'id') and tool_call_delta.id:
+            if hasattr(tool_call_delta, "id") and tool_call_delta.id:
                 tool_call["id"] += tool_call_delta.id
 
             # Accumulate function data
-            if hasattr(tool_call_delta, 'function') and tool_call_delta.function:
-                if hasattr(tool_call_delta.function, 'name') and tool_call_delta.function.name:
+            if hasattr(tool_call_delta, "function") and tool_call_delta.function:
+                if (
+                    hasattr(tool_call_delta.function, "name")
+                    and tool_call_delta.function.name
+                ):
                     tool_call["function"]["name"] += tool_call_delta.function.name
 
-                if hasattr(tool_call_delta.function, 'arguments') and tool_call_delta.function.arguments:
-                    tool_call["function"]["arguments"] += tool_call_delta.function.arguments
+                if (
+                    hasattr(tool_call_delta.function, "arguments")
+                    and tool_call_delta.function.arguments
+                ):
+                    tool_call["function"][
+                        "arguments"
+                    ] += tool_call_delta.function.arguments
 
             # Set type if provided
-            if hasattr(tool_call_delta, 'type') and tool_call_delta.type:
+            if hasattr(tool_call_delta, "type") and tool_call_delta.type:
                 tool_call["type"] = tool_call_delta.type
 
         # Check for complete tool calls and convert them
         complete_tool_calls = []
         for index, tool_call_data in list(self._streaming_tool_calls.items()):
-            if (tool_call_data["id"] and
-                tool_call_data["function"]["name"] and
-                tool_call_data["function"]["arguments"]):
+            if (
+                tool_call_data["id"]
+                and tool_call_data["function"]["name"]
+                and tool_call_data["function"]["arguments"]
+            ):
 
                 try:
                     # Try to parse arguments as JSON to ensure completeness
@@ -804,7 +913,7 @@ class DeepseekProvider(Provider):
                     mock_tool_call = MockToolCall(
                         tool_call_data["id"],
                         tool_call_data["function"]["name"],
-                        tool_call_data["function"]["arguments"]
+                        tool_call_data["function"]["arguments"],
                     )
 
                     # Use existing conversion logic
@@ -829,13 +938,10 @@ class DeepseekProvider(Provider):
         converted_tool_calls = []
         for tool_call in tool_calls:
             function = Function(
-                name=tool_call.function.name,
-                arguments=tool_call.function.arguments
+                name=tool_call.function.name, arguments=tool_call.function.arguments
             )
             tool_call_obj = ChatCompletionMessageToolCall(
-                id=tool_call.id,
-                function=function,
-                type="function"
+                id=tool_call.id, function=function, type="function"
             )
             converted_tool_calls.append(tool_call_obj)
         return converted_tool_calls

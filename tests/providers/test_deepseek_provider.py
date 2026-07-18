@@ -446,6 +446,68 @@ async def test_deepseek_provider_streaming_accumulates_reasoning_content():
 
 
 @pytest.mark.asyncio
+async def test_deepseek_provider_stream_forwards_trailing_usage_only_chunk():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    async def fake_response():
+        yield _ns(
+            id="chunk-1",
+            created=1,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason="stop",
+                    delta=_ns(
+                        content="done",
+                        role="assistant",
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                )
+            ],
+        )
+        yield _ns(
+            id="chunk-2",
+            created=2,
+            model="deepseek-v4-pro",
+            usage=_ns(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+            ),
+            choices=[],
+        )
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=fake_response()),
+    ):
+        stream = await provider.chat_completions_create(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Hello!"}],
+            stream=True,
+        )
+        streamed_chunks = [chunk async for chunk in stream]
+
+    assert streamed_chunks[0].choices[0].delta.content == "done"
+    assert streamed_chunks[-1].choices == []
+    assert streamed_chunks[-1].usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "cache_read_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "cache_write_by_ttl": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 0,
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_deepseek_provider_closes_stream_response_after_iteration():
     provider = DeepseekProvider(api_key="test-api-key")
     stream_response = _ClosableAsyncStream(
@@ -563,3 +625,169 @@ async def test_deepseek_provider_streaming_marks_pending_malformed_tool_call_ret
     assert streamed_chunks[-1].choices[0].stop_info.metadata["retryable"] is True
     assert streamed_chunks[-1].choices[0].stop_info.metadata["pending_tool_calls"][0]["function_name"] == "edit_file"
     assert streamed_chunks[-1].choices[0].stop_info.metadata["pending_tool_calls"][0]["parse_error"]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_streaming_preserves_accumulated_multiple_tool_call_count():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    chunks = [
+        _ns(
+            id="chunk-1",
+            created=1,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason=None,
+                    delta=_ns(
+                        content=None,
+                        role="assistant",
+                        reasoning_content=None,
+                        tool_calls=[
+                            _ns(
+                                index=0,
+                                id="call_1",
+                                type="function",
+                                function=_ns(
+                                    name="read_file",
+                                    arguments='{"path":"brief.md"}',
+                                ),
+                            ),
+                            _ns(
+                                index=1,
+                                id="call_2",
+                                type="function",
+                                function=_ns(
+                                    name="read_file",
+                                    arguments='{"path":"facts.json"}',
+                                ),
+                            ),
+                        ],
+                    ),
+                )
+            ],
+        ),
+        _ns(
+            id="chunk-2",
+            created=2,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason="tool_calls",
+                    delta=_ns(
+                        content=None,
+                        role=None,
+                        reasoning_content=None,
+                        tool_calls=None,
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    async def fake_response():
+        for chunk in chunks:
+            yield chunk
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=fake_response()),
+    ):
+        stream = await provider.chat_completions_create(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Read both files."}],
+            stream=True,
+        )
+        streamed_chunks = [chunk async for chunk in stream]
+
+    assert len(streamed_chunks[0].choices[0].delta.tool_calls) == 2
+    final_choice = streamed_chunks[-1].choices[0]
+    assert final_choice.finish_reason == "tool_calls"
+    assert final_choice.delta.tool_calls is None
+    assert final_choice.stop_info.reason.value == "tool_call"
+    assert final_choice.stop_info.metadata["tool_calls_count"] == 2
+    assert final_choice.stop_info.metadata["has_content"] is True
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_streaming_does_not_double_count_terminal_tool_call():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    def tool_call_chunk(
+        *,
+        chunk_id,
+        index,
+        call_id,
+        path,
+        finish_reason=None,
+    ):
+        return _ns(
+            id=chunk_id,
+            created=index + 1,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason=finish_reason,
+                    delta=_ns(
+                        content=None,
+                        role="assistant" if index == 0 else None,
+                        reasoning_content=None,
+                        tool_calls=[
+                            _ns(
+                                index=index,
+                                id=call_id,
+                                type="function",
+                                function=_ns(
+                                    name="read_file",
+                                    arguments=f'{{"path":"{path}"}}',
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+
+    chunks = [
+        tool_call_chunk(
+            chunk_id="chunk-1",
+            index=0,
+            call_id="call_1",
+            path="brief.md",
+        ),
+        tool_call_chunk(
+            chunk_id="chunk-2",
+            index=1,
+            call_id="call_2",
+            path="facts.json",
+            finish_reason="tool_calls",
+        ),
+    ]
+
+    async def fake_response():
+        for chunk in chunks:
+            yield chunk
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=fake_response()),
+    ):
+        stream = await provider.chat_completions_create(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Read both files."}],
+            stream=True,
+        )
+        streamed_chunks = [chunk async for chunk in stream]
+
+    final_choice = streamed_chunks[-1].choices[0]
+    assert len(final_choice.delta.tool_calls) == 1
+    assert final_choice.stop_info.reason.value == "tool_call"
+    assert final_choice.stop_info.metadata["tool_calls_count"] == 2
