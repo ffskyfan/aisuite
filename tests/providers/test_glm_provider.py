@@ -11,6 +11,44 @@ def _ns(**kwargs):
     return SimpleNamespace(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expected_effort"),
+    [
+        ("low", "high"),
+        ("medium", "high"),
+        ("high", "high"),
+        ("max", "max"),
+        ("xhigh", "max"),
+    ],
+)
+def test_glm_prepare_kwargs_preserves_supported_reasoning_effort(
+    monkeypatch,
+    reasoning_effort,
+    expected_effort,
+):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+    provider = GlmProvider()
+
+    prepared = provider._prepare_kwargs({"reasoning_effort": reasoning_effort})
+
+    assert prepared["thinking"] == {"type": "enabled"}
+    assert prepared["reasoning_effort"] == expected_effort
+
+
+def test_glm_prepare_kwargs_reads_nested_reasoning_effort(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "test-api-key")
+    provider = GlmProvider()
+
+    prepared = provider._prepare_kwargs(
+        {"reasoning": {"type": "enabled", "effort": "max"}}
+    )
+
+    assert prepared == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+
+
 @pytest.mark.asyncio
 async def test_glm_provider_non_stream(monkeypatch):
     monkeypatch.setenv("ZAI_API_KEY", "test-api-key")

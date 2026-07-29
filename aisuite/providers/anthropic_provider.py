@@ -843,6 +843,7 @@ class AnthropicProvider(Provider):
         self._streaming_tool_calls = {}
         # Track thinking state for error recovery
         self._thinking_enabled = False
+        self._thinking_mode = None
         # State for accumulating thinking content
         self._streaming_thinking = {
             "thinking": "",
@@ -1025,8 +1026,15 @@ class AnthropicProvider(Provider):
         replay_mode = kwargs.pop("_replay_mode", None)
         kwargs = self._prepare_kwargs(kwargs)
 
-        # Track thinking state for error recovery
-        self._thinking_enabled = "thinking" in kwargs
+        # Manual extended thinking and adaptive thinking have different replay
+        # requirements.  The manual-mode repair below must not run for adaptive
+        # thinking, where Claude decides whether to emit a thinking block.
+        thinking_config = kwargs.get("thinking")
+        if isinstance(thinking_config, dict):
+            self._thinking_mode = thinking_config.get("type")
+        else:
+            self._thinking_mode = getattr(thinking_config, "type", None)
+        self._thinking_enabled = self._thinking_mode in {"enabled", "adaptive"}
 
         if replay_request_view is not None and replay_mode == "anthropic_messages":
             if isinstance(replay_request_view, dict):
@@ -1041,7 +1049,7 @@ class AnthropicProvider(Provider):
 
         # Fix thinking blocks proactively when thinking is enabled
         # This MUST be done before API call to prevent errors and resource waste
-        if self._thinking_enabled:
+        if self._thinking_mode == "enabled":
             converted_messages = self._fix_thinking_messages(converted_messages)
 
             # If thinking was disabled during fix due to incompatible messages,

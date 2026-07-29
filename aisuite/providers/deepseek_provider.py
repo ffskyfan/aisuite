@@ -537,6 +537,26 @@ class DeepseekProvider(Provider):
             if reasoning_effort:
                 prepared["reasoning_effort"] = reasoning_effort
 
+        extra_body = prepared.get("extra_body") or {}
+        thinking_config = (
+            extra_body.get("thinking") if isinstance(extra_body, dict) else None
+        )
+        thinking_type = (
+            thinking_config.get("type")
+            if isinstance(thinking_config, dict)
+            else getattr(thinking_config, "type", None)
+        )
+        if thinking_type == "disabled":
+            prepared.pop("reasoning_effort", None)
+        elif thinking_type == "enabled":
+            for parameter in (
+                "temperature",
+                "top_p",
+                "presence_penalty",
+                "frequency_penalty",
+            ):
+                prepared.pop(parameter, None)
+
         return prepared
 
     @staticmethod

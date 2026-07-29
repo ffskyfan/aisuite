@@ -20,14 +20,18 @@ def test_kimi_provider_uses_official_default_endpoint():
     assert client.call_args.kwargs["base_url"] == "https://api.moonshot.ai/v1"
 
 
-def test_kimi_provider_prepares_fixed_k3_parameters():
+@pytest.mark.parametrize(
+    "reasoning_effort",
+    ["low", "medium", "high", "max", "xhigh"],
+)
+def test_kimi_provider_prepares_fixed_k3_parameters(reasoning_effort):
     provider = _provider()
     prepared = provider._prepare_request_kwargs(
         {
             "temperature": 0.7,
             "top_p": 0.8,
             "thinking": {"type": "enabled"},
-            "reasoning": {"effort": "high"},
+            "reasoning_effort": reasoning_effort,
             "max_tokens": 4096,
         }
     )

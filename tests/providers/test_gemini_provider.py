@@ -181,6 +181,63 @@ def test_gemini_convert_tool_spec_preserves_non_dict_parameters(_mock_client_cls
     assert "parameters_json_schema" not in declaration
 
 
+@pytest.mark.parametrize(
+    ("model", "effort", "expected_level"),
+    [
+        ("gemini-3-flash-preview", "low", "low"),
+        ("gemini-3-flash-preview", "medium", "medium"),
+        ("gemini-3-flash-preview", "high", "high"),
+        ("gemini-3.1-pro-preview", "low", "low"),
+        ("gemini-3.1-pro-preview", "medium", "medium"),
+        ("gemini-3.1-pro-preview", "high", "high"),
+        ("gemini-3.1-pro-preview", "max", "high"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gemini_3_reasoning_effort_is_passed_as_thinking_level(
+    model,
+    effort,
+    expected_level,
+):
+    provider = GeminiProvider(api_key="test-gemini-key")
+    provider.client = MagicMock()
+    chat = MagicMock()
+    provider.client.chats.create.return_value = chat
+    chat.send_message.return_value = SimpleNamespace()
+
+    with patch.object(
+        GeminiMessageConverter,
+        "from_gemini_response",
+        return_value="ok",
+    ):
+        result = await provider.chat_completions_create(
+            model,
+            [{"role": "user", "content": "hello"}],
+            reasoning_effort=effort,
+        )
+
+    assert result == "ok"
+    config = provider.client.chats.create.call_args.kwargs["config"]
+    thinking_config = config.kwargs["thinking_config"]
+    assert thinking_config.kwargs == {
+        "thinking_level": expected_level,
+        "include_thoughts": True,
+    }
+
+
+def test_gemini_thinking_level_fails_loudly_with_unsupported_sdk(monkeypatch):
+    monkeypatch.setattr(
+        _FakeThinkingConfig,
+        "model_fields",
+        {"include_thoughts": object()},
+    )
+
+    with pytest.raises(LLMError, match="google-genai>=1.59.0"):
+        gemini_module._filter_thinking_config_fields(
+            {"thinking_level": "medium", "include_thoughts": True}
+        )
+
+
 @patch("aisuite.providers.gemini_provider.genai.Client")
 def test_gemini_validate_replay_window_errors_on_missing_signature(_mock_client_cls):
     provider = GeminiProvider(api_key="test-gemini-key")

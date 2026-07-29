@@ -358,6 +358,47 @@ async def test_deepseek_provider_moves_thinking_to_extra_body():
     assert mock_create.call_args.kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
 
 
+def test_deepseek_enabled_thinking_removes_conflicting_sampling_controls():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    prepared = provider._prepare_request_kwargs(
+        {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high",
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "presence_penalty": 0.1,
+            "frequency_penalty": 0.1,
+            "max_completion_tokens": 4096,
+        }
+    )
+
+    assert prepared == {
+        "extra_body": {"thinking": {"type": "enabled"}},
+        "reasoning_effort": "high",
+        "max_completion_tokens": 4096,
+    }
+
+
+def test_deepseek_disabled_thinking_drops_reasoning_effort_only():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    prepared = provider._prepare_request_kwargs(
+        {
+            "thinking": {"type": "disabled"},
+            "reasoning": {"effort": "high"},
+            "temperature": 0.2,
+            "top_p": 0.8,
+        }
+    )
+
+    assert prepared == {
+        "extra_body": {"thinking": {"type": "disabled"}},
+        "temperature": 0.2,
+        "top_p": 0.8,
+    }
+
+
 @pytest.mark.asyncio
 async def test_deepseek_provider_streaming_accumulates_reasoning_content():
     provider = DeepseekProvider(api_key="test-api-key")

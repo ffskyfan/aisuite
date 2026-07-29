@@ -747,12 +747,13 @@ async def test_openai_prefixed_gpt5_chat_create_uses_responses_api(_mock_client_
             "openai/gpt-5.4",
             [{"role": "user", "content": "hello"}],
             max_tokens=1024,
-            reasoning={"effort": "low"},
+            reasoning={"effort": "xhigh"},
         )
 
     assert result.choices[0].message.content == "done"
     assert mock_responses_create.await_args.kwargs["model"] == "openai/gpt-5.4"
     assert mock_responses_create.await_args.kwargs["max_output_tokens"] == 1024
+    assert mock_responses_create.await_args.kwargs["reasoning"] == {"effort": "xhigh"}
     assert "max_completion_tokens" not in mock_responses_create.await_args.kwargs
 
 
@@ -915,3 +916,107 @@ async def test_anthropic_chat_completions_create_uses_replay_override(_mock_clie
     assert result == "ok"
     assert mock_create.await_args.kwargs["system"] == "system prompt"
     assert mock_create.await_args.kwargs["messages"] == [{"role": "user", "content": "hello"}]
+
+
+@patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")
+@pytest.mark.asyncio
+async def test_anthropic_adaptive_thinking_bypasses_manual_replay_fix(_mock_client_cls):
+    provider = AnthropicProvider(api_key="test-anthropic-key")
+    converted_messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "lookup_weather",
+                    "input": {"city": "Shanghai"},
+                }
+            ],
+        }
+    ]
+
+    with (
+        patch.object(
+            provider.converter,
+            "convert_request",
+            return_value=(None, converted_messages),
+        ),
+        patch.object(provider.converter, "convert_response", return_value="ok"),
+        patch.object(
+            provider,
+            "_fix_thinking_messages",
+            side_effect=AssertionError("adaptive thinking must not use manual replay repair"),
+        ),
+        patch.object(
+            provider.client.messages,
+            "create",
+            new=AsyncMock(return_value=SimpleNamespace()),
+        ) as mock_create,
+    ):
+        result = await provider.chat_completions_create(
+            "claude-sonnet-4-6",
+            [{"role": "user", "content": "hello"}],
+            thinking={"type": "adaptive"},
+            output_config={"effort": "max"},
+        )
+
+    assert result == "ok"
+    assert mock_create.await_args.kwargs["thinking"] == {"type": "adaptive"}
+    assert mock_create.await_args.kwargs["output_config"] == {"effort": "max"}
+    assert mock_create.await_args.kwargs["messages"] == converted_messages
+
+
+@patch("aisuite.providers.anthropic_provider.anthropic.AsyncAnthropic")
+@pytest.mark.asyncio
+async def test_anthropic_manual_thinking_keeps_budget_and_runs_replay_fix(_mock_client_cls):
+    provider = AnthropicProvider(api_key="test-anthropic-key")
+    converted_messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "I should use the tool.",
+                    "signature": "sig_123",
+                },
+                {
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "lookup_weather",
+                    "input": {"city": "Shanghai"},
+                },
+            ],
+        }
+    ]
+
+    with (
+        patch.object(
+            provider.converter,
+            "convert_request",
+            return_value=(None, converted_messages),
+        ),
+        patch.object(provider.converter, "convert_response", return_value="ok"),
+        patch.object(
+            provider,
+            "_fix_thinking_messages",
+            wraps=provider._fix_thinking_messages,
+        ) as mock_fix,
+        patch.object(
+            provider.client.messages,
+            "create",
+            new=AsyncMock(return_value=SimpleNamespace()),
+        ) as mock_create,
+    ):
+        result = await provider.chat_completions_create(
+            "claude-sonnet-4-6",
+            [{"role": "user", "content": "hello"}],
+            thinking={"type": "enabled", "budget_tokens": 8192},
+        )
+
+    assert result == "ok"
+    mock_fix.assert_called_once_with(converted_messages)
+    assert mock_create.await_args.kwargs["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 8192,
+    }

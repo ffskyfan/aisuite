@@ -166,3 +166,29 @@ def test_gemini_normalize_response_token_count_camel_case():
             "ephemeral_1h_input_tokens": 0,
         },
     }
+
+
+@pytest.mark.parametrize(
+    "usage_metadata",
+    [
+        {
+            "prompt_token_count": 100,
+            "candidates_token_count": 20,
+            "thoughts_token_count": 30,
+            "total_token_count": 150,
+        },
+        {
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 20,
+            "thoughtsTokenCount": 30,
+            "totalTokenCount": 150,
+        },
+    ],
+)
+def test_gemini_normalize_includes_thought_tokens_once(usage_metadata):
+    normalized = _normalize_gemini_usage(usage_metadata)
+
+    assert normalized["prompt_tokens"] == 100
+    assert normalized["completion_tokens"] == 50
+    assert normalized["reasoning_tokens"] == 30
+    assert normalized["total_tokens"] == 150

@@ -331,23 +331,59 @@ class GlmProvider(Provider):
     def _prepare_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         prepared = dict(kwargs)
 
-        if "reasoning" in prepared and "thinking" not in prepared:
-            prepared["thinking"] = prepared.pop("reasoning")
-        else:
-            prepared.pop("reasoning", None)
+        reasoning = prepared.pop("reasoning", None)
+        reasoning_effort = prepared.get("reasoning_effort")
+        if isinstance(reasoning, dict):
+            if reasoning_effort is None:
+                reasoning_effort = reasoning.get("effort")
+            if (
+                "thinking" not in prepared
+                and reasoning.get("type") in {"enabled", "disabled"}
+            ):
+                prepared["thinking"] = {
+                    key: value
+                    for key, value in reasoning.items()
+                    if key != "effort"
+                }
+        elif isinstance(reasoning, str) and reasoning_effort is None:
+            reasoning_effort = reasoning
+
+        normalized_effort = None
+        if isinstance(reasoning_effort, str):
+            effort = reasoning_effort.strip().lower()
+            if effort in {"max", "xhigh"}:
+                normalized_effort = "max"
+            elif effort in {"low", "medium", "high"}:
+                normalized_effort = "high"
+            elif effort in {"none", "minimal", "disable", "disabled"}:
+                prepared["thinking"] = {"type": "disabled"}
 
         # GLM models default thinking to enabled if omitted. Normalize omission to
         # an explicit disabled state so provider behavior matches AISuite's
         # cross-provider expectation that "not requested" means "off".
         if prepared.get("thinking") is None:
-            prepared["thinking"] = {"type": "disabled"}
+            prepared["thinking"] = {
+                "type": "enabled" if normalized_effort else "disabled"
+            }
+
+        thinking = prepared.get("thinking")
+        thinking_type = (
+            thinking.get("type")
+            if isinstance(thinking, dict)
+            else getattr(thinking, "type", None)
+        )
+        if thinking_type == "disabled":
+            prepared.pop("reasoning_effort", None)
+        elif normalized_effort is not None:
+            prepared["reasoning_effort"] = normalized_effort
+        else:
+            prepared.pop("reasoning_effort", None)
 
         if "max_completion_tokens" in prepared and "max_tokens" not in prepared:
             prepared["max_tokens"] = prepared.pop("max_completion_tokens")
 
         # OpenAI-style stream options are not supported by the Zhipu SDK.
         prepared.pop("stream_options", None)
-        prepared.pop("reasoning_effort", None)
         prepared.pop("verbosity", None)
 
         return prepared

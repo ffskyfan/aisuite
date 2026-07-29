@@ -93,6 +93,42 @@ async def test_vercel_provider_routes_to_explicit_anthropic_protocol():
 
 
 @pytest.mark.asyncio
+async def test_vercel_provider_passes_claude_adaptive_effort_unchanged():
+    provider = VercelProvider(api_key="test-vercel-key")
+    fake_provider = _FakeAsyncProvider("anthropic")
+    provider._protocol_providers["anthropic"] = fake_provider
+
+    await provider.chat_completions_create(
+        model="claude-sonnet-4.6",
+        messages=[{"role": "user", "content": "hello"}],
+        protocol="anthropic",
+        thinking={"type": "adaptive"},
+        output_config={"effort": "max"},
+    )
+
+    assert fake_provider.calls[0]["kwargs"]["thinking"] == {"type": "adaptive"}
+    assert fake_provider.calls[0]["kwargs"]["output_config"] == {"effort": "max"}
+
+
+@pytest.mark.asyncio
+async def test_vercel_provider_passes_gpt_xhigh_effort_unchanged():
+    provider = VercelProvider(api_key="test-vercel-key")
+    fake_provider = _FakeAsyncProvider("openai")
+    provider._protocol_providers["openai"] = fake_provider
+
+    await provider.chat_completions_create(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hello"}],
+        protocol="openai",
+        reasoning={"effort": "xhigh"},
+        max_completion_tokens=65536,
+    )
+
+    assert fake_provider.calls[0]["kwargs"]["reasoning"] == {"effort": "xhigh"}
+    assert fake_provider.calls[0]["kwargs"]["max_completion_tokens"] == 65536
+
+
+@pytest.mark.asyncio
 async def test_vercel_provider_routes_model_protocol_prefix():
     provider = VercelProvider(api_key="test-vercel-key")
     fake_provider = _FakeAsyncProvider("anthropic")

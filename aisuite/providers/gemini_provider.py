@@ -37,7 +37,8 @@ def _normalize_gemini_usage(usage_obj):
     """Normalize Gemini usage/usageMetadata to AISuite standard dict.
 
     Maps promptTokenCount/prompt_token_count -> prompt_tokens,
-    responseTokenCount/response_token_count (or candidatesTokenCount/candidates_token_count) -> completion_tokens,
+    responseTokenCount/response_token_count (or candidatesTokenCount/candidates_token_count)
+    plus thoughtsTokenCount/thoughts_token_count -> completion_tokens,
     totalTokenCount/total_token_count -> total_tokens,
     cachedContentTokenCount/cached_content_token_count -> cache_read_input_tokens.
     """
@@ -56,11 +57,13 @@ def _normalize_gemini_usage(usage_obj):
             "cached_content_token_count",
             "response_token_count",
             "candidates_token_count",
+            "thoughts_token_count",
             "total_token_count",
             "promptTokenCount",
             "cachedContentTokenCount",
             "responseTokenCount",
             "candidatesTokenCount",
+            "thoughtsTokenCount",
             "totalTokenCount",
         ):
             if hasattr(usage_obj, attr):
@@ -72,27 +75,37 @@ def _normalize_gemini_usage(usage_obj):
     cached_content_tokens = data.get("cached_content_token_count")
     if cached_content_tokens is None:
         cached_content_tokens = data.get("cachedContentTokenCount")
-    completion_tokens = data.get("response_token_count")
-    if completion_tokens is None:
-        completion_tokens = data.get("responseTokenCount")
-    if completion_tokens is None:
-        completion_tokens = data.get("candidates_token_count")
-    if completion_tokens is None:
-        completion_tokens = data.get("candidatesTokenCount")
-    total_tokens = (
-        data.get("total_token_count")
-        or data.get("totalTokenCount")
-        or (
-            (prompt_tokens or 0) + (completion_tokens or 0)
-            if prompt_tokens is not None and completion_tokens is not None
-            else None
-        )
-    )
+    visible_completion_tokens = data.get("response_token_count")
+    if visible_completion_tokens is None:
+        visible_completion_tokens = data.get("responseTokenCount")
+    if visible_completion_tokens is None:
+        visible_completion_tokens = data.get("candidates_token_count")
+    if visible_completion_tokens is None:
+        visible_completion_tokens = data.get("candidatesTokenCount")
+    reasoning_tokens = data.get("thoughts_token_count")
+    if reasoning_tokens is None:
+        reasoning_tokens = data.get("thoughtsTokenCount")
+
+    completion_tokens = visible_completion_tokens
+    if visible_completion_tokens is not None and reasoning_tokens is not None:
+        # Gemini reports visible output and billed thinking tokens separately.
+        # AISuite's completion_tokens is the billable output total.
+        completion_tokens = int(visible_completion_tokens) + int(reasoning_tokens)
+
+    total_tokens = data.get("total_token_count")
+    if total_tokens is None:
+        total_tokens = data.get("totalTokenCount")
+    if (
+        total_tokens is None
+        and prompt_tokens is not None
+        and completion_tokens is not None
+    ):
+        total_tokens = int(prompt_tokens) + int(completion_tokens)
 
     if prompt_tokens is None and completion_tokens is None and total_tokens is None:
         return None
 
-    return {
+    normalized = {
         "prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else None,
         "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
         "total_tokens": int(total_tokens) if total_tokens is not None else None,
@@ -103,6 +116,9 @@ def _normalize_gemini_usage(usage_obj):
             "ephemeral_1h_input_tokens": 0,
         },
     }
+    if reasoning_tokens is not None:
+        normalized["reasoning_tokens"] = int(reasoning_tokens)
+    return normalized
 
 
 GEMINI_PROVIDER_NAME = "gemini"
@@ -413,7 +429,7 @@ def _normalize_thinking_config(value: Any) -> Dict[str, Any]:
 
 
 def _filter_thinking_config_fields(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Drop thinking_config keys unsupported by the installed SDK."""
+    """Drop optional unknown keys, but never silently lose thinking_level."""
     if not data:
         return {}
 
@@ -425,6 +441,12 @@ def _filter_thinking_config_fields(data: Dict[str, Any]) -> Dict[str, Any]:
 
     if not allowed:
         return data
+
+    if "thinking_level" in data and "thinking_level" not in allowed:
+        raise LLMError(
+            "The installed google-genai SDK does not support thinking_level; "
+            "upgrade to google-genai>=1.59.0."
+        )
 
     return {key: value for key, value in data.items() if key in allowed}
 
@@ -1354,7 +1376,8 @@ class GeminiProvider(Provider):
                 reasoning_effort = reasoning
 
         if self._is_gemini_3_model(model_id):
-            # Map to Gemini 3 thinking_level (Flash supports minimal/medium/high; Pro supports low/high)
+            # Gemini 3 Flash and Gemini 3.1 Pro support low/medium/high.
+            # Flash additionally supports minimal.
             level = None
             is_flash = self._is_gemini_3_flash_model(model_id)
             if isinstance(thinking_level, str) and thinking_level:
@@ -1363,18 +1386,16 @@ class GeminiProvider(Provider):
                 eff = reasoning_effort.lower()
                 if eff in {"minimal", "none", "disable"}:
                     level = "minimal" if is_flash else "low"
-                elif eff == "low":
-                    level = "low"
-                elif eff == "medium":
-                    level = "medium" if is_flash else "high"
-                elif eff == "high":
+                elif eff in {"low", "medium", "high"}:
+                    level = eff
+                elif eff in {"max", "xhigh"}:
                     level = "high"
 
             if level and not is_flash:
                 if level == "minimal":
                     level = "low"
-                elif level == "medium":
-                    level = "high"
+            if level in {"max", "xhigh"}:
+                level = "high"
 
             thinking_requested = bool(thinking_config_fields) or bool(level) or isinstance(reasoning_effort, str)
             if thinking_requested:
@@ -1392,7 +1413,12 @@ class GeminiProvider(Provider):
             if filtered_thinking_config:
                 try:
                     config_kwargs["thinking_config"] = types.ThinkingConfig(**filtered_thinking_config)
-                except Exception:
+                except Exception as exc:
+                    if "thinking_level" in filtered_thinking_config:
+                        raise LLMError(
+                            "Failed to configure Gemini thinking_level; "
+                            "google-genai>=1.59.0 is required."
+                        ) from exc
                     config_kwargs["thinking_config"] = filtered_thinking_config
 
         if messages and messages[0]['role'] == "system":
