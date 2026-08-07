@@ -32,6 +32,16 @@ class _FakeFunctionResponse:
         self.__dict__.update(kwargs)
 
 
+class _FakeFunctionResponsePart:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FakeFunctionResponseBlob:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
 class _FakePart:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -48,6 +58,10 @@ class _FakePart:
     def from_function_response(name, response):
         return _FakePart(function_response=_FakeFunctionResponse(name=name, response=response))
 
+    @staticmethod
+    def from_bytes(data, mime_type):
+        return _FakePart(inline_data=SimpleNamespace(data=data, mime_type=mime_type))
+
 
 class _FakeContent:
     def __init__(self, role, parts):
@@ -60,6 +74,8 @@ fake_types = SimpleNamespace(
     GenerateContentConfig=_FakeGenerateContentConfig,
     FunctionCall=_FakeFunctionCall,
     FunctionResponse=_FakeFunctionResponse,
+    FunctionResponsePart=_FakeFunctionResponsePart,
+    FunctionResponseBlob=_FakeFunctionResponseBlob,
     Part=_FakePart,
     Content=_FakeContent,
 )
@@ -179,6 +195,48 @@ def test_gemini_convert_tool_spec_preserves_non_dict_parameters(_mock_client_cls
     assert declaration["name"] == "call_native_schema"
     assert declaration["parameters"] is openai_tools[0]["function"]["parameters"]
     assert "parameters_json_schema" not in declaration
+
+
+@patch("aisuite.providers.gemini_provider.genai.Client")
+def test_gemini_preserves_user_image_parts(_mock_client_cls):
+    provider = GeminiProvider(api_key="test-gemini-key")
+    content = [
+        {"type": "text", "text": "inspect"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,ZnJhbWU="},
+        },
+    ]
+
+    parts = provider._content_to_gemini_parts(content)
+
+    assert parts[0].text == "inspect"
+    assert parts[1].inline_data.mime_type == "image/png"
+    assert parts[1].inline_data.data == b"frame"
+
+
+@patch("aisuite.providers.gemini_provider.genai.Client")
+def test_gemini_3_embeds_image_in_function_response_parts(_mock_client_cls):
+    provider = GeminiProvider(api_key="test-gemini-key")
+    content = [
+        {"type": "text", "text": "captured frame"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,ZnJhbWU="},
+        },
+    ]
+
+    part = provider._create_function_response_part(
+        function_name="gameplay_visual_probe",
+        content=content,
+        provider_call_id="fc_1",
+    )
+
+    response = part.function_response
+    assert response.id == "fc_1"
+    assert response.response == {"result": "captured frame"}
+    assert response.parts[0].inline_data.mime_type == "image/png"
+    assert response.parts[0].inline_data.data == b"frame"
 
 
 @pytest.mark.parametrize(

@@ -12,7 +12,7 @@ class MessageNormalizer:
     """Normalizes messages for cross-provider compatibility"""
 
     # Fields that should be preserved when passing between providers
-    CORE_FIELDS = {"role", "content", "tool_calls", "name"}
+    CORE_FIELDS = {"role", "content", "tool_calls", "name", "tool_call_id"}
 
     # Fields that may cause compatibility issues
     OPTIONAL_FIELDS = {
@@ -21,6 +21,7 @@ class MessageNormalizer:
         "tool_call_id",
         "function_call",
         "cache_control",
+        "is_error",
     }
 
     # Provider-specific field mappings
@@ -241,6 +242,11 @@ class MessageNormalizer:
         # Handle None content (common with GPT-5)
         if result["content"] is None:
             result["content"] = ""
+
+        for field in ("name", "tool_call_id", "is_error"):
+            value = getattr(message, field, None)
+            if value is not None:
+                result[field] = value
 
         # Extract optional fields
         if hasattr(message, "tool_calls") and message.tool_calls:

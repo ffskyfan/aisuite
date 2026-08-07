@@ -19,6 +19,11 @@ from aisuite.framework.replay_payload import (
     unwrap_replay_payload,
 )
 from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.framework.content import (
+    MultimodalCapabilities,
+    filter_images_for_capabilities,
+    to_openai_responses_content,
+)
 
 
 class OpenaiProvider(Provider):
@@ -122,6 +127,21 @@ class OpenaiProvider(Provider):
     def _is_o_series_reasoning_model(self, model: str) -> bool:
         model_name = self._canonical_model_name(model).lower()
         return model_name.startswith("o1-") or model_name.startswith("o3")
+
+    def get_multimodal_capabilities(
+        self, model: str | None = None
+    ) -> MultimodalCapabilities:
+        if model and self._should_use_responses_api(model, {}):
+            return MultimodalCapabilities(
+                user_images="supported",
+                tool_result_images="supported",
+            )
+        # OpenAI-compatible Chat Completions commonly accepts user images, but
+        # multimodal role=tool content is not a portable Chat contract.
+        return MultimodalCapabilities(
+            user_images="unknown",
+            tool_result_images="unsupported",
+        )
 
     def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
         return ProviderReplayCapabilities(
@@ -342,6 +362,8 @@ class OpenaiProvider(Provider):
             # Remove reasoning_content field (existing logic)
             if 'reasoning_content' in cleaned_msg:
                 cleaned_msg.pop('reasoning_content')
+            # Canonical-only metadata is mapped by native provider adapters.
+            cleaned_msg.pop('is_error', None)
 
             # Process tool_calls in assistant messages
             if cleaned_msg.get('role') == 'assistant' and cleaned_msg.get('tool_calls'):
@@ -699,7 +721,10 @@ class OpenaiProvider(Provider):
             if role == 'assistant' and msg_dict.get('tool_calls'):
                 text = msg_dict.get('content')
                 if text:
-                    input_items.append({'role': 'assistant', 'content': text})
+                    input_items.append({
+                        'role': 'assistant',
+                        'content': to_openai_responses_content(text),
+                    })
                 for tc in msg_dict['tool_calls']:
                     fn = tc.get('function', {})
                     input_items.append({
@@ -714,12 +739,18 @@ class OpenaiProvider(Provider):
                 input_items.append({
                     'type': 'function_call_output',
                     'call_id': msg_dict.get('tool_call_id'),
-                    'output': msg_dict.get('content', '')
+                    'output': to_openai_responses_content(
+                        msg_dict.get('content', '')
+                    ),
                 })
                 continue
 
-            for field in ['reasoning_content', 'tool_calls', 'tool_call_id']:
+            for field in ['reasoning_content', 'tool_calls', 'tool_call_id', 'is_error']:
                 msg_dict.pop(field, None)
+            if 'content' in msg_dict:
+                msg_dict['content'] = to_openai_responses_content(
+                    msg_dict.get('content')
+                )
             input_items.append(msg_dict)
 
         return input_items
@@ -1078,6 +1109,14 @@ class OpenaiProvider(Provider):
     async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         replay_request_view = kwargs.pop("_replay_request_view", None)
         replay_mode = kwargs.pop("_replay_mode", None)
+
+        capabilities = self.get_multimodal_capabilities(model)
+        messages, _ = filter_images_for_capabilities(messages, capabilities)
+        if replay_request_view is not None:
+            replay_request_view, _ = filter_images_for_capabilities(
+                replay_request_view,
+                capabilities,
+            )
 
         # Prepare kwargs based on model capabilities
         prepared_kwargs = self._prepare_reasoning_kwargs(model, kwargs)

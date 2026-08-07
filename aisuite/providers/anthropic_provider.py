@@ -21,6 +21,12 @@ from aisuite.framework.replay_payload import (
     unwrap_replay_payload,
 )
 from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.framework.content import (
+    MultimodalCapabilities,
+    content_text,
+    filter_images_for_capabilities,
+    to_anthropic_content,
+)
 
 # 设置专门的logger用于调试stop reason
 anthropic_logger = logging.getLogger("anthropic_stop_reason")
@@ -487,6 +493,7 @@ class AnthropicMessageConverter:
                 msg["tool_call_id"],
                 msg.get("content"),
                 cache_control=cache_control,
+                is_error=bool(msg.get("is_error", False)),
             )
         elif msg["role"] == self.ROLE_ASSISTANT and "tool_calls" in msg:
             reasoning_content = msg.get("reasoning_content")
@@ -504,13 +511,18 @@ class AnthropicMessageConverter:
                 cache_control=cache_control,
             )
 
-        content = self._apply_cache_control_to_content(msg.get("content"), cache_control)
+        content = to_anthropic_content(msg.get("content"))
+        content = self._apply_cache_control_to_content(content, cache_control)
         return {"role": msg["role"], "content": content}
 
     def _convert_message_object(self, msg):
         """Convert a Message object to Anthropic format."""
         if msg.role == self.ROLE_TOOL:
-            return self._create_tool_result_message(msg.tool_call_id, msg.content)
+            return self._create_tool_result_message(
+                msg.tool_call_id,
+                msg.content,
+                is_error=bool(getattr(msg, "is_error", False)),
+            )
         elif msg.role == self.ROLE_ASSISTANT and msg.tool_calls:
             reasoning_content = msg.reasoning_content
             return self._create_assistant_tool_message(
@@ -518,16 +530,24 @@ class AnthropicMessageConverter:
                 msg.tool_calls,
                 reasoning_content  # 传递 reasoning_content（ReasoningContent对象）
             )
-        return {"role": msg.role, "content": msg.content}
+        return {"role": msg.role, "content": to_anthropic_content(msg.content)}
 
-    def _create_tool_result_message(self, tool_call_id, content, cache_control=None):
+    def _create_tool_result_message(
+        self,
+        tool_call_id,
+        content,
+        cache_control=None,
+        is_error=False,
+    ):
         """Create a tool result message in Anthropic format."""
         cache_control = self._normalize_cache_control(cache_control)
         tool_result = {
             "type": "tool_result",
             "tool_use_id": tool_call_id,
-            "content": content,
+            "content": to_anthropic_content(content),
         }
+        if is_error:
+            tool_result["is_error"] = True
         if cache_control:
             tool_result["cache_control"] = cache_control
 
@@ -551,7 +571,10 @@ class AnthropicMessageConverter:
 
         # 2. 添加文本内容
         if content:
-            message_content.append({"type": "text", "text": content})
+            if isinstance(content, list):
+                message_content.extend(to_anthropic_content(content))
+            else:
+                message_content.append({"type": "text", "text": content})
 
         # 3. 添加工具调用
         for tool_call in tool_calls:
@@ -586,7 +609,7 @@ class AnthropicMessageConverter:
         # This needs to be fixed to handle this case.
         if messages and messages[0].get("role") == "system":
             system_msg = messages.pop(0)
-            system_content = system_msg.get("content")
+            system_content = content_text(system_msg.get("content"))
             cache_control = system_msg.get("cache_control")
             if cache_control:
                 return self._apply_cache_control_to_content(system_content, cache_control)
@@ -869,6 +892,14 @@ class AnthropicProvider(Provider):
 
         await self.client.close()
 
+    def get_multimodal_capabilities(
+        self, model: str | None = None
+    ) -> MultimodalCapabilities:
+        return MultimodalCapabilities(
+            user_images="supported",
+            tool_result_images="supported",
+        )
+
     def get_replay_capabilities(self, model: str | None = None) -> ProviderReplayCapabilities:
         return ProviderReplayCapabilities(
             needs_exact_turn_replay=False,
@@ -1024,6 +1055,13 @@ class AnthropicProvider(Provider):
         """Create a chat completion using the Anthropic API."""
         replay_request_view = kwargs.pop("_replay_request_view", None)
         replay_mode = kwargs.pop("_replay_mode", None)
+        capabilities = self.get_multimodal_capabilities(model)
+        messages, _ = filter_images_for_capabilities(messages, capabilities)
+        if isinstance(replay_request_view, list):
+            replay_request_view, _ = filter_images_for_capabilities(
+                replay_request_view,
+                capabilities,
+            )
         kwargs = self._prepare_kwargs(kwargs)
 
         # Manual extended thinking and adaptive thinking have different replay

@@ -12,6 +12,7 @@ from aisuite.framework.replay_payload import (
     unwrap_replay_payload,
 )
 from aisuite.framework.message import ReasoningContent
+from aisuite.framework.content import MultimodalCapabilities
 from aisuite.provider import LLMError
 from aisuite.providers.deepseek_provider import DeepseekProvider
 
@@ -21,6 +22,16 @@ class KimiProvider(DeepseekProvider):
 
     PROVIDER_NAME = "kimi"
     REASONING_REPLAY_KIND = "kimi_reasoning_text"
+
+    def get_multimodal_capabilities(
+        self, model: str | None = None
+    ) -> MultimodalCapabilities:
+        # Moonshot model families differ in user-image support. Keep user input
+        # optimistic, but do not send non-standard image blocks as tool output.
+        return MultimodalCapabilities(
+            user_images="unknown",
+            tool_result_images="unsupported",
+        )
 
     def __init__(self, **config):
         api_key = (

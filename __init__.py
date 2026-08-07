@@ -26,8 +26,8 @@ if _impl_dir.exists():
 try:
     from .client import Client  # noqa: F401
     from .framework.message import Message  # noqa: F401
+    from .framework.content import ToolResult  # noqa: F401
     from .utils.tools import Tools  # noqa: F401
 except Exception:
     # Allow partial imports in environments where dependencies aren't installed yet.
     pass
-

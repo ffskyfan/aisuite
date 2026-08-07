@@ -32,10 +32,25 @@ from aisuite.framework.replay_payload import (
 )
 from aisuite.framework.stop_reason import stop_reason_manager
 from aisuite.provider import LLMError, Provider
+from aisuite.framework.content import MultimodalCapabilities
 
 
 class GlmProvider(Provider):
     REASONING_REPLAY_KIND = "glm_reasoning_text"
+
+    def get_multimodal_capabilities(
+        self, model: str | None = None
+    ) -> MultimodalCapabilities:
+        normalized_model = (model or "").lower()
+        user_images = (
+            "supported"
+            if any(marker in normalized_model for marker in ("glm-4v", "glm-4.5v", "glm-4.6v"))
+            else "unsupported"
+        )
+        return MultimodalCapabilities(
+            user_images=user_images,
+            tool_result_images="unsupported",
+        )
 
     def __init__(self, **config):
         api_key = (

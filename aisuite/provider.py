@@ -10,6 +10,7 @@ from aisuite.framework.replay_payload import (
     ProviderReplayCapabilities,
     ReplayValidationResult,
 )
+from aisuite.framework.content import MultimodalCapabilities
 
 
 class LLMError(Exception):
@@ -33,6 +34,19 @@ class Provider(ABC):
         """
 
         return ProviderReplayCapabilities()
+
+    def get_multimodal_capabilities(
+        self, model: str | None = None
+    ) -> MultimodalCapabilities:
+        """Return provider/model multimodal input capabilities.
+
+        User images default to unknown so new vision models are not needlessly
+        downgraded. Tool-result images default to unsupported because that wire
+        shape is much less portable; providers opt in after implementing the
+        native tool-result conversion.
+        """
+
+        return MultimodalCapabilities(tool_result_images="unsupported")
 
     def capture_response(self, response, model: str | None = None, **kwargs):
         """Capture replay-relevant response metadata.

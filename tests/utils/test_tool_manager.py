@@ -2,6 +2,7 @@ import unittest
 from pydantic import BaseModel
 from typing import Dict
 from aisuite.utils.tools import Tools  # Import your ToolManager class
+from aisuite.framework.content import ToolResult, make_image_data_url
 from enum import Enum
 
 
@@ -36,6 +37,21 @@ def get_current_temperature_v2(
 ) -> Dict[str, str]:
     """Gets the current temperature for a specific location and unit (with enum support)."""
     return {"location": location, "unit": unit, "temperature": "72"}
+
+
+def capture_frame(label: str) -> ToolResult:
+    """Returns a captured frame as a multimodal tool result."""
+    return ToolResult(
+        content=[
+            {"type": "text", "text": label},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": make_image_data_url("image/png", b"frame")
+                },
+            },
+        ]
+    )
 
 
 class TestToolManager(unittest.TestCase):
@@ -194,6 +210,26 @@ class TestToolManager(unittest.TestCase):
         assert (
             tools == expected_tool_spec
         ), f"Expected {expected_tool_spec}, but got {tools}"
+
+    def test_execute_tool_preserves_explicit_multimodal_result(self):
+        self.tool_manager._add_tool(capture_frame)
+        result, result_message = self.tool_manager.execute_tool(
+            {
+                "id": "call_capture",
+                "function": {
+                    "name": "capture_frame",
+                    "arguments": {"label": "current game frame"},
+                },
+            }
+        )
+
+        self.assertIsInstance(result[0], ToolResult)
+        message = result_message[0]
+        self.assertEqual(message["role"], "tool")
+        self.assertEqual(message["tool_call_id"], "call_capture")
+        self.assertIsInstance(message["content"], list)
+        self.assertEqual(message["content"][0]["text"], "current game frame")
+        self.assertEqual(message["content"][1]["type"], "image_url")
 
 
 if __name__ == "__main__":

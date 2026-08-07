@@ -4,6 +4,8 @@ import inspect
 import json
 from docstring_parser import parse
 
+from aisuite.framework.content import ToolResult
+
 
 class Tools:
     def __init__(self, tools: list[Callable] = None):
@@ -171,17 +173,29 @@ class Tools:
             # Find matching tool call from message.tool_calls
             for tool_call in message.tool_calls:
                 if tool_call.id == result["tool_call_id"]:
+                    tool_content, is_error = self._tool_result_message_content(
+                        result["content"]
+                    )
                     messages.append(
                         {
                             "role": "tool",
                             "name": result["name"],
-                            "content": json.dumps(result["content"]),
+                            "content": tool_content,
                             "tool_call_id": tool_call.id,
+                            **({"is_error": True} if is_error else {}),
                         }
                     )
                     break
 
         return messages
+
+    @staticmethod
+    def _tool_result_message_content(result: Any) -> tuple[Any, bool]:
+        """Preserve explicit multimodal ToolResult values; JSON encode legacy values."""
+
+        if isinstance(result, ToolResult):
+            return result.content, result.is_error
+        return json.dumps(result), False
 
     def execute(self, tool_calls) -> list:
         """Executes registered tools based on the tool calls from the model.
@@ -271,12 +285,14 @@ class Tools:
                 validated_args = param_model(**arguments)
                 result = tool_func(**validated_args.model_dump())
                 results.append(result)
+                tool_content, is_error = self._tool_result_message_content(result)
                 messages.append(
                     {
                         "role": "tool",
                         "name": tool_name,
-                        "content": json.dumps(result),
+                        "content": tool_content,
                         "tool_call_id": tool_call_id,
+                        **({"is_error": True} if is_error else {}),
                     }
                 )
             except ValidationError as e:

@@ -28,11 +28,21 @@ from aisuite.framework.replay_payload import (
     unwrap_replay_payload,
 )
 from aisuite.framework.stop_reason import StopInfo, StopReason, stop_reason_manager
+from aisuite.framework.content import MultimodalCapabilities
 
 
 class DeepseekProvider(Provider):
     PROVIDER_NAME = "deepseek"
     REASONING_REPLAY_KIND = "deepseek_reasoning_text"
+
+    def get_multimodal_capabilities(
+        self, model: str | None = None
+    ) -> MultimodalCapabilities:
+        # DeepSeek's chat/reasoner API currently accepts text input only.
+        return MultimodalCapabilities(
+            user_images="unsupported",
+            tool_result_images="unsupported",
+        )
 
     def __init__(self, **config):
         """

@@ -3,6 +3,8 @@
 from pydantic import BaseModel
 from typing import Any, Dict, Literal, Optional
 
+from .content import MessageContent
+
 
 class Function(BaseModel):
     arguments: str
@@ -25,8 +27,11 @@ class ReasoningContent(BaseModel):
 
 
 class Message(BaseModel):
-    content: Optional[str] = None
+    content: Optional[MessageContent] = None
     tool_calls: Optional[list[ChatCompletionMessageToolCall]] = None
-    role: Optional[Literal["user", "assistant", "system"]] = "assistant"
+    role: Optional[Literal["user", "assistant", "system", "tool"]] = "assistant"
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    is_error: Optional[bool] = None
     refusal: Optional[str] = None
     reasoning_content: Optional[ReasoningContent] = None

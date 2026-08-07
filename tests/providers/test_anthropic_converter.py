@@ -1,4 +1,5 @@
 import unittest
+import base64
 from unittest.mock import MagicMock
 from types import SimpleNamespace
 from aisuite.providers.anthropic_provider import AnthropicMessageConverter
@@ -79,6 +80,32 @@ class TestAnthropicMessageConverter(unittest.TestCase):
                 }
             ],
         )
+
+    def test_convert_request_preserves_user_and_tool_images(self):
+        image_url = "data:image/png;base64," + base64.b64encode(b"frame").decode()
+        content = [
+            {"type": "text", "text": "inspect frame"},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+        messages = [
+            {"role": "user", "content": content},
+            {
+                "role": "tool",
+                "tool_call_id": "tool_capture",
+                "content": content,
+                "is_error": True,
+            },
+        ]
+
+        _, converted_messages = self.converter.convert_request(messages)
+
+        user_image = converted_messages[0]["content"][1]
+        self.assertEqual(user_image["type"], "image")
+        self.assertEqual(user_image["source"]["media_type"], "image/png")
+        self.assertEqual(user_image["source"]["data"], "ZnJhbWU=")
+        tool_result = converted_messages[1]["content"][0]
+        self.assertTrue(tool_result["is_error"])
+        self.assertEqual(tool_result["content"][1], user_image)
 
     def test_convert_request_with_tool_use_message_cache_control(self):
         messages = [

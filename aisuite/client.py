@@ -4,6 +4,10 @@ import asyncio
 import inspect
 from .utils.tools import Tools
 from .framework.message_normalizer import MessageNormalizer
+from .framework.content import (
+    MultimodalCapabilities,
+    filter_images_for_capabilities,
+)
 
 
 class Client:
@@ -118,6 +122,19 @@ class Completions:
             # This should be handled by making the entire create method async
             raise RuntimeError("Cannot run async provider in existing event loop. Use async client instead.")
         return loop.run_until_complete(coro)
+
+    @staticmethod
+    def _prepare_messages_for_provider(provider, model_name: str, messages: list):
+        """Apply model capability filtering without mutating canonical history."""
+
+        capability_resolver = getattr(provider, "get_multimodal_capabilities", None)
+        capabilities = (
+            capability_resolver(model_name)
+            if callable(capability_resolver)
+            else MultimodalCapabilities()
+        )
+        prepared, _ = filter_images_for_capabilities(messages, capabilities)
+        return prepared
     
     def _wrap_async_generator(self, async_gen):
         """Wrap an async generator to make it synchronously iterable"""
@@ -256,7 +273,12 @@ class Completions:
 
         while turns < max_turns:
             # Make the API call
-            response = provider.chat_completions_create(model_name, messages, **kwargs)
+            request_messages = self._prepare_messages_for_provider(
+                provider, model_name, messages
+            )
+            response = provider.chat_completions_create(
+                model_name, request_messages, **kwargs
+            )
             
             # Handle async providers
             if inspect.iscoroutine(response):
@@ -355,7 +377,12 @@ class Completions:
 
         # Default behavior without tool execution
         # Delegate the chat completion to the correct provider's implementation
-        result = provider.chat_completions_create(model_name, normalized_messages, stream=stream, **kwargs)
+        request_messages = self._prepare_messages_for_provider(
+            provider, model_name, normalized_messages
+        )
+        result = provider.chat_completions_create(
+            model_name, request_messages, stream=stream, **kwargs
+        )
         
         
         # Check if we're in an async context first
@@ -391,4 +418,3 @@ class Completions:
         
         return result
         #return self._extract_thinking_content(response)
-

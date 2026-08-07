@@ -17,6 +17,16 @@ from aisuite.framework.replay_payload import (
     unwrap_replay_payload,
 )
 from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.framework.content import (
+    MultimodalCapabilities,
+    MultimodalContentError,
+    content_text,
+    filter_images_for_capabilities,
+    get_image_part_url,
+    is_image_part,
+    is_text_part,
+    parse_image_data_url,
+)
 from aisuite.provider import Provider, LLMError
 
 # Import Google GenAI SDK lazily so helper functions remain importable when the
@@ -454,6 +464,34 @@ def _filter_thinking_config_fields(data: Dict[str, Any]) -> Dict[str, Any]:
 class GeminiMessageConverter:
 
     @staticmethod
+    def _to_request_parts(content: Any) -> list:
+        if isinstance(content, str):
+            return [{"text": content}]
+        if not isinstance(content, list):
+            return [{"text": str(content or "")}]
+
+        parts = []
+        for part in content:
+            if is_text_part(part):
+                parts.append({"text": part.get("text", "")})
+            elif is_image_part(part):
+                url = get_image_part_url(part)
+                if not url.startswith("data:"):
+                    raise MultimodalContentError(
+                        "Gemini AISuite adapter currently requires image data URLs"
+                    )
+                mime_type, data = parse_image_data_url(url)
+                parts.append(
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64.b64encode(data).decode("ascii"),
+                        }
+                    }
+                )
+        return parts
+
+    @staticmethod
     def to_gemini_request(conversation):
         """
         Convert AISuite conversation (list of messages) to Gemini API request format.
@@ -463,14 +501,14 @@ class GeminiMessageConverter:
 
         # If the first message is a system role, use it as systemInstruction for Gemini
         if messages and messages[0].get("role") == "system":
-            system_instruction = messages[0]["content"]
+            system_instruction = content_text(messages[0]["content"])
             messages = messages[1:]  # remove system message from main history
 
         # Build Gemini 'contents' list from remaining messages
         contents = []
         for msg in messages:
             role = msg.get("role")
-            content_text = msg.get("content", "")
+            content = msg.get("content", "")
             # Map AISuite role to Gemini role (Gemini expects "user" or "model")
             if role == "assistant":
                 role = "model"
@@ -479,10 +517,9 @@ class GeminiMessageConverter:
             else:
                 # Other roles (if any) can be treated as user by default
                 role = "user"
-            # Each content entry has a role and parts (here just one text part)
             content_entry = {
                 "role": role,
-                "parts": [ {"text": content_text} ]
+                "parts": GeminiMessageConverter._to_request_parts(content),
             }
             contents.append(content_entry)
 
@@ -711,6 +748,91 @@ class GeminiProvider(Provider):
         self._stream_content_length = 0
         self._stream_tool_calls_count = 0
 
+    def get_multimodal_capabilities(
+        self, model: str | None = None
+    ) -> MultimodalCapabilities:
+        return MultimodalCapabilities(
+            user_images="supported",
+            tool_result_images=(
+                "supported" if self._is_gemini_3_model(model or "")
+                else "unsupported"
+            ),
+        )
+
+    def _image_to_gemini_part(
+        self,
+        part: Dict[str, Any],
+        *,
+        function_result: bool = False,
+        display_name: str = "tool-result-image",
+    ):
+        url = get_image_part_url(part)
+        if not url.startswith("data:"):
+            raise MultimodalContentError(
+                "Gemini AISuite adapter currently requires image data URLs"
+            )
+        mime_type, data = parse_image_data_url(url)
+
+        if function_result:
+            response_part_cls = getattr(types, "FunctionResponsePart", None)
+            response_blob_cls = getattr(types, "FunctionResponseBlob", None)
+            if response_part_cls is not None and response_blob_cls is not None:
+                return response_part_cls(
+                    inline_data=response_blob_cls(
+                        mime_type=mime_type,
+                        display_name=display_name,
+                        data=data,
+                    )
+                )
+
+        part_cls = getattr(types, "Part", None)
+        if part_cls is None:
+            raise MultimodalContentError("google-genai Part type is unavailable")
+        if hasattr(part_cls, "from_bytes"):
+            return part_cls.from_bytes(data=data, mime_type=mime_type)
+        blob_cls = getattr(types, "Blob", None)
+        if blob_cls is not None:
+            return part_cls(inline_data=blob_cls(mime_type=mime_type, data=data))
+        return part_cls(
+            inline_data={"mime_type": mime_type, "data": data}
+        )
+
+    def _content_to_gemini_parts(self, content: Any) -> list:
+        if isinstance(content, str):
+            return [types.Part.from_text(text=content)]
+        if not isinstance(content, list):
+            return [types.Part.from_text(text=str(content or ""))]
+
+        parts = []
+        for part in content:
+            if is_text_part(part):
+                parts.append(types.Part.from_text(text=part.get("text", "")))
+            elif is_image_part(part):
+                parts.append(self._image_to_gemini_part(part))
+            else:
+                raise MultimodalContentError(
+                    f"unsupported canonical Gemini content part: {part!r}"
+                )
+        return parts
+
+    def _tool_content_to_gemini_payload(self, content: Any) -> tuple[str, list]:
+        text = content_text(content)
+        media_parts = []
+        if isinstance(content, list):
+            image_index = 0
+            for part in content:
+                if not is_image_part(part):
+                    continue
+                image_index += 1
+                media_parts.append(
+                    self._image_to_gemini_part(
+                        part,
+                        function_result=True,
+                        display_name=f"tool-result-image-{image_index}",
+                    )
+                )
+        return text, media_parts
+
     def _is_gemini_3_model(self, model_id: str) -> bool:
         """Heuristic check for Gemini 3 series models.
 
@@ -920,7 +1042,8 @@ class GeminiProvider(Provider):
         content: Any,
         provider_call_id: Optional[str] = None,
     ):
-        response_payload = {"result": content}
+        text_content, media_parts = self._tool_content_to_gemini_payload(content)
+        response_payload = {"result": text_content}
         function_response_cls = getattr(types, "FunctionResponse", None)
         part_cls = getattr(types, "Part", None)
 
@@ -932,15 +1055,20 @@ class GeminiProvider(Provider):
                 }
                 if provider_call_id:
                     kwargs["id"] = provider_call_id
+                if media_parts:
+                    kwargs["parts"] = media_parts
                 function_response = function_response_cls(**kwargs)
                 return part_cls(function_response=function_response)
             except Exception:
                 pass
 
-        return types.Part.from_function_response(
-            name=function_name,
-            response=response_payload,
-        )
+        fallback_kwargs = {
+            "name": function_name,
+            "response": response_payload,
+        }
+        if media_parts:
+            fallback_kwargs["parts"] = media_parts
+        return types.Part.from_function_response(**fallback_kwargs)
 
     def _create_function_call_part(
         self,
@@ -1103,7 +1231,7 @@ class GeminiProvider(Provider):
         parts = []
 
         if msg.get("content"):
-            parts.append(types.Part.from_text(text=msg["content"]))
+            parts.extend(self._content_to_gemini_parts(msg["content"]))
 
         tool_calls = msg.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -1319,7 +1447,17 @@ class GeminiProvider(Provider):
                     if assistant_content:
                         # Prepend the assistant's summary to the user message
                         original_content = next_user.get("content", "")
-                        next_user["content"] = f"[Assistant's previous response: {assistant_content}]\n\n{original_content}"
+                        prefix = (
+                            f"[Assistant's previous response: "
+                            f"{content_text(assistant_content)}]"
+                        )
+                        if isinstance(original_content, list):
+                            next_user["content"] = [
+                                {"type": "text", "text": prefix},
+                                *original_content,
+                            ]
+                        else:
+                            next_user["content"] = f"{prefix}\n\n{original_content}"
 
                     # Skip the problematic assistant message
                     i += 1  # Skip assistant
@@ -1340,6 +1478,14 @@ class GeminiProvider(Provider):
 
         replay_request_view = kwargs.pop("_replay_request_view", None)
         replay_mode = kwargs.pop("_replay_mode", None)
+
+        capabilities = self.get_multimodal_capabilities(model)
+        messages, _ = filter_images_for_capabilities(messages, capabilities)
+        if isinstance(replay_request_view, list):
+            replay_request_view, _ = filter_images_for_capabilities(
+                replay_request_view,
+                capabilities,
+            )
 
         if replay_request_view is not None and replay_mode in {"provider_exact_turn", "degraded_legacy_turn"}:
             messages = replay_request_view
@@ -1422,7 +1568,9 @@ class GeminiProvider(Provider):
                     config_kwargs["thinking_config"] = filtered_thinking_config
 
         if messages and messages[0]['role'] == "system":
-            config_kwargs["system_instruction"] = messages[0]['content']
+            config_kwargs["system_instruction"] = content_text(
+                messages[0]['content']
+            )
             messages = messages[1:]
         # Map max_tokens to max_output_tokens for Google SDK
         if "max_tokens" in kwargs or "max_output_tokens" in kwargs:
@@ -1468,7 +1616,9 @@ class GeminiProvider(Provider):
             # Handle different conversation scenarios
             if messages[-1]["role"] == "user":
                 # Standard case: last message is from user
-                last_user_message = messages[-1]["content"]
+                last_user_message = self._content_to_gemini_parts(
+                    messages[-1]["content"]
+                )
                 convo_history = messages[:-1]
             elif messages[-1]["role"] in ["tool", "assistant"]:
                 # Agent scenario: last message is tool result or assistant message
@@ -1503,7 +1653,7 @@ class GeminiProvider(Provider):
                             history_msgs.append(types.Content(role="user", parts=replay_parts))
                     else:
                         # Fallback to text format if no tool_call_id
-                        tool_content = f"Tool result: {msg['content']}"
+                        tool_content = f"Tool result: {content_text(msg['content'])}"
                         part = types.Part.from_text(text=tool_content)
                         history_msgs.append(types.Content(role="user", parts=[part]))
                 elif role in ("user", "assistant"):
@@ -1517,10 +1667,10 @@ class GeminiProvider(Provider):
                         if parts:
                             history_msgs.append(types.Content(role=gemini_role, parts=parts))
                     else:
-                        # Regular text message
+                        # Regular text or image message
                         if msg.get("content"):
-                            part = types.Part.from_text(text=msg["content"])
-                            history_msgs.append(types.Content(role=gemini_role, parts=[part]))
+                            parts = self._content_to_gemini_parts(msg["content"])
+                            history_msgs.append(types.Content(role=gemini_role, parts=parts))
                 else:
                     # Skip unknown message types
                     continue
@@ -1560,7 +1710,7 @@ class GeminiProvider(Provider):
                             if replay_parts:
                                 contents.append(types.Content(role="user", parts=replay_parts))
                         else:
-                            tool_content = f"Tool result: {msg['content']}"
+                            tool_content = f"Tool result: {content_text(msg['content'])}"
                             part = types.Part.from_text(text=tool_content)
                             contents.append(types.Content(role="user", parts=[part]))
                     elif role in ("user", "assistant"):
@@ -1572,8 +1722,8 @@ class GeminiProvider(Provider):
                                 contents.append(types.Content(role=gemini_role, parts=parts))
                         else:
                             if msg.get("content"):
-                                part = types.Part.from_text(text=msg["content"])
-                                contents.append(types.Content(role=gemini_role, parts=[part]))
+                                parts = self._content_to_gemini_parts(msg["content"])
+                                contents.append(types.Content(role=gemini_role, parts=parts))
 
 
 
@@ -1719,7 +1869,7 @@ class GeminiProvider(Provider):
                             if replay_parts:
                                 contents.append(types.Content(role="user", parts=replay_parts))
                         else:
-                            tool_content = f"Tool result: {msg['content']}"
+                            tool_content = f"Tool result: {content_text(msg['content'])}"
                             part = types.Part.from_text(text=tool_content)
                             contents.append(types.Content(role="user", parts=[part]))
                     elif role in ("user", "assistant"):
@@ -1731,8 +1881,8 @@ class GeminiProvider(Provider):
                                 contents.append(types.Content(role=gemini_role, parts=parts))
                         else:
                             if msg.get("content"):
-                                part = types.Part.from_text(text=msg["content"])
-                                contents.append(types.Content(role=gemini_role, parts=[part]))
+                                parts = self._content_to_gemini_parts(msg["content"])
+                                contents.append(types.Content(role=gemini_role, parts=parts))
 
 
 

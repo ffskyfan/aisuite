@@ -293,6 +293,10 @@ class VercelProvider(Provider):
         provider, resolved_model, _ = self._resolve_replay_target(model)
         return provider.get_replay_capabilities(resolved_model)
 
+    def get_multimodal_capabilities(self, model: str | None = None):
+        provider, resolved_model, _ = self._resolve_replay_target(model)
+        return provider.get_multimodal_capabilities(resolved_model)
+
     def capture_response(self, response, model: str | None = None, **kwargs):
         provider, resolved_model, replay_kwargs = self._resolve_replay_target(
             model, kwargs
