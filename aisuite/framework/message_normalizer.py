@@ -33,6 +33,7 @@ class MessageNormalizer:
         "glm": {"remove_fields": ["refusal"], "preserve_reasoning": True},
         "deepseek": {"remove_fields": ["refusal"], "preserve_reasoning": True},
         "kimi": {"remove_fields": ["refusal"], "preserve_reasoning": True},
+        "qwen": {"remove_fields": ["refusal"], "preserve_reasoning": True},
         "anthropic": {
             "remove_fields": [],
             "preserve_reasoning": False,  # Claude handles reasoning differently
@@ -82,6 +83,10 @@ class MessageNormalizer:
             "supported": False,  # DeepSeek has automatic caching
             "auto_cache": True,
         },
+        "qwen": {
+            "supported": False,  # Qwen context caching is automatic by default
+            "auto_cache": True,
+        },
         "default": {"supported": False},
     }
 
@@ -116,6 +121,8 @@ class MessageNormalizer:
                 return "deepseek"
             elif provider_part == "kimi":
                 return "kimi"
+            elif provider_part in ["qwen", "dashscope"]:
+                return "qwen"
 
         # Fallback to model name detection for backward compatibility
         # Check for Claude/Anthropic models
@@ -130,6 +137,8 @@ class MessageNormalizer:
         # Check for DeepSeek
         elif "deepseek" in model_lower:
             return "deepseek"
+        elif "qwen" in model_lower or "dashscope" in model_lower:
+            return "qwen"
         else:
             return "default"
 

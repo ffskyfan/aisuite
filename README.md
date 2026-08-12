@@ -18,6 +18,7 @@ Currently supported providers are:
 - HuggingFace Ollama
 - Mistral
 - OpenAI
+- Qwen
 - Sambanova
 - Watsonx
 
@@ -45,6 +46,12 @@ This installs aisuite along with Zhipu's official SDK for GLM-5.
 pip install 'aisuite[glm]'
 ```
 
+This installs aisuite with the OpenAI-compatible transport used by Qwen.
+
+```shell
+pip install 'aisuite[qwen]'
+```
+
 This installs all the provider-specific libraries
 
 ```shell
@@ -58,6 +65,26 @@ install the provider-specific library either separately or when installing aisui
 
 The API Keys can be set as environment variables, or can be passed as config to the aisuite Client constructor.
 You can use tools like [`python-dotenv`](https://pypi.org/project/python-dotenv/) or [`direnv`](https://direnv.net/) to set the environment variables manually. Please take a look at the `examples` folder to see usage.
+
+For Qwen with Alibaba Cloud Model Studio Token Plan, use the subscription key
+and the native `qwen` provider. Keys beginning with `sk-sp-` automatically select
+the official Token Plan endpoint. `QWEN_BASE_URL` can override the endpoint when
+using a workspace-specific or other official deployment.
+
+```shell
+export BAILIAN_TOKEN_PLAN_API_KEY="your-token-plan-key"
+```
+
+```python
+import aisuite as ai
+
+client = ai.Client()
+response = client.chat.completions.create(
+    model="qwen:qwen3.8-max",
+    messages=[{"role": "user", "content": "Hello"}],
+    reasoning_effort="xhigh",
+)
+```
 
 Here is a short example of using `aisuite` to generate chat completion responses from gpt-4o and claude-3-5-sonnet.
 
