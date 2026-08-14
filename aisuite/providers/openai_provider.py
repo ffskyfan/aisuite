@@ -528,6 +528,29 @@ class OpenaiProvider(Provider):
         if cache_read_input_tokens < 0:
             cache_read_input_tokens = 0
 
+        cache_write_tokens = _deep_get(
+            data, "prompt_tokens_details", "cache_write_tokens"
+        )
+        if cache_write_tokens is None:
+            cache_write_tokens = _deep_get(
+                data, "input_tokens_details", "cache_write_tokens"
+            )
+        if cache_write_tokens is None:
+            cache_write_tokens = _deep_get(
+                usage_obj, "prompt_tokens_details", "cache_write_tokens"
+            )
+        if cache_write_tokens is None:
+            cache_write_tokens = _deep_get(
+                usage_obj, "input_tokens_details", "cache_write_tokens"
+            )
+        if cache_write_tokens is None:
+            cache_write_tokens = data.get("cache_write_tokens")
+        cache_write_input_tokens = (
+            int(cache_write_tokens) if cache_write_tokens is not None else 0
+        )
+        if cache_write_input_tokens < 0:
+            cache_write_input_tokens = 0
+
         total_tokens = data.get("total_tokens")
         if total_tokens is None:
             total_tokens = prompt_tokens + completion_tokens
@@ -537,7 +560,7 @@ class OpenaiProvider(Provider):
             "completion_tokens": int(completion_tokens),
             "total_tokens": int(total_tokens),
             "cache_read_input_tokens": cache_read_input_tokens,
-            "cache_write_input_tokens": 0,
+            "cache_write_input_tokens": cache_write_input_tokens,
             "cache_write_by_ttl": {
                 "ephemeral_5m_input_tokens": 0,
                 "ephemeral_1h_input_tokens": 0,

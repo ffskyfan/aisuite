@@ -247,6 +247,49 @@ class VercelProvider(Provider):
 
         return protocol, self._normalize_model_for_protocol(protocol, stripped_model)
 
+    @staticmethod
+    def _first_party_provider_for_model(model: str) -> Optional[str]:
+        """Return the first-party Vercel provider slug for supported model families."""
+        normalized_model = str(model or "").strip().lower()
+        if normalized_model.startswith("openai/"):
+            return "openai"
+        if normalized_model.startswith("anthropic/"):
+            return "anthropic"
+        return None
+
+    def _pin_first_party_provider(
+        self,
+        model: str,
+        request_kwargs: Dict[str, Any],
+    ) -> None:
+        provider_slug = self._first_party_provider_for_model(model)
+        if provider_slug is None:
+            return
+
+        raw_extra_body = request_kwargs.get("extra_body")
+        if raw_extra_body is not None and not isinstance(raw_extra_body, dict):
+            raise ValueError("vercel extra_body must be a dict when provided")
+        extra_body = dict(raw_extra_body or {})
+
+        raw_provider_options = extra_body.get("providerOptions")
+        if raw_provider_options is not None and not isinstance(
+            raw_provider_options, dict
+        ):
+            raise ValueError("vercel providerOptions must be a dict when provided")
+        provider_options = dict(raw_provider_options or {})
+
+        raw_gateway_options = provider_options.get("gateway")
+        if raw_gateway_options is not None and not isinstance(
+            raw_gateway_options, dict
+        ):
+            raise ValueError("vercel providerOptions.gateway must be a dict")
+        gateway_options = dict(raw_gateway_options or {})
+        gateway_options.pop("order", None)
+        gateway_options["only"] = [provider_slug]
+        provider_options["gateway"] = gateway_options
+        extra_body["providerOptions"] = provider_options
+        request_kwargs["extra_body"] = extra_body
+
     def _create_protocol_provider(self, protocol: str) -> Provider:
         protocol_config = self._build_protocol_config(protocol)
 
@@ -328,6 +371,7 @@ class VercelProvider(Provider):
     ) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         request_kwargs = kwargs.copy()
         protocol, resolved_model = self._resolve_protocol(model, request_kwargs)
+        self._pin_first_party_provider(resolved_model, request_kwargs)
         provider = self._get_protocol_provider(protocol)
         return await provider.chat_completions_create(
             resolved_model,

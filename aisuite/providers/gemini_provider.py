@@ -843,11 +843,22 @@ class GeminiProvider(Provider):
             return False
         return "gemini-3" in model_id
 
-    def _is_gemini_3_flash_model(self, model_id: str) -> bool:
-        """Heuristic check for Gemini 3 Flash models."""
+    @staticmethod
+    def _supports_minimal_thinking_level(model_id: str) -> bool:
+        """Only the original Gemini 3 Flash preview accepts ``minimal``."""
         if not model_id:
             return False
-        return "gemini-3" in model_id and "flash" in model_id
+        return model_id.rsplit("/", 1)[-1] == "gemini-3-flash-preview"
+
+    @staticmethod
+    def _uses_modern_flash_sampling_contract(model_id: str) -> bool:
+        """Gemini 3.6+ Flash rejects legacy sampling controls."""
+        if not model_id:
+            return False
+        return model_id.rsplit("/", 1)[-1] in {
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
+        }
 
     def _resolve_tool_call_signature(self, model_id: str, tool_call: Any) -> Tuple[Optional[str], bool]:
         """
@@ -1521,37 +1532,62 @@ class GeminiProvider(Provider):
             elif isinstance(reasoning, str):
                 reasoning_effort = reasoning
 
+        uses_modern_flash_sampling_contract = self._uses_modern_flash_sampling_contract(
+            model_id
+        )
+        if uses_modern_flash_sampling_contract:
+            # Gemini 3.6+ removed these controls. Drop product-level defaults too,
+            # otherwise an otherwise valid request fails before generation starts.
+            for param in ("temperature", "top_p", "top_k", "candidate_count"):
+                kwargs.pop(param, None)
+
         if self._is_gemini_3_model(model_id):
-            # Gemini 3 Flash and Gemini 3.1 Pro support low/medium/high.
-            # Flash additionally supports minimal.
+            # Gemini 3 models support low/medium/high. Only the original Flash
+            # preview additionally supports minimal; 3.7 returns an error for it.
             level = None
-            is_flash = self._is_gemini_3_flash_model(model_id)
+            supports_minimal = self._supports_minimal_thinking_level(model_id)
+            configured_level = thinking_config_fields.get("thinking_level")
+            if isinstance(configured_level, str):
+                configured_level = configured_level.lower()
+                if configured_level == "minimal" and not supports_minimal:
+                    configured_level = "low"
+                if configured_level in {"max", "xhigh"}:
+                    configured_level = "high"
+                thinking_config_fields["thinking_level"] = configured_level
             if isinstance(thinking_level, str) and thinking_level:
                 level = thinking_level.lower()
             elif isinstance(reasoning_effort, str) and reasoning_effort:
                 eff = reasoning_effort.lower()
                 if eff in {"minimal", "none", "disable"}:
-                    level = "minimal" if is_flash else "low"
+                    level = "minimal" if supports_minimal else "low"
                 elif eff in {"low", "medium", "high"}:
                     level = eff
                 elif eff in {"max", "xhigh"}:
                     level = "high"
 
-            if level and not is_flash:
-                if level == "minimal":
-                    level = "low"
+            if level == "minimal" and not supports_minimal:
+                level = "low"
             if level in {"max", "xhigh"}:
                 level = "high"
 
-            thinking_requested = bool(thinking_config_fields) or bool(level) or isinstance(reasoning_effort, str)
+            thinking_requested = (
+                bool(thinking_config_fields)
+                or bool(level)
+                or isinstance(reasoning_effort, str)
+            )
             if thinking_requested:
                 if level and "thinking_level" not in thinking_config_fields:
                     thinking_config_fields["thinking_level"] = level
                 if "include_thoughts" not in thinking_config_fields:
                     thinking_config_fields["include_thoughts"] = True
 
-            # For Gemini 3, default temperature to 1.0 if not explicitly set
-            if "temperature" not in kwargs and "temperature" not in config_kwargs:
+            # Older Gemini 3 endpoints expect temperature=1.0. Gemini 3.6+
+            # rejects the field entirely, so they must use the provider default.
+            if (
+                not uses_modern_flash_sampling_contract
+                and "temperature" not in kwargs
+                and "temperature" not in config_kwargs
+            ):
                 config_kwargs["temperature"] = 1.0
 
         if thinking_config_fields:
@@ -1620,6 +1656,14 @@ class GeminiProvider(Provider):
                     messages[-1]["content"]
                 )
                 convo_history = messages[:-1]
+            elif (
+                messages[-1]["role"] == "assistant"
+                and uses_modern_flash_sampling_contract
+            ):
+                # Gemini 3.6+ rejects a prefilled model turn. Keep the model turn
+                # as history and add an explicit user continuation instead.
+                convo_history = messages
+                last_user_message = "Continue."
             elif messages[-1]["role"] in ["tool", "assistant"]:
                 # Agent scenario: last message is tool result or assistant message
                 # According to Gemini API docs, we should include all messages as history

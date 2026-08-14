@@ -245,6 +245,11 @@ def test_gemini_3_embeds_image_in_function_response_parts(_mock_client_cls):
         ("gemini-3-flash-preview", "low", "low"),
         ("gemini-3-flash-preview", "medium", "medium"),
         ("gemini-3-flash-preview", "high", "high"),
+        ("gemini-3.7-flash", "minimal", "low"),
+        ("gemini-3.7-flash", "low", "low"),
+        ("gemini-3.7-flash", "medium", "medium"),
+        ("gemini-3.7-flash", "high", "high"),
+        ("gemini-3.7-flash", "max", "high"),
         ("gemini-3.1-pro-preview", "low", "low"),
         ("gemini-3.1-pro-preview", "medium", "medium"),
         ("gemini-3.1-pro-preview", "high", "high"),
@@ -281,6 +286,89 @@ async def test_gemini_3_reasoning_effort_is_passed_as_thinking_level(
         "thinking_level": expected_level,
         "include_thoughts": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_gemini_3_7_flash_removes_unsupported_sampling_controls():
+    provider = GeminiProvider(api_key="test-gemini-key")
+    provider.client = MagicMock()
+    chat = MagicMock()
+    provider.client.chats.create.return_value = chat
+    chat.send_message.return_value = SimpleNamespace()
+
+    with patch.object(
+        GeminiMessageConverter,
+        "from_gemini_response",
+        return_value="ok",
+    ):
+        result = await provider.chat_completions_create(
+            "gemini-3.7-flash",
+            [{"role": "user", "content": "hello"}],
+            max_tokens=1024,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            candidate_count=2,
+        )
+
+    assert result == "ok"
+    config = provider.client.chats.create.call_args.kwargs["config"]
+    assert config.kwargs == {"max_output_tokens": 1024}
+
+
+@pytest.mark.asyncio
+async def test_gemini_3_7_flash_coerces_nested_minimal_thinking_to_low():
+    provider = GeminiProvider(api_key="test-gemini-key")
+    provider.client = MagicMock()
+    chat = MagicMock()
+    provider.client.chats.create.return_value = chat
+    chat.send_message.return_value = SimpleNamespace()
+
+    with patch.object(
+        GeminiMessageConverter,
+        "from_gemini_response",
+        return_value="ok",
+    ):
+        result = await provider.chat_completions_create(
+            "gemini-3.7-flash",
+            [{"role": "user", "content": "hello"}],
+            thinking_config={"thinking_level": "minimal"},
+        )
+
+    assert result == "ok"
+    config = provider.client.chats.create.call_args.kwargs["config"]
+    assert config.kwargs["thinking_config"].kwargs == {
+        "thinking_level": "low",
+        "include_thoughts": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_gemini_3_7_flash_converts_final_model_prefill_to_user_continuation():
+    provider = GeminiProvider(api_key="test-gemini-key")
+    provider.client = MagicMock()
+    chat = MagicMock()
+    provider.client.chats.create.return_value = chat
+    chat.send_message.return_value = SimpleNamespace()
+
+    with patch.object(
+        GeminiMessageConverter,
+        "from_gemini_response",
+        return_value="ok",
+    ):
+        result = await provider.chat_completions_create(
+            "gemini-3.7-flash",
+            [
+                {"role": "user", "content": "Write a scene."},
+                {"role": "assistant", "content": "The door opened"},
+            ],
+        )
+
+    assert result == "ok"
+    history = provider.client.chats.create.call_args.kwargs["history"]
+    assert [message.role for message in history] == ["user", "model"]
+    chat.send_message.assert_called_once_with(message="Continue.")
+    provider.client.models.generate_content.assert_not_called()
 
 
 def test_gemini_thinking_level_fails_loudly_with_unsupported_sdk(monkeypatch):

@@ -129,6 +129,43 @@ async def test_vercel_provider_passes_gpt_xhigh_effort_unchanged():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "protocol", "expected_provider"),
+    [
+        ("gpt-5.6-sol", "openai", "openai"),
+        ("claude-sonnet-5", "anthropic", "anthropic"),
+    ],
+)
+async def test_vercel_provider_pins_first_party_gateway_provider(
+    model,
+    protocol,
+    expected_provider,
+):
+    provider = VercelProvider(api_key="test-vercel-key")
+    fake_provider = _FakeAsyncProvider(protocol)
+    provider._protocol_providers[protocol] = fake_provider
+
+    await provider.chat_completions_create(
+        model=model,
+        messages=[{"role": "user", "content": "hello"}],
+        extra_body={
+            "providerOptions": {
+                "gateway": {"order": ["bedrock"]},
+                "custom": {"keep": True},
+            },
+            "other": "keep",
+        },
+    )
+
+    extra_body = fake_provider.calls[0]["kwargs"]["extra_body"]
+    assert extra_body["providerOptions"]["gateway"] == {
+        "only": [expected_provider],
+    }
+    assert extra_body["providerOptions"]["custom"] == {"keep": True}
+    assert extra_body["other"] == "keep"
+
+
+@pytest.mark.asyncio
 async def test_vercel_provider_routes_model_protocol_prefix():
     provider = VercelProvider(api_key="test-vercel-key")
     fake_provider = _FakeAsyncProvider("anthropic")

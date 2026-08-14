@@ -20,6 +20,7 @@ Vercel AI Gateway is a unified API that provides access to multiple AI providers
 - ✅ Tool/function calling
 - ✅ Anthropic prompt caching via `cache_control`
 - ✅ Native protocol routing for OpenAI and Claude models
+- ✅ Deterministic first-party routing for OpenAI and Anthropic model families
 
 ## Installation
 
@@ -76,7 +77,7 @@ client = ai.Client({
 
 # Use either the fully qualified gateway model id...
 response = await client.chat.completions.create(
-    model="vercel:anthropic/claude-sonnet-4.5",
+    model="vercel:anthropic/claude-sonnet-5",
     messages=[
         {"role": "user", "content": "Hello, how are you?"}
     ]
@@ -90,13 +91,13 @@ You can also use closeai-style shorthand for the two native protocol families:
 ```python
 # Claude models route to the Anthropic-compatible endpoint
 response = await client.chat.completions.create(
-    model="vercel:claude-sonnet-4.5",
+    model="vercel:claude-sonnet-5",
     messages=[{"role": "user", "content": "Summarize this"}],
 )
 
 # GPT / o-series models route to the OpenAI-compatible endpoint
 response = await client.chat.completions.create(
-    model="vercel:gpt-5.2",
+    model="vercel:gpt-5.6-terra",
     messages=[{"role": "user", "content": "Explain this code"}],
 )
 ```
@@ -105,8 +106,8 @@ response = await client.chat.completions.create(
 
 The Vercel AI Gateway supports models from various providers. For the dual-protocol routing in `aisuite`, the most relevant patterns are:
 
-- **OpenAI**: `vercel:gpt-5.2`, `vercel:openai/gpt-5.2`
-- **Anthropic**: `vercel:claude-sonnet-4.5`, `vercel:anthropic/claude-sonnet-4.5`
+- **OpenAI**: `vercel:gpt-5.6-terra`, `vercel:openai/gpt-5.6-terra`
+- **Anthropic**: `vercel:claude-sonnet-5`, `vercel:anthropic/claude-sonnet-5`
 - **Google**: `vercel:google/gemini-pro`, `vercel:google/gemini-flash`
 - **And many more...**
 
@@ -205,22 +206,18 @@ response = await client.chat.completions.create(
     }
 )
 
-# Configure provider routing
+# First-party routing is pinned automatically
 response = await client.chat.completions.create(
-    model="vercel:anthropic/claude-sonnet-4",
+    model="vercel:anthropic/claude-sonnet-5",
     messages=[{"role": "user", "content": "Hello"}],
-    extra_body={
-        "providerOptions": {
-            "gateway": {
-                "order": ["vertex", "anthropic"]  # Try Vertex AI first, then Anthropic
-            },
-            "anthropic": {
-                "thinkingBudget": 0.001  # Set thinking budget for Claude models
-            }
-        }
-    }
 )
 ```
+
+For normalized `openai/...` and `anthropic/...` models, `aisuite` injects
+`providerOptions.gateway.only` with the matching first-party provider. Any conflicting
+`gateway.order` value is removed. This keeps the upstream supplier—and therefore
+pricing and cache accounting—deterministic. Other gateway model families are left
+unchanged.
 
 If you need Claude-native features such as `thinking` or explicit `cache_control`, prefer the Anthropic route by using a Claude model id or `protocol="anthropic"`.
 
@@ -278,8 +275,8 @@ except Exception as e:
 1. The Vercel AI Gateway acts as a proxy to multiple AI providers
 2. Model availability depends on your gateway configuration
 3. Pricing and rate limits are managed through your Vercel account
-4. GPT / o-series models route through the OpenAI-compatible API
-5. Claude models route through the Anthropic-compatible API
+4. GPT / o-series models route through the OpenAI-compatible API and are pinned to OpenAI
+5. Claude models route through the Anthropic-compatible API and are pinned to Anthropic
 6. All features supported by the underlying models should work through the matching native protocol
 
 ## Troubleshooting

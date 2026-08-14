@@ -17,7 +17,10 @@ def test_openai_normalize_chat_completions_cached_tokens():
         "prompt_tokens": 100,
         "completion_tokens": 50,
         "total_tokens": 150,
-        "prompt_tokens_details": {"cached_tokens": 40},
+        "prompt_tokens_details": {
+            "cached_tokens": 40,
+            "cache_write_tokens": 25,
+        },
     }
     normalized = provider._normalize_usage(usage)
     assert normalized == {
@@ -25,7 +28,7 @@ def test_openai_normalize_chat_completions_cached_tokens():
         "completion_tokens": 50,
         "total_tokens": 150,
         "cache_read_input_tokens": 40,
-        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens": 25,
         "cache_write_by_ttl": {
             "ephemeral_5m_input_tokens": 0,
             "ephemeral_1h_input_tokens": 0,
@@ -39,7 +42,10 @@ def test_openai_normalize_responses_cached_tokens():
         "input_tokens": 80,
         "output_tokens": 20,
         "total_tokens": 100,
-        "input_tokens_details": {"cached_tokens": 10},
+        "input_tokens_details": {
+            "cached_tokens": 10,
+            "cache_write_tokens": 8,
+        },
     }
     normalized = provider._normalize_usage(usage)
     assert normalized == {
@@ -47,7 +53,7 @@ def test_openai_normalize_responses_cached_tokens():
         "completion_tokens": 20,
         "total_tokens": 100,
         "cache_read_input_tokens": 10,
-        "cache_write_input_tokens": 0,
+        "cache_write_input_tokens": 8,
         "cache_write_by_ttl": {
             "ephemeral_5m_input_tokens": 0,
             "ephemeral_1h_input_tokens": 0,
