@@ -104,6 +104,63 @@ async def test_deepseek_provider_non_stream_replays_reasoning_content():
     assert response.metadata["usage"]["cache_read_input_tokens"] == 3
 
 
+@pytest.mark.asyncio
+async def test_deepseek_provider_fills_and_preserves_empty_tool_reasoning():
+    provider = DeepseekProvider(api_key="test-api-key")
+    response_tool_call = _ns(
+        id="call_2",
+        type="function",
+        function=_ns(name="write_file", arguments='{"path":"done.txt"}'),
+    )
+    mock_response = _ns(
+        id="deepseek-response-id",
+        created=1234567890,
+        model="deepseek-v4-flash",
+        usage=None,
+        choices=[
+            _ns(
+                index=0,
+                finish_reason="tool_calls",
+                message=_ns(
+                    content="",
+                    role="assistant",
+                    reasoning_content="",
+                    tool_calls=[response_tool_call],
+                ),
+            )
+        ],
+    )
+
+    previous_tool_call = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": "{}"},
+    }
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=mock_response),
+    ) as mock_create:
+        response = await provider.chat_completions_create(
+            model="deepseek-v4-flash",
+            messages=[
+                {"role": "user", "content": "continue"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [previous_tool_call],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+            ],
+            thinking={"type": "enabled"},
+        )
+
+    sent_messages = mock_create.call_args.kwargs["messages"]
+    assert sent_messages[1]["reasoning_content"] == ""
+    assert response.choices[0].message.reasoning_content.thinking == ""
+    assert response.choices[0].message.reasoning_content.raw_data["payload"]["reasoning_content"] == ""
+
+
 def test_deepseek_build_replay_view_preserves_reasoning_content():
     provider = DeepseekProvider(api_key="test-api-key")
 
@@ -197,10 +254,10 @@ def test_deepseek_validate_replay_window_reports_missing_tool_call_id():
     assert any(diag.code == "missing_tool_call_id" for diag in result.diagnostics)
 
 
-def test_deepseek_validate_replay_window_requires_reasoning_for_thinking_tool_calls():
+def test_deepseek_build_replay_view_fills_empty_reasoning_for_thinking_tool_calls():
     provider = DeepseekProvider(api_key="test-api-key")
 
-    result = provider.validate_replay_window(
+    replay_build = provider.build_replay_view(
         "deepseek-v4-pro",
         [
             {
@@ -220,8 +277,7 @@ def test_deepseek_validate_replay_window_requires_reasoning_for_thinking_tool_ca
         extra_body={"thinking": {"type": "enabled"}},
     )
 
-    assert result.ok is False
-    assert any(diag.code == "missing_reasoning_content" for diag in result.diagnostics)
+    assert replay_build.request_view[0]["reasoning_content"] == ""
 
 
 def test_deepseek_validate_replay_window_allows_non_thinking_tool_calls_without_reasoning():
@@ -484,6 +540,16 @@ async def test_deepseek_provider_streaming_accumulates_reasoning_content():
     assert accumulated_thinking["thinking"] == "think-1 think-2"
     assert accumulated_thinking["raw_data"]["provider"] == "deepseek"
     assert accumulated_thinking["raw_data"]["payload"]["reasoning_content"] == "think-1 think-2"
+
+
+def test_deepseek_provider_empty_accumulated_thinking_keeps_replay_payload():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    accumulated_thinking = provider._get_accumulated_thinking()
+
+    assert accumulated_thinking["thinking"] == ""
+    assert accumulated_thinking["raw_data"]["provider"] == "deepseek"
+    assert accumulated_thinking["raw_data"]["payload"]["reasoning_content"] == ""
 
 
 @pytest.mark.asyncio

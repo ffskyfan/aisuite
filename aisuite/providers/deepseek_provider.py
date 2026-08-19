@@ -136,43 +136,11 @@ class DeepseekProvider(Provider):
             return thinking.get("type") == "enabled"
         return bool(thinking)
 
-    def _has_reasoning_input(self, reasoning_content: Any) -> bool:
-        if reasoning_content is None:
-            return False
-        if isinstance(reasoning_content, str):
-            return bool(reasoning_content.strip())
-        if isinstance(reasoning_content, ReasoningContent):
-            value = self._extract_reasoning_input(reasoning_content)
-            return isinstance(value, str) and bool(value.strip())
-        if hasattr(reasoning_content, "thinking"):
-            value = self._extract_reasoning_input(reasoning_content)
-            return isinstance(value, str) and bool(value.strip())
-        if isinstance(reasoning_content, dict):
-            raw_data = reasoning_content.get("raw_data") or {}
-            envelope = get_replay_payload(raw_data)
-            if envelope and envelope.get("provider") == "deepseek":
-                payload = unwrap_replay_payload(raw_data)
-                if isinstance(payload, dict) and isinstance(
-                    payload.get("reasoning_content"), str
-                ):
-                    return bool(payload["reasoning_content"].strip())
-            for key in ("reasoning_content", "thinking", "text"):
-                value = reasoning_content.get(key)
-                if isinstance(value, str) and value.strip():
-                    return True
-            if isinstance(raw_data, dict):
-                value = raw_data.get("reasoning_content")
-                if isinstance(value, str) and value.strip():
-                    return True
-            return False
-        return False
-
     def validate_replay_window(
         self, model: str, messages: list, **kwargs
     ) -> ReplayValidationResult:
         diagnostics: list[ReplayDiagnostic] = []
         normalized_messages: list[dict[str, Any]] = []
-        thinking_enabled = self._is_thinking_enabled(kwargs)
         for msg in messages:
             if isinstance(msg, dict):
                 normalized_messages.append(msg)
@@ -224,21 +192,6 @@ class DeepseekProvider(Provider):
                                 metadata={"tool_call_id": tool_call_id},
                             )
                         )
-                if thinking_enabled and not self._has_reasoning_input(
-                    msg.get("reasoning_content")
-                ):
-                    diagnostics.append(
-                        ReplayDiagnostic(
-                            code="missing_reasoning_content",
-                            message=(
-                                "DeepSeek thinking mode requires assistant "
-                                "tool-call replay to include reasoning_content."
-                            ),
-                            provider="deepseek",
-                            metadata={"role": "assistant"},
-                        )
-                    )
-
         return ReplayValidationResult(
             ok=not any(diag.severity == "error" for diag in diagnostics),
             diagnostics=tuple(diagnostics),
@@ -285,19 +238,29 @@ class DeepseekProvider(Provider):
             envelope = get_replay_payload(raw_data)
             if envelope and envelope.get("provider") == "deepseek":
                 payload = unwrap_replay_payload(raw_data)
-                if isinstance(payload, dict) and payload.get("reasoning_content"):
-                    return payload["reasoning_content"]
-            return raw_data.get("reasoning_content") or reasoning_content.thinking
+                if isinstance(payload, dict):
+                    value = payload.get("reasoning_content")
+                    if isinstance(value, str):
+                        return value
+            if isinstance(raw_data, dict):
+                value = raw_data.get("reasoning_content")
+                if isinstance(value, str):
+                    return value
+            return reasoning_content.thinking
 
         if hasattr(reasoning_content, "thinking"):
             raw_data = getattr(reasoning_content, "raw_data", None) or {}
             envelope = get_replay_payload(raw_data)
             if envelope and envelope.get("provider") == "deepseek":
                 payload = unwrap_replay_payload(raw_data)
-                if isinstance(payload, dict) and payload.get("reasoning_content"):
-                    return payload["reasoning_content"]
-            if isinstance(raw_data, dict) and raw_data.get("reasoning_content"):
-                return raw_data["reasoning_content"]
+                if isinstance(payload, dict):
+                    value = payload.get("reasoning_content")
+                    if isinstance(value, str):
+                        return value
+            if isinstance(raw_data, dict):
+                value = raw_data.get("reasoning_content")
+                if isinstance(value, str):
+                    return value
             thinking = getattr(reasoning_content, "thinking", None)
             return thinking if isinstance(thinking, str) else None
 
@@ -306,14 +269,19 @@ class DeepseekProvider(Provider):
             envelope = get_replay_payload(raw_data)
             if envelope and envelope.get("provider") == "deepseek":
                 payload = unwrap_replay_payload(raw_data)
-                if isinstance(payload, dict) and payload.get("reasoning_content"):
-                    return payload["reasoning_content"]
-            return (
-                raw_data.get("reasoning_content")
-                or reasoning_content.get("thinking")
-                or reasoning_content.get("text")
-                or str(reasoning_content)
-            )
+                if isinstance(payload, dict):
+                    value = payload.get("reasoning_content")
+                    if isinstance(value, str):
+                        return value
+            if isinstance(raw_data, dict):
+                value = raw_data.get("reasoning_content")
+                if isinstance(value, str):
+                    return value
+            for key in ("reasoning_content", "thinking", "text"):
+                value = reasoning_content.get(key)
+                if isinstance(value, str):
+                    return value
+            return None
 
         return str(reasoning_content)
 
@@ -324,14 +292,17 @@ class DeepseekProvider(Provider):
     def _get_accumulated_thinking(self) -> Dict[str, Any]:
         thinking_text = self._streaming_reasoning
         self._streaming_reasoning = ""
-        if not thinking_text:
-            return {"thinking": "", "raw_data": None}
         return {
             "thinking": thinking_text,
             "raw_data": self._build_reasoning_replay_payload(thinking_text),
         }
 
-    def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _prepare_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        fill_empty_tool_reasoning: bool = False,
+    ) -> List[Dict[str, Any]]:
         prepared_messages = []
 
         for message in messages:
@@ -342,11 +313,27 @@ class DeepseekProvider(Provider):
             )
             prepared.pop("refusal", None)
 
+            is_thinking_tool_call = bool(
+                fill_empty_tool_reasoning
+                and prepared.get("role") == "assistant"
+                and prepared.get("tool_calls")
+            )
+            # DeepSeek V4 can emit an explicit empty reasoning_content for a
+            # tool-call turn. Keep that state replayable instead of dropping
+            # the valid assistant/tool protocol block from history.
             reasoning_content = prepared.get("reasoning_content")
             if reasoning_content is not None:
-                prepared["reasoning_content"] = self._extract_reasoning_input(
+                extracted_reasoning = self._extract_reasoning_input(
                     reasoning_content
                 )
+                if extracted_reasoning is not None:
+                    prepared["reasoning_content"] = extracted_reasoning
+                elif is_thinking_tool_call:
+                    prepared["reasoning_content"] = ""
+                else:
+                    prepared["reasoning_content"] = None
+            elif is_thinking_tool_call:
+                prepared["reasoning_content"] = ""
 
             prepared_messages.append(prepared)
 
@@ -361,7 +348,10 @@ class DeepseekProvider(Provider):
             raise LLMError(f"DeepSeek replay window validation failed: {error_codes}")
 
         return ReplayBuildResult(
-            request_view=self._prepare_messages(messages),
+            request_view=self._prepare_messages(
+                messages,
+                fill_empty_tool_reasoning=self._is_thinking_enabled(kwargs),
+            ),
             replay_mode="canonical_with_reasoning",
             degraded=validation.degraded,
             diagnostics=validation.diagnostics,
@@ -815,6 +805,12 @@ class DeepseekProvider(Provider):
                 choice_data = {"message": choice.message}
                 finish_reason = getattr(choice, "finish_reason", None)
                 stop_info = self._create_stop_info(finish_reason, choice_data, model)
+                tool_calls = (
+                    self._convert_tool_calls(choice.message.tool_calls)
+                    if hasattr(choice.message, "tool_calls")
+                    and choice.message.tool_calls
+                    else None
+                )
 
                 choices.append(
                     Choice(
@@ -822,15 +818,11 @@ class DeepseekProvider(Provider):
                         message=Message(
                             content=choice.message.content,
                             role=choice.message.role,
-                            tool_calls=(
-                                self._convert_tool_calls(choice.message.tool_calls)
-                                if hasattr(choice.message, "tool_calls")
-                                and choice.message.tool_calls
-                                else None
-                            ),
+                            tool_calls=tool_calls,
                             refusal=None,
                             reasoning_content=self._convert_reasoning_content(
-                                getattr(choice.message, "reasoning_content", None)
+                                getattr(choice.message, "reasoning_content", None),
+                                preserve_empty=bool(tool_calls),
                             ),
                         ),
                         finish_reason=finish_reason,
@@ -854,9 +846,21 @@ class DeepseekProvider(Provider):
                 metadata=metadata,
             )
 
-    def _convert_reasoning_content(self, reasoning_content):
+    def _convert_reasoning_content(
+        self,
+        reasoning_content,
+        *,
+        preserve_empty: bool = False,
+    ):
         """Convert DeepSeek reasoning_content to ReasoningContent object."""
-        if not reasoning_content:
+        if reasoning_content is None:
+            if not preserve_empty:
+                return None
+            reasoning_content = ""
+        elif not isinstance(reasoning_content, str):
+            reasoning_content = str(reasoning_content)
+
+        if not reasoning_content and not preserve_empty:
             return None
 
         return ReasoningContent(
