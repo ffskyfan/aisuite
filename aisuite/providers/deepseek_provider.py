@@ -221,7 +221,10 @@ class DeepseekProvider(Provider):
             protocol_diagnostics=(),
         )
 
-    def _build_reasoning_replay_payload(self, reasoning_content: str) -> Dict[str, Any]:
+    def _build_reasoning_replay_payload(
+        self, reasoning_content: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return optional provider replay data in addition to canonical thinking."""
         return build_replay_payload(
             "deepseek",
             self.REASONING_REPLAY_KIND,

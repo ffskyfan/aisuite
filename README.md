@@ -86,6 +86,11 @@ response = client.chat.completions.create(
 )
 ```
 
+Qwen keeps the original reasoning text only in `reasoning_content.thinking`,
+with `provider="qwen"` and no `raw_data` payload. The adapter sends that text
+unchanged as the API's `reasoning_content` string. Historical replay envelopes
+and alternate text fields are not part of the Qwen history contract.
+
 Here is a short example of using `aisuite` to generate chat completion responses from gpt-4o and claude-3-5-sonnet.
 
 Set the API keys.

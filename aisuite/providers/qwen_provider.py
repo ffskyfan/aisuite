@@ -8,14 +8,10 @@ from aisuite.framework.content import (
     has_image_content,
     is_image_part,
 )
-from aisuite.framework.message import ReasoningContent
 from aisuite.framework.replay_payload import (
     ReplayBuildResult,
     ReplayDiagnostic,
     ReplayValidationResult,
-    build_replay_payload,
-    get_replay_payload,
-    unwrap_replay_payload,
 )
 from aisuite.provider import LLMError
 from aisuite.providers.deepseek_provider import DeepseekProvider
@@ -25,7 +21,6 @@ class QwenProvider(DeepseekProvider):
     """Qwen provider using Alibaba Cloud Model Studio's OpenAI-compatible API."""
 
     PROVIDER_NAME = "qwen"
-    REASONING_REPLAY_KIND = "qwen_reasoning_text"
     TOOL_IMAGE_FORWARD_TEXT = "[visual tool result attached in following user message]"
 
     TOKEN_PLAN_BASE_URL = (
@@ -155,50 +150,19 @@ class QwenProvider(DeepseekProvider):
         flush_visual_parts()
         return projected
 
-    def _build_reasoning_replay_payload(self, reasoning_content: str) -> Dict[str, Any]:
-        return build_replay_payload(
-            self.PROVIDER_NAME,
-            self.REASONING_REPLAY_KIND,
-            {"reasoning_content": reasoning_content},
-            legacy_fields={"reasoning_content": reasoning_content},
-        )
+    def _build_reasoning_replay_payload(self, reasoning_content: str) -> None:
+        # Qwen replays the original thinking text directly; no raw copy is needed.
+        return None
 
     def _extract_reasoning_input(self, reasoning_content: Any) -> Optional[str]:
-        if reasoning_content is None:
-            return None
-
-        raw_data: Dict[str, Any] = {}
-        fallback = None
-        if isinstance(reasoning_content, ReasoningContent):
-            raw_data = reasoning_content.raw_data or {}
-            fallback = reasoning_content.thinking
-        elif hasattr(reasoning_content, "thinking"):
-            raw_data = getattr(reasoning_content, "raw_data", None) or {}
-            fallback = getattr(reasoning_content, "thinking", None)
+        """Read the sole canonical text verbatim, without raw-payload fallbacks."""
+        if isinstance(reasoning_content, str):
+            thinking = reasoning_content
         elif isinstance(reasoning_content, dict):
-            raw_data = reasoning_content.get("raw_data") or {}
-            fallback = (
-                reasoning_content.get("reasoning_content")
-                or reasoning_content.get("thinking")
-                or reasoning_content.get("text")
-            )
-        elif isinstance(reasoning_content, str):
-            return reasoning_content or None
+            thinking = reasoning_content.get("thinking")
         else:
-            return None
-
-        envelope = get_replay_payload(raw_data)
-        if envelope and envelope.get("provider") == self.PROVIDER_NAME:
-            payload = unwrap_replay_payload(raw_data)
-            if isinstance(payload, dict):
-                value = payload.get("reasoning_content")
-                if isinstance(value, str) and value:
-                    return value
-
-        legacy_value = raw_data.get("reasoning_content")
-        if isinstance(legacy_value, str) and legacy_value:
-            return legacy_value
-        return fallback if isinstance(fallback, str) and fallback else None
+            thinking = getattr(reasoning_content, "thinking", None)
+        return thinking if isinstance(thinking, str) and thinking else None
 
     def _has_reasoning_input(self, reasoning_content: Any) -> bool:
         value = self._extract_reasoning_input(reasoning_content)
@@ -359,8 +323,7 @@ class QwenProvider(DeepseekProvider):
                     ReplayDiagnostic(
                         code="missing_reasoning_raw_replay",
                         message=(
-                            "Qwen preserved thinking requires provider-native raw "
-                            "reasoning replay data."
+                            "Qwen preserved thinking requires the original thinking text."
                         ),
                         severity="warning",
                         provider=self.PROVIDER_NAME,

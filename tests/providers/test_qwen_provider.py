@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -87,6 +88,52 @@ def test_qwen_message_normalizer_preserves_reasoning_content():
 
     assert MessageNormalizer.detect_provider_type("qwen:qwen3.8-max") == "qwen"
     assert normalized[0]["reasoning_content"]["thinking"] == "keep me"
+
+
+def test_qwen_reasoning_has_one_canonical_text():
+    provider = _provider()
+    text = "\n 保留原值：Space=550ms / gravity=9.81。\t"
+
+    reasoning = provider._convert_reasoning_content(text)
+
+    assert reasoning.model_dump(exclude_none=True) == {
+        "thinking": text,
+        "provider": "qwen",
+    }
+    assert provider.get_replay_capabilities().needs_reasoning_raw_replay is True
+    for value in (
+        text,
+        reasoning,
+        reasoning.model_dump(),
+        SimpleNamespace(thinking=text),
+    ):
+        assert provider._extract_reasoning_input(value) == text
+
+
+@pytest.mark.parametrize("text", [None, ""])
+def test_qwen_does_not_create_absent_reasoning(text):
+    assert _provider()._convert_reasoning_content(text) is None
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        {"text": "not canonical"},
+        {"reasoning_content": "not canonical"},
+        {"raw_data": {"reasoning_content": "not canonical"}},
+    ],
+)
+def test_qwen_does_not_read_alternate_reasoning_fields(reasoning):
+    assert _provider()._extract_reasoning_input(reasoning) is None
+
+
+def test_qwen_uses_thinking_as_the_only_reasoning_source():
+    reasoning = {
+        "thinking": "canonical text",
+        "raw_data": {"reasoning_content": "stale duplicate"},
+    }
+
+    assert _provider()._extract_reasoning_input(reasoning) == "canonical text"
 
 
 @pytest.mark.parametrize(
@@ -261,9 +308,6 @@ async def test_qwen_client_preserves_user_image_and_stringifies_tool_result():
     reasoning = ReasoningContent(
         thinking="inspect the frame",
         provider="qwen",
-        raw_data=client.providers["qwen"]._build_reasoning_replay_payload(
-            "inspect the frame"
-        ),
     )
 
     await client.chat.completions.create(
@@ -314,7 +358,8 @@ async def test_qwen_client_preserves_user_image_and_stringifies_tool_result():
 
 
 @pytest.mark.asyncio
-async def test_qwen_client_replays_reasoning_across_tool_round_trip():
+@pytest.mark.parametrize("persist_history", [False, True], ids=["live", "persisted"])
+async def test_qwen_client_replays_reasoning_across_tool_round_trip(persist_history):
     reasoning_text = "I should inspect the scene before editing it."
     tool_call_id = "call_inspect_scene"
     first_transport_response = SimpleNamespace(
@@ -375,9 +420,18 @@ async def test_qwen_client_replays_reasoning_across_tool_round_trip():
         model="qwen:qwen3.8-max",
         messages=messages,
     )
+    assistant_message = first_response.choices[0].message
+    assert assistant_message.reasoning_content.model_dump(exclude_none=True) == {
+        "thinking": reasoning_text,
+        "provider": "qwen",
+    }
+    if persist_history:
+        assistant_message = json.loads(
+            assistant_message.model_dump_json(exclude_none=True)
+        )
     messages.extend(
         [
-            first_response.choices[0].message,
+            assistant_message,
             {
                 "role": "tool",
                 "tool_call_id": tool_call_id,
@@ -385,6 +439,12 @@ async def test_qwen_client_replays_reasoning_across_tool_round_trip():
             },
         ]
     )
+
+    validation = client.providers["qwen"].validate_replay_window(
+        "qwen3.8-max", messages
+    )
+    assert validation.ok is True
+    assert validation.degraded is False
 
     second_response = await client.chat.completions.create(
         model="qwen:qwen3.8-max",
@@ -547,8 +607,8 @@ async def test_qwen_stream_preserves_reasoning_tool_calls_and_trailing_usage():
     assert chunks[-1].metadata["usage"]["cache_read_input_tokens"] == 4
 
     accumulated = provider._get_accumulated_thinking()
-    assert accumulated["thinking"] == "inspect first"
-    assert accumulated["raw_data"]["provider"] == "qwen"
+    assert accumulated == {"thinking": "inspect first", "raw_data": None}
+    assert provider._get_accumulated_thinking() == {"thinking": "", "raw_data": None}
 
 
 def test_qwen_tool_result_image_without_text_is_projected_after_tool_marker():
