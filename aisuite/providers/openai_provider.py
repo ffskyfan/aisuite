@@ -1085,6 +1085,19 @@ class OpenaiProvider(Provider):
             if usage_dict:
                 metadata['usage'] = usage_dict
 
+            # Responses 的 incomplete 可能仍带部分正文，不能统一伪装成正常 stop。
+            status = getattr(resp, 'status', None)
+            finish_reason = 'stop'
+            if status == 'incomplete':
+                details = getattr(resp, 'incomplete_details', None)
+                reason = details.get('reason') if isinstance(details, dict) else getattr(details, 'reason', None)
+                finish_reason = {
+                    'max_output_tokens': 'length',
+                    'content_filter': 'content_filter',
+                }.get(reason, 'incomplete')
+            elif status not in (None, 'completed'):
+                finish_reason = 'error'
+
             return ChatCompletionResponse(
                 choices=[
                     Choice(index=0, message=Message(
@@ -1093,7 +1106,7 @@ class OpenaiProvider(Provider):
                         tool_calls=None,
                         refusal=None,
                         reasoning_content=reasoning_content
-                    ), finish_reason='stop')
+                    ), finish_reason=finish_reason)
                 ],
                 metadata=metadata
             )
