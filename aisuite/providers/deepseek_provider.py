@@ -326,9 +326,7 @@ class DeepseekProvider(Provider):
             # the valid assistant/tool protocol block from history.
             reasoning_content = prepared.get("reasoning_content")
             if reasoning_content is not None:
-                extracted_reasoning = self._extract_reasoning_input(
-                    reasoning_content
-                )
+                extracted_reasoning = self._extract_reasoning_input(reasoning_content)
                 if extracted_reasoning is not None:
                     prepared["reasoning_content"] = extracted_reasoning
                 elif is_thinking_tool_call:
@@ -399,10 +397,7 @@ class DeepseekProvider(Provider):
                 content_length = max(content_length, stream_content_length)
                 has_content = True
 
-            if (
-                isinstance(stream_tool_calls_count, int)
-                and stream_tool_calls_count > 0
-            ):
+            if isinstance(stream_tool_calls_count, int) and stream_tool_calls_count > 0:
                 # The terminal chunk can repeat tool calls or contain an empty
                 # delta. Use the accumulated count without double-counting the
                 # calls visible in the current delta.
@@ -888,6 +883,19 @@ class DeepseekProvider(Provider):
         # Accumulate tool call chunks
         for tool_call_delta in delta.tool_calls:
             index = getattr(tool_call_delta, "index", 0)
+            function_delta = getattr(tool_call_delta, "function", None)
+            has_payload = bool(
+                getattr(tool_call_delta, "id", None)
+                or getattr(function_delta, "name", None)
+                or getattr(function_delta, "arguments", None)
+            )
+
+            # Some OpenAI-compatible endpoints repeat an empty tool-call item in
+            # the terminal chunk. It is only a protocol placeholder: creating a
+            # fresh accumulator for it would turn a completed call into a false
+            # malformed_streaming_tool_call_arguments error.
+            if not has_payload:
+                continue
 
             # Initialize tool call accumulator if not exists
             if index not in self._streaming_tool_calls:
@@ -904,20 +912,12 @@ class DeepseekProvider(Provider):
                 tool_call["id"] += tool_call_delta.id
 
             # Accumulate function data
-            if hasattr(tool_call_delta, "function") and tool_call_delta.function:
-                if (
-                    hasattr(tool_call_delta.function, "name")
-                    and tool_call_delta.function.name
-                ):
-                    tool_call["function"]["name"] += tool_call_delta.function.name
+            if function_delta:
+                if hasattr(function_delta, "name") and function_delta.name:
+                    tool_call["function"]["name"] += function_delta.name
 
-                if (
-                    hasattr(tool_call_delta.function, "arguments")
-                    and tool_call_delta.function.arguments
-                ):
-                    tool_call["function"][
-                        "arguments"
-                    ] += tool_call_delta.function.arguments
+                if hasattr(function_delta, "arguments") and function_delta.arguments:
+                    tool_call["function"]["arguments"] += function_delta.arguments
 
             # Set type if provided
             if hasattr(tool_call_delta, "type") and tool_call_delta.type:

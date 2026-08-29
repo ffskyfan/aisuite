@@ -158,7 +158,12 @@ async def test_deepseek_provider_fills_and_preserves_empty_tool_reasoning():
     sent_messages = mock_create.call_args.kwargs["messages"]
     assert sent_messages[1]["reasoning_content"] == ""
     assert response.choices[0].message.reasoning_content.thinking == ""
-    assert response.choices[0].message.reasoning_content.raw_data["payload"]["reasoning_content"] == ""
+    assert (
+        response.choices[0].message.reasoning_content.raw_data["payload"][
+            "reasoning_content"
+        ]
+        == ""
+    )
 
 
 def test_deepseek_build_replay_view_preserves_reasoning_content():
@@ -334,14 +339,14 @@ def test_deepseek_capture_response_returns_structured_result():
     captured = provider.capture_response(response, model="deepseek-v4-pro")
 
     assert captured.canonical_message.content == "done"
-    assert (
-        captured.replay_metadata["reasoning_content"]["provider"] == "deepseek"
-    )
+    assert captured.replay_metadata["reasoning_content"]["provider"] == "deepseek"
 
 
 def test_deepseek_provider_preserves_custom_base_url():
     with patch("aisuite.providers.deepseek_provider.openai.AsyncOpenAI") as mock_client:
-        DeepseekProvider(api_key="test-api-key", base_url="https://api.deepseek.com/beta")
+        DeepseekProvider(
+            api_key="test-api-key", base_url="https://api.deepseek.com/beta"
+        )
 
     assert mock_client.call_args.kwargs["base_url"] == "https://api.deepseek.com/beta"
 
@@ -411,7 +416,9 @@ async def test_deepseek_provider_moves_thinking_to_extra_body():
         )
 
     mock_create.assert_called_once()
-    assert mock_create.call_args.kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert mock_create.call_args.kwargs["extra_body"] == {
+        "thinking": {"type": "disabled"}
+    }
 
 
 def test_deepseek_enabled_thinking_removes_conflicting_sampling_controls():
@@ -539,7 +546,10 @@ async def test_deepseek_provider_streaming_accumulates_reasoning_content():
     accumulated_thinking = provider._get_accumulated_thinking()
     assert accumulated_thinking["thinking"] == "think-1 think-2"
     assert accumulated_thinking["raw_data"]["provider"] == "deepseek"
-    assert accumulated_thinking["raw_data"]["payload"]["reasoning_content"] == "think-1 think-2"
+    assert (
+        accumulated_thinking["raw_data"]["payload"]["reasoning_content"]
+        == "think-1 think-2"
+    )
 
 
 def test_deepseek_provider_empty_accumulated_thinking_keeps_replay_payload():
@@ -730,8 +740,17 @@ async def test_deepseek_provider_streaming_marks_pending_malformed_tool_call_ret
         == "malformed_streaming_tool_call_arguments"
     )
     assert streamed_chunks[-1].choices[0].stop_info.metadata["retryable"] is True
-    assert streamed_chunks[-1].choices[0].stop_info.metadata["pending_tool_calls"][0]["function_name"] == "edit_file"
-    assert streamed_chunks[-1].choices[0].stop_info.metadata["pending_tool_calls"][0]["parse_error"]
+    assert (
+        streamed_chunks[-1]
+        .choices[0]
+        .stop_info.metadata["pending_tool_calls"][0]["function_name"]
+        == "edit_file"
+    )
+    assert (
+        streamed_chunks[-1]
+        .choices[0]
+        .stop_info.metadata["pending_tool_calls"][0]["parse_error"]
+    )
 
 
 @pytest.mark.asyncio
@@ -819,6 +838,91 @@ async def test_deepseek_provider_streaming_preserves_accumulated_multiple_tool_c
     assert final_choice.stop_info.reason.value == "tool_call"
     assert final_choice.stop_info.metadata["tool_calls_count"] == 2
     assert final_choice.stop_info.metadata["has_content"] is True
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_streaming_ignores_empty_terminal_tool_call_placeholder():
+    provider = DeepseekProvider(api_key="test-api-key")
+
+    chunks = [
+        _ns(
+            id="chunk-1",
+            created=1,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason=None,
+                    delta=_ns(
+                        content=None,
+                        role="assistant",
+                        reasoning_content=None,
+                        tool_calls=[
+                            _ns(
+                                index=0,
+                                id="call_1",
+                                type="function",
+                                function=_ns(
+                                    name="read_file",
+                                    arguments='{"path":"brief.md"}',
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        ),
+        _ns(
+            id="chunk-2",
+            created=2,
+            model="deepseek-v4-pro",
+            usage=None,
+            choices=[
+                _ns(
+                    index=0,
+                    finish_reason="tool_calls",
+                    delta=_ns(
+                        content=None,
+                        role=None,
+                        reasoning_content=None,
+                        tool_calls=[
+                            _ns(
+                                index=0,
+                                id=None,
+                                type="function",
+                                function=_ns(name=None, arguments=None),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    async def fake_response():
+        for chunk in chunks:
+            yield chunk
+
+    with patch.object(
+        provider.client.chat.completions,
+        "create",
+        new=AsyncMock(return_value=fake_response()),
+    ):
+        stream = await provider.chat_completions_create(
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "Read the file."}],
+            stream=True,
+        )
+        streamed_chunks = [chunk async for chunk in stream]
+
+    assert len(streamed_chunks[0].choices[0].delta.tool_calls) == 1
+    final_choice = streamed_chunks[-1].choices[0]
+    assert final_choice.finish_reason == "tool_calls"
+    assert final_choice.delta.tool_calls is None
+    assert final_choice.stop_info.reason.value == "tool_call"
+    assert final_choice.stop_info.metadata["tool_calls_count"] == 1
+    assert "error_class" not in final_choice.stop_info.metadata
 
 
 @pytest.mark.asyncio

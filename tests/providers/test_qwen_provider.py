@@ -550,9 +550,7 @@ async def test_qwen_recovers_stringified_tool_argument_types_from_schema():
         ],
     )
 
-    arguments = json.loads(
-        response.choices[0].message.tool_calls[0].function.arguments
-    )
+    arguments = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
     assert arguments == {
         "expectedRevision": 0,
         "tasks": [{"id": 7}],
@@ -607,7 +605,7 @@ def test_qwen_preserves_ambiguous_anyof_string_recovery():
 
 
 @pytest.mark.asyncio
-async def test_qwen_stream_recovers_tool_arguments_with_request_schema():
+async def test_qwen_stream_recovers_scene_change_nullable_revision():
     provider = _provider()
 
     async def fake_response():
@@ -619,7 +617,7 @@ async def test_qwen_stream_recovers_tool_arguments_with_request_schema():
             choices=[
                 SimpleNamespace(
                     index=0,
-                    finish_reason="tool_calls",
+                    finish_reason=None,
                     delta=SimpleNamespace(
                         role="assistant",
                         content=None,
@@ -627,11 +625,43 @@ async def test_qwen_stream_recovers_tool_arguments_with_request_schema():
                         tool_calls=[
                             SimpleNamespace(
                                 index=0,
-                                id="call_update_plan",
+                                id="call_scene_change",
                                 type="function",
                                 function=SimpleNamespace(
-                                    name="update_plan",
-                                    arguments='{"expectedRevision":"0"}',
+                                    name="scene_change",
+                                    arguments=(
+                                        '{"scene":{"path":"Scenes/Main.gscn"},'
+                                        '"expectedRevision":"0","ops":['
+                                        '{"op":"delete_node","target":"/World"}]}'
+                                    ),
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+        yield SimpleNamespace(
+            id="chat_2",
+            created=2,
+            model="qwen3.8-max",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    finish_reason="tool_calls",
+                    delta=SimpleNamespace(
+                        role=None,
+                        content=None,
+                        reasoning_content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                type="function",
+                                function=SimpleNamespace(
+                                    name=None,
+                                    arguments=None,
                                 ),
                             )
                         ],
@@ -649,13 +679,42 @@ async def test_qwen_stream_recovers_tool_arguments_with_request_schema():
             {
                 "type": "function",
                 "function": {
-                    "name": "update_plan",
+                    "name": "scene_change",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "expectedRevision": {"type": "integer"},
+                            "scene": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                },
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                            "expectedRevision": {
+                                "oneOf": [
+                                    {"type": "integer", "minimum": 0},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "ops": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "op": {
+                                            "type": "string",
+                                            "enum": ["delete_node"],
+                                        },
+                                        "target": {"type": "string"},
+                                    },
+                                    "required": ["op"],
+                                    "additionalProperties": False,
+                                },
+                            },
                         },
-                        "required": ["expectedRevision"],
+                        "required": ["scene", "ops"],
                         "additionalProperties": False,
                     },
                 },
@@ -664,10 +723,16 @@ async def test_qwen_stream_recovers_tool_arguments_with_request_schema():
     )
 
     chunks = [chunk async for chunk in stream]
-    arguments = json.loads(
-        chunks[0].choices[0].delta.tool_calls[0].function.arguments
-    )
-    assert arguments == {"expectedRevision": 0}
+    arguments = json.loads(chunks[0].choices[0].delta.tool_calls[0].function.arguments)
+    assert arguments == {
+        "scene": {"path": "Scenes/Main.gscn"},
+        "expectedRevision": 0,
+        "ops": [{"op": "delete_node", "target": "/World"}],
+    }
+    final_choice = chunks[-1].choices[0]
+    assert final_choice.stop_info.reason.value == "tool_call"
+    assert final_choice.stop_info.metadata["tool_calls_count"] == 1
+    assert "error_class" not in final_choice.stop_info.metadata
 
 
 def test_qwen38_replay_marks_missing_tool_reasoning_as_degraded():
