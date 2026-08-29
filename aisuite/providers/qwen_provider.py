@@ -1,6 +1,11 @@
 import copy
+import json
+import logging
 import os
-from typing import Any, Dict, List, Optional
+from contextvars import ContextVar
+from typing import Any, Dict, List, Optional, Tuple
+
+from jsonschema.validators import validator_for
 
 from aisuite.framework.content import (
     MultimodalCapabilities,
@@ -15,6 +20,221 @@ from aisuite.framework.replay_payload import (
 )
 from aisuite.provider import LLMError
 from aisuite.providers.deepseek_provider import DeepseekProvider
+
+
+logger = logging.getLogger(__name__)
+
+_QWEN_TOOL_SCHEMAS: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "qwen_tool_schemas",
+    default=None,
+)
+_JSON_PARSE_FAILED = object()
+
+
+def _json_path(path: Tuple[Any, ...]) -> str:
+    rendered = "$"
+    for part in path:
+        if isinstance(part, int):
+            rendered += f"[{part}]"
+        elif isinstance(part, str) and part.isidentifier():
+            rendered += f".{part}"
+        else:
+            rendered += f"[{json.dumps(part, ensure_ascii=False)}]"
+    return rendered
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"Non-standard JSON constant: {value}")
+
+
+class _SchemaArgumentRecovery:
+    """Recover stringified values and let JSON Schema remain the authority."""
+
+    def __init__(self, schema: Any):
+        validator_class = validator_for(schema)
+        validator_class.check_schema(schema)
+        self.schema = schema
+        self.validator = validator_class(schema)
+
+    def is_valid(self, value: Any, schema: Any = None) -> bool:
+        target_schema = self.schema if schema is None else schema
+        try:
+            return self.validator.evolve(schema=target_schema).is_valid(value)
+        except Exception:
+            return False
+
+    def recover(self, value: Any) -> Tuple[Any, Tuple[str, ...]]:
+        original = copy.deepcopy(value)
+        candidate = copy.deepcopy(value)
+        attempted_paths = set()
+        recovered_paths: List[str] = []
+        union_guards = []
+
+        while True:
+            errors = list(self.validator.iter_errors(candidate))
+            if not errors:
+                break
+
+            errors_by_path: Dict[Tuple[Any, ...], list] = {}
+            for error in errors:
+                for string_error, guards in self._iter_string_errors(error):
+                    path = tuple(string_error.absolute_path)
+                    errors_by_path.setdefault(path, []).append(
+                        (string_error, guards)
+                    )
+
+            replacements = {}
+            for path, path_errors in errors_by_path.items():
+                if path in attempted_paths:
+                    continue
+                attempted_paths.add(path)
+
+                current_value = self._value_at_path(candidate, path)
+                if not isinstance(current_value, str):
+                    continue
+                try:
+                    parsed_value = json.loads(
+                        current_value,
+                        parse_constant=_reject_json_constant,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(parsed_value, str):
+                    continue
+
+                if not any(
+                    self._error_accepts_parsed_value(error, parsed_value)
+                    for error, _ in path_errors
+                ):
+                    continue
+
+                replacements[path] = parsed_value
+                for _, guards in path_errors:
+                    union_guards.extend(guards)
+
+            if not replacements:
+                break
+
+            for path, replacement in sorted(
+                replacements.items(), key=lambda item: len(item[0])
+            ):
+                candidate = self._replace_at_path(candidate, path, replacement)
+                recovered_paths.append(_json_path(path))
+
+        if (
+            recovered_paths
+            and self.is_valid(candidate)
+            and self._union_guards_are_unambiguous(candidate, union_guards)
+        ):
+            return candidate, tuple(dict.fromkeys(recovered_paths))
+        return original, ()
+
+    def _iter_string_errors(self, error: Any, union_guards: tuple = ()):
+        guards = union_guards
+        if error.validator in {"oneOf", "anyOf"}:
+            guards = (
+                *guards,
+                (
+                    tuple(error.absolute_path),
+                    tuple(error.validator_value),
+                ),
+            )
+
+        if isinstance(error.instance, str):
+            yield error, guards
+            return
+
+        for child in error.context:
+            yield from self._iter_string_errors(child, guards)
+
+    def _error_accepts_parsed_value(self, error: Any, parsed_value: Any) -> bool:
+        if error.validator == "type":
+            expected_types = error.validator_value
+            if isinstance(expected_types, str):
+                expected_types = [expected_types]
+            if not isinstance(expected_types, list) or "string" in expected_types:
+                return False
+            return any(
+                self.validator.is_type(parsed_value, expected_type)
+                for expected_type in expected_types
+            )
+
+        if error.validator in {"enum", "const"}:
+            return self.is_valid(
+                parsed_value,
+                {error.validator: error.validator_value},
+            )
+
+        if error.validator in {"oneOf", "anyOf"}:
+            branches = error.validator_value
+            matching = [
+                branch for branch in branches if self.is_valid(parsed_value, branch)
+            ]
+            if len(matching) == 1:
+                return True
+            if matching:
+                return False
+
+            shape_matches = [
+                branch
+                for branch in branches
+                if self._schema_accepts_value_shape(parsed_value, branch)
+            ]
+            return len(shape_matches) == 1
+
+        return False
+
+    def _schema_accepts_value_shape(self, value: Any, schema: Any) -> bool:
+        if not isinstance(schema, dict):
+            return bool(schema)
+        expected_types = schema.get("type")
+        if isinstance(expected_types, str):
+            expected_types = [expected_types]
+        if not isinstance(expected_types, list):
+            return False
+        return any(
+            self.validator.is_type(value, expected_type)
+            for expected_type in expected_types
+        )
+
+    def _union_guards_are_unambiguous(
+        self,
+        candidate: Any,
+        union_guards: list,
+    ) -> bool:
+        for path, branches in union_guards:
+            value = self._value_at_path(candidate, path)
+            matching_count = sum(
+                1 for branch in branches if self.is_valid(value, branch)
+            )
+            if matching_count != 1:
+                return False
+        return True
+
+    @staticmethod
+    def _value_at_path(value: Any, path: Tuple[Any, ...]) -> Any:
+        current = value
+        try:
+            for part in path:
+                current = current[part]
+        except (KeyError, IndexError, TypeError):
+            return _JSON_PARSE_FAILED
+        return current
+
+    @staticmethod
+    def _replace_at_path(
+        value: Any,
+        path: Tuple[Any, ...],
+        replacement: Any,
+    ) -> Any:
+        if not path:
+            return replacement
+
+        current = value
+        for part in path[:-1]:
+            current = current[part]
+        current[path[-1]] = replacement
+        return value
 
 
 class QwenProvider(DeepseekProvider):
@@ -493,6 +713,115 @@ class QwenProvider(DeepseekProvider):
 
         return normalized
 
+    @classmethod
+    def _extract_tool_schemas(cls, tools: Any) -> Dict[str, Any]:
+        if not isinstance(tools, (list, tuple)):
+            return {}
+
+        schemas: Dict[str, Any] = {}
+        duplicate_names = set()
+        for tool in tools:
+            tool_data = cls._normalize_message(tool)
+            function = tool_data.get("function")
+            if not isinstance(function, dict) and hasattr(function, "model_dump"):
+                function = function.model_dump()
+            if not isinstance(function, dict):
+                continue
+
+            name = function.get("name")
+            parameters = function.get("parameters")
+            if not isinstance(name, str) or not isinstance(parameters, (dict, bool)):
+                continue
+
+            if name in schemas:
+                duplicate_names.add(name)
+                continue
+            schemas[name] = copy.deepcopy(parameters)
+
+        for name in duplicate_names:
+            schemas.pop(name, None)
+        return schemas
+
+    @staticmethod
+    def _recover_tool_arguments(
+        tool_name: str,
+        raw_arguments: Any,
+        schema: Any,
+    ) -> Tuple[Any, Tuple[str, ...]]:
+        if not isinstance(raw_arguments, str):
+            return raw_arguments, ()
+
+        try:
+            arguments = json.loads(
+                raw_arguments,
+                parse_constant=_reject_json_constant,
+            )
+        except (TypeError, ValueError):
+            return raw_arguments, ()
+
+        try:
+            recovery = _SchemaArgumentRecovery(schema)
+            if recovery.is_valid(arguments):
+                return raw_arguments, ()
+
+            candidate, recovered_paths = recovery.recover(arguments)
+            if not recovered_paths or not recovery.is_valid(candidate):
+                return raw_arguments, ()
+
+            normalized_arguments = json.dumps(
+                candidate,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            return normalized_arguments, recovered_paths
+        except Exception as exc:
+            logger.warning(
+                "Qwen tool argument recovery skipped because the schema could not "
+                "be validated: tool=%s error=%s",
+                tool_name,
+                exc,
+            )
+            return raw_arguments, ()
+
+    def _convert_tool_calls(self, tool_calls):
+        converted_tool_calls = super()._convert_tool_calls(tool_calls)
+        tool_schemas = _QWEN_TOOL_SCHEMAS.get()
+        if not converted_tool_calls or not tool_schemas:
+            return converted_tool_calls
+
+        for tool_call in converted_tool_calls:
+            tool_name = tool_call.function.name
+            schema = tool_schemas.get(tool_name)
+            if schema is None:
+                continue
+
+            raw_arguments = tool_call.function.arguments
+            normalized_arguments, recovered_paths = self._recover_tool_arguments(
+                tool_name,
+                raw_arguments,
+                schema,
+            )
+            if not recovered_paths:
+                continue
+
+            tool_call.function.arguments = normalized_arguments
+            logger.info(
+                "Recovered Qwen tool argument types from JSON strings: "
+                "tool=%s paths=%s",
+                tool_name,
+                list(recovered_paths),
+            )
+            logger.debug(
+                "Qwen tool argument recovery details: tool=%s raw_arguments=%s "
+                "normalized_arguments=%s",
+                tool_name,
+                self._truncate_string(raw_arguments),
+                self._truncate_string(normalized_arguments),
+            )
+
+        return converted_tool_calls
+
     async def chat_completions_create(
         self, model, messages, stream: bool = False, **kwargs
     ):
@@ -506,9 +835,27 @@ class QwenProvider(DeepseekProvider):
                 # reasoning replay remains stable across compatible endpoints.
                 kwargs["preserve_thinking"] = True
 
-        return await super().chat_completions_create(
-            model=model,
-            messages=messages,
-            stream=stream,
-            **kwargs,
-        )
+        tool_schemas = self._extract_tool_schemas(kwargs.get("tools"))
+        context_token = _QWEN_TOOL_SCHEMAS.set(tool_schemas)
+        try:
+            response = await super().chat_completions_create(
+                model=model,
+                messages=messages,
+                stream=stream,
+                **kwargs,
+            )
+        finally:
+            _QWEN_TOOL_SCHEMAS.reset(context_token)
+
+        if not stream:
+            return response
+
+        async def stream_with_tool_schemas():
+            stream_context_token = _QWEN_TOOL_SCHEMAS.set(tool_schemas)
+            try:
+                async for chunk in response:
+                    yield chunk
+            finally:
+                _QWEN_TOOL_SCHEMAS.reset(stream_context_token)
+
+        return stream_with_tool_schemas()

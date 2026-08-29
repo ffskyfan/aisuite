@@ -14,6 +14,7 @@ vertexai = { version = "^1.63.0", optional = true }
 groq = { version = "^0.9.0", optional = true }
 mistralai = { version = "^1.0.3", optional = true }
 openai = { version = "^1.100.2", optional = true }
+jsonschema = { version = "^4.23.0", optional = true }
 ibm-watsonx-ai = { version = "^1.1.16", optional = true }
 docstring-parser = { version = ">=0.15.0,<1.0.0", optional = true }
 cerebras_cloud_sdk = { version = "^1.19.0", optional = true }
@@ -30,7 +31,7 @@ cerebras = ["cerebras_cloud_sdk"]
 cohere = ["cohere"]
 deepseek = ["openai"]
 kimi = ["openai"]
-qwen = ["openai"]
+qwen = ["openai", "jsonschema"]
 google = ["vertexai"]
 groq = ["groq"]
 huggingface = []
@@ -40,7 +41,7 @@ openai = ["openai"]
 glm = ["zai-sdk"]
 vercel = ["openai", "anthropic"]
 watsonx = ["ibm-watsonx-ai"]
-all = ["anthropic", "boto3", "cerebras_cloud_sdk", "cohere", "docstring-parser", "groq", "ibm-watsonx-ai", "mistralai", "openai", "vertexai", "zai-sdk"]  # To install all providers
+all = ["anthropic", "boto3", "cerebras_cloud_sdk", "cohere", "docstring-parser", "groq", "ibm-watsonx-ai", "jsonschema", "mistralai", "openai", "vertexai", "zai-sdk"]  # To install all providers
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^3.7.1"

@@ -464,6 +464,212 @@ async def test_qwen_client_replays_reasoning_across_tool_round_trip(persist_hist
     }
 
 
+@pytest.mark.asyncio
+async def test_qwen_recovers_stringified_tool_argument_types_from_schema():
+    provider = _provider()
+    raw_arguments = json.dumps(
+        {
+            "expectedRevision": "0",
+            "tasks": '[{"id":"7"}]',
+            "enabled": "true",
+            "config": '{"retries":2}',
+            "label": "123",
+        }
+    )
+    provider.client.chat.completions.create = AsyncMock(
+        return_value=SimpleNamespace(
+            id="chat_1",
+            created=1,
+            model="qwen3.8-max",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    finish_reason="tool_calls",
+                    message=SimpleNamespace(
+                        role="assistant",
+                        content="",
+                        reasoning_content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call_update_plan",
+                                type="function",
+                                function=SimpleNamespace(
+                                    name="update_plan",
+                                    arguments=raw_arguments,
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+    )
+
+    response = await provider.chat_completions_create(
+        model="qwen3.8-max",
+        messages=[{"role": "user", "content": "Update the plan"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_plan",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "expectedRevision": {"type": "integer"},
+                            "tasks": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"id": {"type": "integer"}},
+                                    "required": ["id"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "enabled": {"type": "boolean"},
+                            "config": {
+                                "type": "object",
+                                "properties": {"retries": {"type": "integer"}},
+                                "required": ["retries"],
+                                "additionalProperties": False,
+                            },
+                            "label": {"type": "string"},
+                        },
+                        "required": [
+                            "expectedRevision",
+                            "tasks",
+                            "enabled",
+                            "config",
+                            "label",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+    )
+
+    arguments = json.loads(
+        response.choices[0].message.tool_calls[0].function.arguments
+    )
+    assert arguments == {
+        "expectedRevision": 0,
+        "tasks": [{"id": 7}],
+        "enabled": True,
+        "config": {"retries": 2},
+        "label": "123",
+    }
+
+
+def test_qwen_preserves_raw_arguments_when_full_schema_still_fails():
+    raw_arguments = '{"expectedRevision":"0"}'
+    normalized, recovered_paths = QwenProvider._recover_tool_arguments(
+        "update_plan",
+        raw_arguments,
+        {
+            "type": "object",
+            "properties": {
+                "expectedRevision": {"type": "integer"},
+                "tasks": {"type": "array"},
+            },
+            "required": ["expectedRevision", "tasks"],
+            "additionalProperties": False,
+        },
+    )
+
+    assert normalized == raw_arguments
+    assert recovered_paths == ()
+
+
+def test_qwen_preserves_ambiguous_anyof_string_recovery():
+    raw_arguments = '{"value":"1"}'
+    normalized, recovered_paths = QwenProvider._recover_tool_arguments(
+        "choose_value",
+        raw_arguments,
+        {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "integer"},
+                        {"type": "number"},
+                    ]
+                }
+            },
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    )
+
+    assert normalized == raw_arguments
+    assert recovered_paths == ()
+
+
+@pytest.mark.asyncio
+async def test_qwen_stream_recovers_tool_arguments_with_request_schema():
+    provider = _provider()
+
+    async def fake_response():
+        yield SimpleNamespace(
+            id="chat_1",
+            created=1,
+            model="qwen3.8-max",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    finish_reason="tool_calls",
+                    delta=SimpleNamespace(
+                        role="assistant",
+                        content=None,
+                        reasoning_content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call_update_plan",
+                                type="function",
+                                function=SimpleNamespace(
+                                    name="update_plan",
+                                    arguments='{"expectedRevision":"0"}',
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+
+    provider.client.chat.completions.create = AsyncMock(return_value=fake_response())
+    stream = await provider.chat_completions_create(
+        model="qwen3.8-max",
+        messages=[{"role": "user", "content": "Update the plan"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_plan",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "expectedRevision": {"type": "integer"},
+                        },
+                        "required": ["expectedRevision"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+    )
+
+    chunks = [chunk async for chunk in stream]
+    arguments = json.loads(
+        chunks[0].choices[0].delta.tool_calls[0].function.arguments
+    )
+    assert arguments == {"expectedRevision": 0}
+
+
 def test_qwen38_replay_marks_missing_tool_reasoning_as_degraded():
     provider = _provider()
 
