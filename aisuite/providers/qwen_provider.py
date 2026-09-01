@@ -7,12 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from jsonschema.validators import validator_for
 
-from aisuite.framework.content import (
-    MultimodalCapabilities,
-    content_text,
-    has_image_content,
-    is_image_part,
-)
+from aisuite.framework.content import MultimodalCapabilities
 from aisuite.framework.replay_payload import (
     ReplayBuildResult,
     ReplayDiagnostic,
@@ -241,7 +236,6 @@ class QwenProvider(DeepseekProvider):
     """Qwen provider using Alibaba Cloud Model Studio's OpenAI-compatible API."""
 
     PROVIDER_NAME = "qwen"
-    TOOL_IMAGE_FORWARD_TEXT = "[visual tool result attached in following user message]"
 
     TOKEN_PLAN_BASE_URL = (
         "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
@@ -317,58 +311,6 @@ class QwenProvider(DeepseekProvider):
             user_images=user_images,
             tool_result_images=user_images,
         )
-
-    def _project_tool_result_images(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Keep Qwen tool messages string-only without discarding screenshots."""
-
-        projected: List[Dict[str, Any]] = []
-        pending_visual_parts: List[Dict[str, Any]] = []
-
-        def flush_visual_parts() -> None:
-            if not pending_visual_parts:
-                return
-            projected.append(
-                {
-                    "role": "user",
-                    "content": copy.deepcopy(pending_visual_parts),
-                }
-            )
-            pending_visual_parts.clear()
-
-        for raw_message in messages:
-            message = copy.deepcopy(self._normalize_message(raw_message))
-            if message.get("role") != "tool":
-                flush_visual_parts()
-                projected.append(message)
-                continue
-
-            content = message.get("content")
-            if not has_image_content(content):
-                projected.append(message)
-                continue
-
-            tool_call_id = str(message.get("tool_call_id") or "unknown")
-            text = content_text(content).strip()
-            message["content"] = text or self.TOOL_IMAGE_FORWARD_TEXT
-            projected.append(message)
-
-            pending_visual_parts.append(
-                {
-                    "type": "text",
-                    "text": (
-                        "The following image is visual output from tool result "
-                        f"{tool_call_id}. Inspect it as part of that tool result."
-                    ),
-                }
-            )
-            pending_visual_parts.extend(
-                copy.deepcopy(part) for part in content if is_image_part(part)
-            )
-
-        flush_visual_parts()
-        return projected
 
     def _build_reasoning_replay_payload(self, reasoning_content: str) -> None:
         # Qwen replays the original thinking text directly; no raw copy is needed.

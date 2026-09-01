@@ -467,10 +467,12 @@ OpenAI-compatible 不是统一能力声明。不同端点可能只兼容文本 C
 
 - User Content 图片：端点和模型支持时原样传递 OpenAI 风格内容数组；
 - Tool Result 图片：只有端点明确支持多模态 Tool Result 时才传递；
-- 只支持 Chat Completions 文本 Tool Result 的端点按非视觉规则过滤图片；
+- 只支持 Chat Completions 文本 Tool Result 的端点默认按非视觉规则过滤图片；若适配器已实现并验证工具图片到 User 视觉消息的投影，可声明有效 Tool Result 视觉支持；
 - 不因为 Provider 使用 OpenAI SDK 就默认认为它支持视觉或多模态 Tool Result。
 
 该规则适用于 DeepSeek、Kimi、GLM、Groq、Mistral、Cerebras、Together、Fireworks、Nebius、Ollama、Hugging Face、xAI、CloseAI 等路径，最终能力仍以具体模型和端点为准。
+
+当前 Qwen 视觉模型与 `deepseek-v4-flash-vision-exp` 复用 Provider 层投影：保留原有 tool_call_id 与文本 Tool Result，在整个连续 Tool Result 组结束后追加关联图片的 User 消息。投影只作用于出站副本；canonical 历史、推理回放和并行工具配对保持不变。DeepSeek 其他模型仍过滤图片。原生支持多模态 Tool Result 的 Provider 不使用该投影。
 
 ### 9.6 其他原生 Provider
 
@@ -616,7 +618,7 @@ aisuite/providers/message_converter.py
 - GPT 5.5、GPT 5.4；
 - Claude Opus 4.6、Claude Sonnet 4.6；
 - Gemini 3 Flash、Gemini 3.1 Pro；
-- DeepSeek V4 Flash、DeepSeek V4 Pro；
+- DeepSeek V4 Flash、DeepSeek V4 Pro、DeepSeek V4 Flash Vision Exp；
 - Kimi K3；
 - GLM 5.2。
 

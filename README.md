@@ -91,6 +91,25 @@ with `provider="qwen"` and no `raw_data` payload. The adapter sends that text
 unchanged as the API's `reasoning_content` string. Historical replay envelopes
 and alternate text fields are not part of the Qwen history contract.
 
+For DeepSeek's experimental vision model, keep the standard `DEEPSEEK_API_KEY`
+and optional `DEEPSEEK_BASE_URL` (default: `https://api.deepseek.com`):
+
+```python
+client = ai.Client()
+response = client.chat.completions.create(
+    model="deepseek:deepseek-v4-flash-vision-exp",
+    messages=[{"role": "user", "content": "Hello"}],
+    thinking={"type": "enabled"},
+    reasoning_effort="low",
+)
+```
+
+User images use canonical `image_url` content parts. Tool-result screenshots
+are projected into a user vision message after the complete tool-result group,
+without changing canonical history or discarding reasoning. This projection is
+shared with Qwen; other DeepSeek models remain text-only. See the official
+[vision guide](https://api-docs.deepseek.com/guides/vision/) for model limits.
+
 Here is a short example of using `aisuite` to generate chat completion responses from gpt-4o and claude-3-5-sonnet.
 
 Set the API keys.

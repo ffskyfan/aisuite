@@ -1,3 +1,4 @@
+import copy
 import openai
 import os
 import json
@@ -28,20 +29,31 @@ from aisuite.framework.replay_payload import (
     unwrap_replay_payload,
 )
 from aisuite.framework.stop_reason import StopInfo, StopReason, stop_reason_manager
-from aisuite.framework.content import MultimodalCapabilities
+from aisuite.framework.content import (
+    MultimodalCapabilities,
+    content_text,
+    has_image_content,
+    is_image_part,
+)
 
 
 class DeepseekProvider(Provider):
     PROVIDER_NAME = "deepseek"
     REASONING_REPLAY_KIND = "deepseek_reasoning_text"
+    TOOL_IMAGE_FORWARD_TEXT = "[visual tool result attached in following user message]"
 
     def get_multimodal_capabilities(
         self, model: str | None = None
     ) -> MultimodalCapabilities:
-        # DeepSeek's chat/reasoner API currently accepts text input only.
+        normalized_model = (model or "").lower().removeprefix("deepseek:")
+        supports_vision = normalized_model == "deepseek-v4-flash-vision-exp"
+        # Chat Completions accepts images only in user messages. Tool images
+        # remain supported through the provider-local projection below.
+        # https://api-docs.deepseek.com/guides/vision/
+        image_support = "supported" if supports_vision else "unsupported"
         return MultimodalCapabilities(
-            user_images="unsupported",
-            tool_result_images="unsupported",
+            user_images=image_support,
+            tool_result_images=image_support,
         )
 
     def __init__(self, **config):
@@ -300,6 +312,63 @@ class DeepseekProvider(Provider):
             "raw_data": self._build_reasoning_replay_payload(thinking_text),
         }
 
+    def _project_tool_result_images(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Project screenshots for APIs whose tool messages must be text-only.
+
+        Shared by DeepSeek vision and Qwen. Flush only after the entire
+        contiguous tool-result group so parallel call/result pairs stay intact.
+        Canonical history is never modified or given synthetic user turns.
+        """
+        projected: List[Dict[str, Any]] = []
+        pending_visual_parts: List[Dict[str, Any]] = []
+
+        def flush_visual_parts() -> None:
+            if pending_visual_parts:
+                projected.append(
+                    {"role": "user", "content": list(pending_visual_parts)}
+                )
+                pending_visual_parts.clear()
+
+        for raw_message in messages:
+            message = copy.deepcopy(
+                raw_message.model_dump()
+                if hasattr(raw_message, "model_dump")
+                else dict(raw_message)
+            )
+            # AISuite-only tool metadata is not part of the wire schema.
+            message.pop("is_error", None)
+            if message.get("role") != "tool":
+                flush_visual_parts()
+                projected.append(message)
+                continue
+
+            content = message.get("content")
+            if not has_image_content(content):
+                if isinstance(content, list):
+                    message["content"] = content_text(content)
+                projected.append(message)
+                continue
+
+            tool_call_id = str(message.get("tool_call_id") or "unknown")
+            text = content_text(content).strip()
+            message["content"] = text or self.TOOL_IMAGE_FORWARD_TEXT
+            projected.append(message)
+            pending_visual_parts.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "The following image is visual output from tool result "
+                        f"{tool_call_id}. Inspect it as part of that tool result."
+                    ),
+                }
+            )
+            pending_visual_parts.extend(part for part in content if is_image_part(part))
+
+        flush_visual_parts()
+        return projected
+
     def _prepare_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -348,11 +417,15 @@ class DeepseekProvider(Provider):
             )
             raise LLMError(f"DeepSeek replay window validation failed: {error_codes}")
 
+        prepared_messages = self._prepare_messages(
+            messages,
+            fill_empty_tool_reasoning=self._is_thinking_enabled(kwargs),
+        )
+        if self.get_multimodal_capabilities(model).tool_result_images == "supported":
+            prepared_messages = self._project_tool_result_images(prepared_messages)
+
         return ReplayBuildResult(
-            request_view=self._prepare_messages(
-                messages,
-                fill_empty_tool_reasoning=self._is_thinking_enabled(kwargs),
-            ),
+            request_view=prepared_messages,
             replay_mode="canonical_with_reasoning",
             degraded=validation.degraded,
             diagnostics=validation.diagnostics,
