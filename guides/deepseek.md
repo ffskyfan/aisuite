@@ -80,4 +80,16 @@ Sources (checked 2026-09-11): [models](https://api-docs.deepseek.com/quick_start
 [vision](https://api-docs.deepseek.com/guides/vision/),
 [thinking](https://api-docs.deepseek.com/guides/thinking_mode/).
 
+## Reasoning history
+
+New responses store the original reasoning text only in
+`reasoning_content.thinking`, with `raw_data=None`. This also preserves an empty
+string for tool-call turns. The provider converts that text into a single
+`reasoning_content` string when building the API request.
+
+Existing histories with versioned `raw_data.payload.reasoning_content` or legacy
+`raw_data.reasoning_content` remain readable without rewriting the stored data.
+If old copies disagree, replay retains its existing precedence: the versioned
+payload, then the legacy raw field, then canonical `thinking`.
+
 Happy coding! If you’d like to contribute, please read our [Contributing Guide](../CONTRIBUTING.md).

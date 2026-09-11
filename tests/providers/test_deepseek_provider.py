@@ -1,3 +1,4 @@
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -98,9 +99,9 @@ async def test_deepseek_provider_non_stream_replays_reasoning_content():
     )
     assert response.choices[0].message.content == "done"
     assert response.choices[0].message.reasoning_content.thinking == "step-by-step"
-    assert (
-        response.choices[0].message.reasoning_content.raw_data["provider"] == "deepseek"
-    )
+    assert response.choices[0].message.reasoning_content.raw_data is None
+    captured = provider.capture_response(response, model="deepseek-v4-pro")
+    assert captured.replay_metadata["reasoning_content"] is None
     assert response.metadata["usage"]["cache_read_input_tokens"] == 3
 
 
@@ -158,12 +159,7 @@ async def test_deepseek_provider_fills_and_preserves_empty_tool_reasoning():
     sent_messages = mock_create.call_args.kwargs["messages"]
     assert sent_messages[1]["reasoning_content"] == ""
     assert response.choices[0].message.reasoning_content.thinking == ""
-    assert (
-        response.choices[0].message.reasoning_content.raw_data["payload"][
-            "reasoning_content"
-        ]
-        == ""
-    )
+    assert response.choices[0].message.reasoning_content.raw_data is None
 
 
 def test_deepseek_build_replay_view_preserves_reasoning_content():
@@ -245,6 +241,94 @@ def test_deepseek_message_normalizer_preserves_reasoning_content():
     )
 
     assert normalized[0]["reasoning_content"]["thinking"] == "keep me"
+
+
+@pytest.mark.parametrize("representation", ["dict", "object", "namespace"])
+@pytest.mark.parametrize(
+    "thinking,raw_data,expected",
+    [
+        pytest.param("\n original text\t", None, "\n original text\t", id="canonical"),
+        pytest.param("", None, "", id="canonical-empty"),
+        pytest.param(
+            "", {"reasoning_content": "legacy text"}, "legacy text", id="legacy-raw"
+        ),
+        pytest.param(
+            "",
+            {
+                "version": 1,
+                "provider": "deepseek",
+                "kind": "deepseek_reasoning_text",
+                "payload": {"reasoning_content": "envelope text"},
+            },
+            "envelope text",
+            id="legacy-envelope",
+        ),
+        pytest.param(
+            "display text",
+            {"reasoning_content": "legacy text"},
+            "legacy text",
+            id="legacy-conflict",
+        ),
+        pytest.param(
+            "display text",
+            {
+                "version": 1,
+                "provider": "deepseek",
+                "kind": "deepseek_reasoning_text",
+                "payload": {"reasoning_content": "envelope text"},
+                "reasoning_content": "legacy text",
+            },
+            "envelope text",
+            id="envelope-conflict",
+        ),
+        pytest.param("display text", {"reasoning_content": ""}, "", id="legacy-empty"),
+        pytest.param(
+            "display text",
+            {
+                "version": 1,
+                "provider": "deepseek",
+                "kind": "deepseek_reasoning_text",
+                "payload": {"reasoning_content": ""},
+                "reasoning_content": "legacy text",
+            },
+            "",
+            id="envelope-empty",
+        ),
+    ],
+)
+def test_deepseek_replays_canonical_and_legacy_reasoning_without_mutating_history(
+    representation, thinking, raw_data, expected
+):
+    provider = DeepseekProvider(api_key="test-api-key")
+    reasoning = {"thinking": thinking, "provider": "deepseek", "raw_data": raw_data}
+    if representation == "object":
+        reasoning = ReasoningContent(**reasoning)
+    elif representation == "namespace":
+        reasoning = SimpleNamespace(**reasoning)
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": reasoning,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+    original = deepcopy(messages)
+
+    replay = provider.build_replay_view(
+        "deepseek-v4-pro", messages, thinking={"type": "enabled"}
+    )
+
+    assert replay.degraded is False
+    assert replay.request_view[0]["reasoning_content"] == expected
+    assert messages == original
 
 
 def test_deepseek_validate_replay_window_reports_missing_tool_call_id():
@@ -545,21 +629,16 @@ async def test_deepseek_provider_streaming_accumulates_reasoning_content():
 
     accumulated_thinking = provider._get_accumulated_thinking()
     assert accumulated_thinking["thinking"] == "think-1 think-2"
-    assert accumulated_thinking["raw_data"]["provider"] == "deepseek"
-    assert (
-        accumulated_thinking["raw_data"]["payload"]["reasoning_content"]
-        == "think-1 think-2"
-    )
+    assert accumulated_thinking["raw_data"] is None
 
 
-def test_deepseek_provider_empty_accumulated_thinking_keeps_replay_payload():
+def test_deepseek_provider_empty_accumulated_thinking_needs_no_raw_payload():
     provider = DeepseekProvider(api_key="test-api-key")
 
     accumulated_thinking = provider._get_accumulated_thinking()
 
     assert accumulated_thinking["thinking"] == ""
-    assert accumulated_thinking["raw_data"]["provider"] == "deepseek"
-    assert accumulated_thinking["raw_data"]["payload"]["reasoning_content"] == ""
+    assert accumulated_thinking["raw_data"] is None
 
 
 @pytest.mark.asyncio

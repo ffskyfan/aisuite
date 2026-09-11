@@ -24,7 +24,6 @@ from aisuite.framework.replay_payload import (
     ReplayCaptureResult,
     ReplayDiagnostic,
     ReplayValidationResult,
-    build_replay_payload,
     get_replay_payload,
     unwrap_replay_payload,
 )
@@ -242,13 +241,9 @@ class DeepseekProvider(Provider):
     def _build_reasoning_replay_payload(
         self, reasoning_content: str
     ) -> Optional[Dict[str, Any]]:
-        """Return optional provider replay data in addition to canonical thinking."""
-        return build_replay_payload(
-            "deepseek",
-            self.REASONING_REPLAY_KIND,
-            {"reasoning_content": reasoning_content},
-            legacy_fields={"reasoning_content": reasoning_content},
-        )
+        # Canonical thinking is the complete replay text, including an empty
+        # string for tool calls. Legacy raw payloads remain readable below.
+        return None
 
     def _extract_reasoning_input(self, reasoning_content: Any) -> Optional[str]:
         if reasoning_content is None:
