@@ -97,7 +97,7 @@ and optional `DEEPSEEK_BASE_URL` (default: `https://api.deepseek.com`):
 ```python
 client = ai.Client()
 response = client.chat.completions.create(
-    model="deepseek:deepseek-v4-flash-vision-exp",
+    model="deepseek:deepseek-flash",
     messages=[{"role": "user", "content": "Hello"}],
     thinking={"type": "enabled"},
     reasoning_effort="low",

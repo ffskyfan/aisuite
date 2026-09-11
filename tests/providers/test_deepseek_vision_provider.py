@@ -15,7 +15,7 @@ from aisuite.framework.message import Message, ReasoningContent
 from aisuite.providers.deepseek_provider import DeepseekProvider
 from aisuite.providers.qwen_provider import QwenProvider
 
-MODEL = "deepseek-v4-flash-vision-exp"
+MODEL = "deepseek-flash"
 IMAGE = {
     "type": "image_url",
     "image_url": {
@@ -63,8 +63,10 @@ def _history():
     ]
 
 
-@pytest.mark.parametrize("model", [MODEL, f"deepseek:{MODEL}"])
-def test_only_explicit_vision_model_supports_both_image_roles(model):
+@pytest.mark.parametrize("model", [
+    MODEL, f"deepseek:{MODEL}", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"
+])
+def test_current_flash_and_its_provider_aliases_support_both_image_roles(model):
     provider = DeepseekProvider.__new__(DeepseekProvider)
     capabilities = provider.get_multimodal_capabilities(model)
 
@@ -82,7 +84,6 @@ def test_only_explicit_vision_model_supports_both_image_roles(model):
         None,
         "deepseek-chat",
         "deepseek-reasoner",
-        "deepseek-v4-flash",
         "deepseek-v4-pro",
         "future-vision",
     ],

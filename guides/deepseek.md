@@ -24,51 +24,60 @@ poetry add openai
 
 In your code:
 ```python
+import asyncio
 import aisuite as ai
-client = ai.Client()
 
-provider = "deepseek"
-model_id = "deepseek-v4-flash"
+async def main():
+    client = ai.Client()
+    try:
+        response = await client.chat.completions.create(
+            model="deepseek:deepseek-flash",
+            messages=[{"role": "user", "content": "Say hello."}],
+        )
+        print(response.choices[0].message.content)
+    finally:
+        await client.aclose()
 
-messages = [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "What’s the weather like in San Francisco?"},
-]
-
-response = client.chat.completions.create(
-    model=f"{provider}:{model_id}",
-    messages=messages,
-)
-
-print(response.choices[0].message.content)
+asyncio.run(main())
 ```
 
-## DeepSeek V4 Models
+## DeepSeek V4.1 Flash
 
-The current DeepSeek API model IDs are:
+Use `deepseek-flash` for DeepSeek V4.1 Flash, including native vision. The retired
+`deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` names already route to it.
+The generic provider still accepts other API model IDs, but only explicitly
+known visual models preserve images; it does not infer capabilities from names.
 
-- `deepseek-v4-flash`: fast, economical default.
-- `deepseek-v4-pro`: higher quality model for harder reasoning, coding, and agent work.
+DeepSeek defaults to thinking mode. To explicitly control it through `aisuite`, pass `thinking`; the provider will forward it via the OpenAI SDK `extra_body` field:
 
-DeepSeek V4 defaults to thinking mode. To explicitly control it through `aisuite`, pass `thinking`; the provider will forward it via the OpenAI SDK `extra_body` field:
+The following snippets run inside an async function with an initialized client.
 
 ```python
-response = client.chat.completions.create(
-    model="deepseek:deepseek-v4-flash",
+response = await client.chat.completions.create(
+    model="deepseek:deepseek-flash",
     messages=messages,
     thinking={"type": "disabled"},
 )
 ```
 
-For thinking mode, use `reasoning_effort` with `high` or `max`:
+For thinking mode, use `reasoning_effort` with `low`, `high`, or `max`:
 
 ```python
-response = client.chat.completions.create(
-    model="deepseek:deepseek-v4-pro",
+response = await client.chat.completions.create(
+    model="deepseek:deepseek-flash",
     messages=messages,
     thinking={"type": "enabled"},
     reasoning_effort="high",
 )
 ```
+
+User images use OpenAI-compatible `image_url` content blocks. Tool-result images
+are projected to a user message after the complete tool-result group; tool IDs,
+text, and canonical history are preserved. Thinking history is replayed in
+`reasoning_content` when tools are used.
+
+Sources (checked 2026-09-11): [models](https://api-docs.deepseek.com/quick_start/pricing/),
+[vision](https://api-docs.deepseek.com/guides/vision/),
+[thinking](https://api-docs.deepseek.com/guides/thinking_mode/).
 
 Happy coding! If you’d like to contribute, please read our [Contributing Guide](../CONTRIBUTING.md).

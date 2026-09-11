@@ -46,7 +46,13 @@ class DeepseekProvider(Provider):
         self, model: str | None = None
     ) -> MultimodalCapabilities:
         normalized_model = (model or "").lower().removeprefix("deepseek:")
-        supports_vision = normalized_model == "deepseek-v4-flash-vision-exp"
+        # V4.1 Flash is natively multimodal. Both retired Flash API names
+        # already route to it; do not infer vision support for unknown models.
+        supports_vision = normalized_model in {
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        }
         # Chat Completions accepts images only in user messages. Tool images
         # remain supported through the provider-local projection below.
         # https://api-docs.deepseek.com/guides/vision/
