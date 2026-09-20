@@ -862,6 +862,23 @@ class OpenaiProvider(Provider):
             diagnostics=validation.diagnostics,
         )
 
+    def _responses_stream_message(self, response):
+        """Preserve the native output, even when reasoning has no visible summary."""
+        output = self._extract_responses_output_items(response)
+        content = "".join(self._extract_text_from_responses_output_item(item) or "" for item in output)
+        calls = [call for item in output if (call := self._convert_responses_function_call_item(item))]
+        thinking = "".join(self._extract_reasoning_text_from_item(item) or "" for item in output)
+        return Message(
+            role="assistant", content=content, tool_calls=calls or None,
+            reasoning_content=ReasoningContent(
+                thinking=thinking, provider="openai",
+                raw_data=self._build_responses_replay_payload(
+                    output=[item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in output],
+                    response_id=getattr(response, "id", None),
+                ),
+            ),
+        )
+
     async def _responses_create(self, model: str, messages: List[Dict[str, Any]], stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
         """
         使用 OpenAI Responses API（与 CloseAI 对齐）的调用实现：
@@ -883,6 +900,11 @@ class OpenaiProvider(Provider):
         # 准备 kwargs：去掉 messages，处理 tools（透传）
         responses_kwargs = kwargs.copy()
         responses_kwargs.pop('messages', None)
+        responses_kwargs.setdefault('store', False)
+        includes = list(responses_kwargs.get('include') or [])
+        if 'reasoning.encrypted_content' not in includes:
+            includes.append('reasoning.encrypted_content')
+        responses_kwargs['include'] = includes
         if 'max_completion_tokens' in responses_kwargs:
             max_tokens_value = responses_kwargs.pop('max_completion_tokens')
             responses_kwargs.setdefault('max_output_tokens', max_tokens_value)
@@ -907,7 +929,7 @@ class OpenaiProvider(Provider):
             async def stream_gen():
                 try:
                     nonlocal stream_usage
-                    emitted_text_from_delta = False
+                    emitted_text_items = set()
                     emitted_tool_call_ids = set()
 
                     def _response_metadata_from_event(chunk, response_obj=None):
@@ -956,7 +978,7 @@ class OpenaiProvider(Provider):
                         elif ctype == 'response.output_text.delta' and hasattr(chunk, 'delta'):
                             # Accumulate content length
                             if chunk.delta:
-                                emitted_text_from_delta = True
+                                emitted_text_items.add(getattr(chunk, 'item_id', None))
                                 self._stream_content_length += len(chunk.delta)
                             yield ChatCompletionResponse(
                                 choices=[StreamChoice(index=0, delta=ChoiceDelta(content=chunk.delta, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
@@ -976,7 +998,9 @@ class OpenaiProvider(Provider):
                         elif ctype == 'response.output_item.done':
                             item = getattr(chunk, 'item', None)
                             item_text = self._extract_text_from_responses_output_item(item)
-                            if item_text and not emitted_text_from_delta:
+                            item_id = getattr(item, 'id', None)
+                            if item_text and item_id not in emitted_text_items:
+                                emitted_text_items.add(item_id)
                                 yield _stream_text_response(item_text, chunk)
 
                             tool_call = self._convert_responses_function_call_item(item)
@@ -984,40 +1008,46 @@ class OpenaiProvider(Provider):
                                 tool_call_keys = self._responses_tool_call_keys(tool_call)
                                 if not tool_call_keys.intersection(emitted_tool_call_ids):
                                     yield _stream_tool_call_response(tool_call, chunk)
-                        elif ctype in ['response.completed', 'response.done']:
+                        elif ctype in ('response.completed', 'response.done', 'response.incomplete', 'response.failed'):
                             completed_response = getattr(chunk, 'response', None)
-                            for item in self._extract_responses_output_items(completed_response):
-                                item_text = self._extract_text_from_responses_output_item(item)
-                                if item_text and not emitted_text_from_delta:
-                                    emitted_text_from_delta = True
-                                    yield _stream_text_response(item_text, chunk, completed_response)
-
-                                tool_call = self._convert_responses_function_call_item(item)
-                                if tool_call:
-                                    tool_call_keys = self._responses_tool_call_keys(tool_call)
-                                    if not tool_call_keys.intersection(emitted_tool_call_ids):
+                            if completed_response is None:
+                                raise ValueError("Missing terminal Responses payload")
+                            status = getattr(completed_response, 'status', None)
+                            finish = 'stop'
+                            if ctype == 'response.incomplete' or status == 'incomplete':
+                                details = getattr(completed_response, 'incomplete_details', None)
+                                reason = details.get('reason') if isinstance(details, dict) else getattr(details, 'reason', None)
+                                finish = 'length' if reason == 'max_output_tokens' else 'content_filter' if reason == 'content_filter' else 'incomplete'
+                            elif ctype == 'response.failed' or status not in (None, 'completed'):
+                                finish = 'error'
+                            canonical = self._responses_stream_message(completed_response)
+                            if finish == 'stop':
+                                for item in self._extract_responses_output_items(completed_response):
+                                    item_text = self._extract_text_from_responses_output_item(item)
+                                    item_id = getattr(item, 'id', None)
+                                    if item_text and item_id not in emitted_text_items:
+                                        emitted_text_items.add(item_id)
+                                        yield _stream_text_response(item_text, chunk, completed_response)
+                                for tool_call in canonical.tool_calls or []:
+                                    if not self._responses_tool_call_keys(tool_call).intersection(emitted_tool_call_ids):
                                         yield _stream_tool_call_response(tool_call, chunk, completed_response)
-
-                            # Create accurate stop_info with accumulated metadata
                             metadata = {
-                                "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
-                                "content_length": self._stream_content_length,
-                                "tool_calls_count": self._stream_tool_calls_count,
-                                "finish_reason": 'stop',
-                                "model": getattr(chunk, 'model', None) or getattr(completed_response, 'model', None),
-                                "provider": "openai"
+                                "has_content": bool(canonical.content or canonical.tool_calls),
+                                "content_length": len(canonical.content or ''),
+                                "tool_calls_count": len(canonical.tool_calls or []),
+                                "finish_reason": finish, "provider": "openai",
                             }
-                            stop_info = stop_reason_manager.map_stop_reason("openai", 'stop', metadata)
-                            response_metadata = {
-                                'id': getattr(chunk, 'response_id', None) or getattr(completed_response, 'id', None),
-                                'model': getattr(chunk, 'model', None) or getattr(completed_response, 'model', None)
-                            }
+                            response_metadata = _response_metadata_from_event(chunk, completed_response)
+                            response_metadata['canonical_message'] = canonical
                             if stream_usage:
                                 response_metadata['usage'] = stream_usage
                             yield ChatCompletionResponse(
-                                choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role=None, tool_calls=None, reasoning_content=None), finish_reason='stop', stop_info=stop_info)],
-                                metadata=response_metadata
+                                choices=[StreamChoice(index=0, delta=ChoiceDelta(), finish_reason=finish,
+                                    stop_info=stop_reason_manager.map_stop_reason("openai", finish, metadata))],
+                                metadata=response_metadata,
                             )
+                        elif ctype == 'error':
+                            raise ValueError("Responses stream error")
                 finally:
                     await self._close_stream_response(response)
             return stream_gen()
@@ -1198,6 +1228,9 @@ class OpenaiProvider(Provider):
                         # Capture usage from the streaming chunk if available (typically on final chunk)
                         if hasattr(chunk, "usage") and chunk.usage:
                             stream_usage = self._normalize_usage(chunk.usage) or stream_usage
+
+                        if not chunk.choices and stream_usage:
+                            yield ChatCompletionResponse(choices=[], metadata={'usage': stream_usage})
 
                         if chunk.choices:
                             # Create choices with stop_info
