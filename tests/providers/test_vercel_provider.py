@@ -133,6 +133,7 @@ async def test_vercel_provider_passes_gpt_xhigh_effort_unchanged():
     ("model", "protocol", "expected_provider"),
     [
         ("gpt-5.6-sol", "openai", "openai"),
+        ("claude-opus-5.5", "anthropic", "anthropic"),
         ("claude-sonnet-5", "anthropic", "anthropic"),
     ],
 )
@@ -158,6 +159,8 @@ async def test_vercel_provider_pins_first_party_gateway_provider(
     )
 
     extra_body = fake_provider.calls[0]["kwargs"]["extra_body"]
+    if model == "claude-opus-5.5":
+        assert fake_provider.calls[0]["model"] == "anthropic/claude-opus-5.5"
     assert extra_body["providerOptions"]["gateway"] == {
         "only": [expected_provider],
     }

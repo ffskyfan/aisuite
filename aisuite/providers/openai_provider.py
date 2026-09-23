@@ -124,6 +124,9 @@ class OpenaiProvider(Provider):
     def _is_gpt5_model(self, model: str) -> bool:
         return self._canonical_model_name(model).lower().startswith("gpt-5")
 
+    def _is_gpt6_model(self, model: str) -> bool:
+        return self._canonical_model_name(model).lower().startswith("gpt-6")
+
     def _is_o_series_reasoning_model(self, model: str) -> bool:
         model_name = self._canonical_model_name(model).lower()
         return model_name.startswith("o1-") or model_name.startswith("o3")
@@ -413,12 +416,18 @@ class OpenaiProvider(Provider):
 
     def _supports_reasoning(self, model: str) -> bool:
         """Check if the model supports reasoning parameters."""
-        return self._is_gpt5_model(model) or self._is_o_series_reasoning_model(model)
+        return (
+            self._is_gpt5_model(model)
+            or self._is_gpt6_model(model)
+            or self._is_o_series_reasoning_model(model)
+        )
 
     def _prepare_reasoning_kwargs(self, model: str, kwargs: dict) -> dict:
         """Prepare reasoning-related kwargs based on model type."""
         prepared_kwargs = kwargs.copy()
         is_gpt5 = self._is_gpt5_model(model)
+        is_gpt6 = self._is_gpt6_model(model)
+        is_gpt_family = is_gpt5 or is_gpt6
         is_o_series_reasoning = self._is_o_series_reasoning_model(model)
 
         # If model doesn't support reasoning, remove reasoning-related parameters
@@ -429,7 +438,7 @@ class OpenaiProvider(Provider):
             return prepared_kwargs
 
         # For reasoning models, handle special parameter requirements
-        if is_gpt5 or is_o_series_reasoning:
+        if is_gpt_family or is_o_series_reasoning:
             # These models don't support max_tokens, use max_completion_tokens instead
             if 'max_tokens' in prepared_kwargs:
                 max_tokens_value = prepared_kwargs.pop('max_tokens')
@@ -447,8 +456,8 @@ class OpenaiProvider(Provider):
         # Handle reasoning parameters for supported models
         if 'reasoning' in kwargs:
             reasoning = kwargs['reasoning']
-            if is_gpt5:
-                # GPT-5 uses reasoning parameter with effort field
+            if is_gpt_family:
+                # GPT-5/6 use the Responses API reasoning object.
                 prepared_kwargs['reasoning'] = reasoning
             elif is_o_series_reasoning:
                 # o1/o3 series use reasoning_effort parameter
@@ -463,6 +472,13 @@ class OpenaiProvider(Provider):
         # Handle reasoning_effort parameter for o1/o3 models
         if 'reasoning_effort' in kwargs and is_o_series_reasoning:
             prepared_kwargs['reasoning_effort'] = kwargs['reasoning_effort']
+
+        if is_gpt6:
+            reasoning = prepared_kwargs.get('reasoning')
+            effort = reasoning.get('effort') if isinstance(reasoning, dict) else None
+            if effort != 'none':
+                for field in ('temperature', 'top_p', 'top_logprobs', 'logprobs'):
+                    prepared_kwargs.pop(field, None)
 
         # Handle verbosity parameter for GPT-5 models
         if 'verbosity' in kwargs and is_gpt5:
@@ -663,10 +679,10 @@ class OpenaiProvider(Provider):
     def _should_use_responses_api(self, model: str, kwargs: dict) -> bool:
         """
         是否使用 Responses API：
-        - GPT-5 系列：默认使用 Responses（推荐）
+        - GPT-5/6 系列：默认使用 Responses（推荐）
         - 其他模型：走 Chat Completions
         """
-        if self._is_gpt5_model(model):
+        if self._is_gpt5_model(model) or self._is_gpt6_model(model):
             return True
         return False
 
