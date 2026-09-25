@@ -628,14 +628,15 @@ def test_openai_validate_replay_window_reports_missing_tool_call_id(_mock_client
 
 
 @patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
-def test_openai_prefixed_gpt5_model_uses_responses_capabilities(_mock_client_cls):
+@pytest.mark.parametrize("model", ["openai/gpt-5.4", "openai/gpt-6-sol", "openai:gpt-6-luna"])
+def test_openai_prefixed_gpt_models_use_responses_capabilities(_mock_client_cls, model):
     provider = OpenaiProvider(api_key="test-openai-key")
 
-    assert provider._should_use_responses_api("openai/gpt-5.4", {}) is True
-    assert provider._supports_reasoning("openai/gpt-5.4") is True
+    assert provider._should_use_responses_api(model, {}) is True
+    assert provider._supports_reasoning(model) is True
 
     prepared = provider._prepare_reasoning_kwargs(
-        "openai/gpt-5.4",
+        model,
         {
             "max_tokens": 1024,
             "reasoning": {"effort": "low"},
@@ -720,14 +721,15 @@ async def test_openai_chat_completions_create_uses_replay_override_for_responses
 
 
 @patch("aisuite.providers.openai_provider.openai.AsyncOpenAI")
+@pytest.mark.parametrize("model", ["openai/gpt-5.4", "openai/gpt-6-sol", "openai:gpt-6-luna"])
 @pytest.mark.asyncio
-async def test_openai_prefixed_gpt5_chat_create_uses_responses_api(_mock_client_cls):
+async def test_openai_prefixed_gpt_chat_create_uses_responses_api(_mock_client_cls, model):
     provider = OpenaiProvider(api_key="test-openai-key")
     response = SimpleNamespace(
         output_text="done",
         output=[],
         id="resp_1",
-        model="openai/gpt-5.4",
+        model=model,
         usage=None,
     )
 
@@ -744,14 +746,14 @@ async def test_openai_prefixed_gpt5_chat_create_uses_responses_api(_mock_client_
         ),
     ):
         result = await provider.chat_completions_create(
-            "openai/gpt-5.4",
+            model,
             [{"role": "user", "content": "hello"}],
             max_tokens=1024,
             reasoning={"effort": "xhigh"},
         )
 
     assert result.choices[0].message.content == "done"
-    assert mock_responses_create.await_args.kwargs["model"] == "openai/gpt-5.4"
+    assert mock_responses_create.await_args.kwargs["model"] == model
     assert mock_responses_create.await_args.kwargs["max_output_tokens"] == 1024
     assert mock_responses_create.await_args.kwargs["reasoning"] == {"effort": "xhigh"}
     assert "max_completion_tokens" not in mock_responses_create.await_args.kwargs

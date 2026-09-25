@@ -121,8 +121,8 @@ class OpenaiProvider(Provider):
                 return normalized[len(prefix):]
         return normalized
 
-    def _is_gpt5_model(self, model: str) -> bool:
-        return self._canonical_model_name(model).lower().startswith("gpt-5")
+    def _is_gpt_responses_model(self, model: str) -> bool:
+        return self._canonical_model_name(model).lower().startswith(("gpt-5", "gpt-6"))
 
     def _is_o_series_reasoning_model(self, model: str) -> bool:
         model_name = self._canonical_model_name(model).lower()
@@ -413,12 +413,12 @@ class OpenaiProvider(Provider):
 
     def _supports_reasoning(self, model: str) -> bool:
         """Check if the model supports reasoning parameters."""
-        return self._is_gpt5_model(model) or self._is_o_series_reasoning_model(model)
+        return self._is_gpt_responses_model(model) or self._is_o_series_reasoning_model(model)
 
     def _prepare_reasoning_kwargs(self, model: str, kwargs: dict) -> dict:
         """Prepare reasoning-related kwargs based on model type."""
         prepared_kwargs = kwargs.copy()
-        is_gpt5 = self._is_gpt5_model(model)
+        is_gpt_responses = self._is_gpt_responses_model(model)
         is_o_series_reasoning = self._is_o_series_reasoning_model(model)
 
         # If model doesn't support reasoning, remove reasoning-related parameters
@@ -429,15 +429,15 @@ class OpenaiProvider(Provider):
             return prepared_kwargs
 
         # For reasoning models, handle special parameter requirements
-        if is_gpt5 or is_o_series_reasoning:
+        if is_gpt_responses or is_o_series_reasoning:
             # These models don't support max_tokens, use max_completion_tokens instead
             if 'max_tokens' in prepared_kwargs:
                 max_tokens_value = prepared_kwargs.pop('max_tokens')
                 prepared_kwargs['max_completion_tokens'] = max_tokens_value
 
-            # GPT-5 has specific parameter restrictions
-            if is_gpt5:
-                # GPT-5 may have temperature restrictions (based on CloseAI findings)
+            # GPT-5/6 have specific parameter restrictions
+            if is_gpt_responses:
+                # These models may have temperature restrictions
                 # Remove temperature if it's not the default value to avoid potential issues
                 if 'temperature' in prepared_kwargs and prepared_kwargs['temperature'] != 1.0:
                     # For safety, we'll keep the temperature but add a comment
@@ -447,8 +447,8 @@ class OpenaiProvider(Provider):
         # Handle reasoning parameters for supported models
         if 'reasoning' in kwargs:
             reasoning = kwargs['reasoning']
-            if is_gpt5:
-                # GPT-5 uses reasoning parameter with effort field
+            if is_gpt_responses:
+                # GPT-5/6 use the Responses reasoning parameter with effort field
                 prepared_kwargs['reasoning'] = reasoning
             elif is_o_series_reasoning:
                 # o1/o3 series use reasoning_effort parameter
@@ -464,8 +464,8 @@ class OpenaiProvider(Provider):
         if 'reasoning_effort' in kwargs and is_o_series_reasoning:
             prepared_kwargs['reasoning_effort'] = kwargs['reasoning_effort']
 
-        # Handle verbosity parameter for GPT-5 models
-        if 'verbosity' in kwargs and is_gpt5:
+        # Handle verbosity parameter for GPT-5/6 models
+        if 'verbosity' in kwargs and is_gpt_responses:
             prepared_kwargs['verbosity'] = kwargs['verbosity']
 
         return prepared_kwargs
@@ -663,10 +663,10 @@ class OpenaiProvider(Provider):
     def _should_use_responses_api(self, model: str, kwargs: dict) -> bool:
         """
         是否使用 Responses API：
-        - GPT-5 系列：默认使用 Responses（推荐）
+        - GPT-5/6 系列：默认使用 Responses（推荐）
         - 其他模型：走 Chat Completions
         """
-        if self._is_gpt5_model(model):
+        if self._is_gpt_responses_model(model):
             return True
         return False
 
@@ -1192,7 +1192,7 @@ class OpenaiProvider(Provider):
             if replay_request_view is not None:
                 prepared_kwargs["_replay_request_view"] = replay_request_view
                 prepared_kwargs["_replay_mode"] = replay_mode
-            # GPT-5 + reasoning 等场景：走 Responses API 路径（与 closeaide 实现对齐）
+            # GPT-5/6 + reasoning 等场景：走 Responses API 路径（与 closeaide 实现对齐）
             return await self._responses_create(model, messages, stream=stream, **prepared_kwargs)
 
         # Any exception raised by OpenAI will be returned to the caller.
