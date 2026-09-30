@@ -476,9 +476,21 @@ class OpenaiProvider(Provider):
         if is_gpt6:
             reasoning = prepared_kwargs.get('reasoning')
             effort = reasoning.get('effort') if isinstance(reasoning, dict) else None
+            if (
+                self._canonical_model_name(model).lower().startswith('gpt-6.1-sol')
+                and effort in ('none', 'minimal')
+            ):
+                prepared_kwargs['reasoning'] = {**reasoning, 'effort': 'low'}
+                effort = 'low'
             if effort != 'none':
                 for field in ('temperature', 'top_p', 'top_logprobs', 'logprobs'):
                     prepared_kwargs.pop(field, None)
+                include = prepared_kwargs.get('include')
+                if include is not None:
+                    prepared_kwargs['include'] = [
+                        field for field in include
+                        if field != 'message.output_text.logprobs'
+                    ]
 
         # Handle verbosity parameter for GPT-5 models
         if 'verbosity' in kwargs and is_gpt5:
