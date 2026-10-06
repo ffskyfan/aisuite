@@ -5,7 +5,7 @@
 import anthropic
 import json
 import logging
-from typing import AsyncGenerator, Union
+from typing import AsyncIterator, Union
 from aisuite.provider import Provider, LLMError
 from aisuite.framework import ChatCompletionResponse
 from aisuite.framework.message import Message, ChatCompletionMessageToolCall, Function, ReasoningContent
@@ -21,6 +21,7 @@ from aisuite.framework.replay_payload import (
     unwrap_replay_payload,
 )
 from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.framework.stream_activity import ActivityByteStream, ObservedAsyncStream, StreamActivity
 from aisuite.framework.content import (
     MultimodalCapabilities,
     content_text,
@@ -1051,7 +1052,9 @@ class AnthropicProvider(Provider):
             "cache_creation": dict(s["cache_creation"]),
         }
 
-    async def chat_completions_create(self, model, messages, stream: bool = False, **kwargs) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
+    async def chat_completions_create(
+        self, model, messages, stream: bool = False, **kwargs
+    ) -> Union[ChatCompletionResponse, AsyncIterator[ChatCompletionResponse]]:
         """Create a chat completion using the Anthropic API."""
         replay_request_view = kwargs.pop("_replay_request_view", None)
         replay_mode = kwargs.pop("_replay_mode", None)
@@ -1122,11 +1125,23 @@ class AnthropicProvider(Provider):
                     **kwargs
                 )
 
+                # Open the HTTP request within chat_completions_create so callers'
+                # request deadlines include connection setup and response headers.
+                stream_response = await response.__aenter__()
+                activity = StreamActivity()
+                try:
+                    activity.request_id = stream_response.request_id
+                    stream_response.response.stream = ActivityByteStream(stream_response.response.stream, activity)
+                except BaseException:
+                    await stream_response.close()
+                    raise
+
                 async def stream_generator():
                     chunk_count = 0
                     yielded_count = 0
-                    async with response as stream_response:
+                    try:
                         async for chunk in stream_response:
+                            activity.record_event(chunk)
                             chunk_count += 1
                             result = self.converter.convert_stream_response(chunk, model, self)
                             if result is not None:  # Only yield non-None results
@@ -1151,9 +1166,11 @@ class AnthropicProvider(Provider):
                                     recovered_tool_calls,
                                     request_id=getattr(stream_response, "request_id", None),
                                 )
-                    anthropic_logger.debug(f"STREAM_END: total_chunks={chunk_count}, yielded={yielded_count}")
+                    finally:
+                        await stream_response.close()
+                        anthropic_logger.debug(f"STREAM_END: total_chunks={chunk_count}, yielded={yielded_count}")
 
-                return stream_generator()
+                return ObservedAsyncStream(stream_generator(), activity, stream_response.close)
             else:
                 response = await self.client.messages.create(
                     model=model,

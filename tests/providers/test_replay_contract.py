@@ -502,6 +502,11 @@ async def test_anthropic_chat_stream_uses_sdk_stream_helper_and_final_message_re
         def __init__(self, final_message):
             self._final_message = final_message
             self.request_id = "req_test_123"
+            self.response = SimpleNamespace(stream=Mock())
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
 
         def __aiter__(self):
             async def _iterate():
@@ -541,6 +546,8 @@ async def test_anthropic_chat_stream_uses_sdk_stream_helper_and_final_message_re
 
     assert create_mock.await_count == 0
     assert stream_mock.call_count == 1
+    assert response_stream.stream_activity.request_id == "req_test_123"
+    assert stream_mock.return_value._stream.closed is True
     assert len(streamed_responses) == 1
     tool_calls = streamed_responses[0].choices[0].delta.tool_calls
     assert tool_calls is not None
