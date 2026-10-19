@@ -235,7 +235,29 @@ class KimiProvider(DeepseekProvider):
         prepared = dict(kwargs)
         prepared.pop("thinking", None)
         prepared.pop("reasoning", None)
-        prepared.pop("extra_body", None)
+        extra_body = prepared.pop("extra_body", None)
+        cache_options = prepared.pop("prompt_cache_options", None)
+        if cache_options is None and isinstance(extra_body, dict):
+            cache_options = extra_body.get("prompt_cache_options")
+        if cache_options is not None:
+            if (
+                not isinstance(cache_options, dict)
+                or set(cache_options) - {"mode", "ttl"}
+                or cache_options.get("mode", "implicit") != "implicit"
+                or cache_options.get("ttl", "5m") not in ("5m", "1h")
+            ):
+                raise ValueError(
+                    "Kimi prompt_cache_options requires implicit mode and a 5m or 1h TTL"
+                )
+            # Preserve only the supported cache option, not unrelated reasoning
+            # parameters stripped from K3 requests. OpenAI SDK uses extra_body
+            # for Moonshot-specific fields.
+            prepared["extra_body"] = {
+                "prompt_cache_options": {
+                    "mode": "implicit",
+                    "ttl": cache_options.get("ttl", "5m"),
+                }
+            }
         prepared.pop("temperature", None)
         prepared.pop("top_p", None)
         prepared.pop("n", None)
@@ -248,6 +270,39 @@ class KimiProvider(DeepseekProvider):
         prepared["reasoning_effort"] = "max"
         return prepared
 
+    async def _create_completion_request(self, **kwargs):
+        if not (kwargs.get("extra_body") or {}).get("prompt_cache_options"):
+            return await super()._create_completion_request(**kwargs)
+        # TTL is locked when a prefix is first written. Requested 1h does not
+        # prove old entries were upgraded: bill actual 5m/1h writes from headers.
+        raw = await self.client.chat.completions.with_raw_response.create(**kwargs)
+        try:
+            return raw.parse(), dict(raw.headers)
+        except BaseException:
+            await raw.http_response.aclose()
+            raise
+
+    def _normalize_response_usage(self, usage_obj, *, response_headers):
+        normalized = self._normalize_usage(usage_obj)
+        if normalized is None:
+            return None
+        headers = {str(key).lower(): value for key, value in response_headers.items()}
+        for ttl in ("5m", "1h"):
+            value = headers.get(f"msh-usage-cache-write-tokens-{ttl}")
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count >= 0:
+                normalized["cache_write_by_ttl"][
+                    f"ephemeral_{ttl}_input_tokens"
+                ] = count
+        normalized["cache_write_input_tokens"] = max(
+            normalized["cache_write_input_tokens"],
+            sum(normalized["cache_write_by_ttl"].values()),
+        )
+        return normalized
+
     def _normalize_usage(self, usage_obj):
         normalized = super()._normalize_usage(usage_obj)
         if normalized is None:
@@ -259,4 +314,16 @@ class KimiProvider(DeepseekProvider):
             cached_tokens = getattr(usage_obj, "cached_tokens", None)
         if cached_tokens is not None:
             normalized["cache_read_input_tokens"] = max(0, int(cached_tokens))
+        details = (
+            usage_obj.get("prompt_tokens_details")
+            if isinstance(usage_obj, dict)
+            else getattr(usage_obj, "prompt_tokens_details", None)
+        )
+        write_tokens = (
+            details.get("cache_write_tokens")
+            if isinstance(details, dict)
+            else getattr(details, "cache_write_tokens", None)
+        )
+        if write_tokens is not None:
+            normalized["cache_write_input_tokens"] = max(0, int(write_tokens))
         return normalized

@@ -1,7 +1,10 @@
+import copy
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import httpx
 
 from aisuite import Client
 from aisuite.framework.message import ReasoningContent
@@ -39,6 +42,161 @@ def test_kimi_provider_prepares_fixed_k3_parameters(reasoning_effort):
         "max_completion_tokens": 4096,
         "reasoning_effort": "max",
     }
+
+
+@pytest.mark.parametrize("ttl", ["5m", "1h"])
+@pytest.mark.parametrize("location", ["native", "extra_body"])
+def test_kimi_cache_options_are_preserved_without_leaking_reasoning_parameters(
+    ttl, location
+):
+    options = {"mode": "implicit", "ttl": ttl}
+    original = {"extra_body": {"thinking": {"type": "disabled"}, "unsupported": True}}
+    if location == "native":
+        original["prompt_cache_options"] = options
+    else:
+        original["extra_body"]["prompt_cache_options"] = options
+    snapshot = copy.deepcopy(original)
+    prepared = _provider()._prepare_request_kwargs(original)
+    assert prepared == {
+        "extra_body": {"prompt_cache_options": options},
+        "reasoning_effort": "max",
+    }
+    assert original == snapshot
+
+
+@pytest.mark.parametrize(
+    "options", ["1h", {"ttl": "30m"}, {"ttl": []}, {"mode": "explicit"}, {"unknown": 1}]
+)
+def test_kimi_rejects_invalid_explicit_cache_options(options):
+    with pytest.raises(ValueError, match="prompt_cache_options"):
+        _provider()._prepare_request_kwargs({"prompt_cache_options": options})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("actual_ttl", ["5m", "1h", None])
+async def test_kimi_cache_ttl_reaches_wire_and_usage_uses_actual_headers(
+    stream, actual_ttl
+):
+    requests = []
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 2,
+        "total_tokens": 102,
+        "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 20},
+    }
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        headers = (
+            {f"Msh-Usage-Cache-Write-Tokens-{actual_ttl}": "20"} if actual_ttl else {}
+        )
+        base = {"id": "chat_1", "created": 1, "model": "kimi-k3"}
+        if stream:
+            chunks = [
+                {
+                    **base,
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "delta": {"role": "assistant", "content": "done"},
+                        }
+                    ],
+                },
+                {
+                    **base,
+                    "object": "chat.completion.chunk",
+                    "choices": [],
+                    "usage": usage,
+                },
+            ]
+            content = (
+                "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+                + "data: [DONE]\n\n"
+            )
+            return httpx.Response(
+                200,
+                headers={**headers, "content-type": "text/event-stream"},
+                content=content,
+            )
+        return httpx.Response(
+            200,
+            headers=headers,
+            json={
+                **base,
+                "object": "chat.completion",
+                "usage": usage,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "done"},
+                    }
+                ],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http_client:
+        provider = KimiProvider(api_key="offline-test", http_client=http_client)
+        try:
+            response = await provider.chat_completions_create(
+                model="kimi-k3",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=stream,
+                prompt_cache_options={"mode": "implicit", "ttl": "1h"},
+                max_tokens=256,
+            )
+            if stream:
+                chunks = [chunk async for chunk in response]
+                normalized = chunks[-1].usage
+                assert chunks[0].choices[0].delta.content == "done"
+                assert requests[0]["stream_options"]["include_usage"] is True
+            else:
+                normalized = response.usage
+                assert response.choices[0].message.content == "done"
+        finally:
+            await provider.aclose()
+
+    assert len(requests) == 1
+    assert requests[0]["prompt_cache_options"] == {"mode": "implicit", "ttl": "1h"}
+    assert "extra_body" not in requests[0]
+    assert requests[0]["max_completion_tokens"] == 256
+    assert normalized["prompt_tokens"] == 100
+    assert normalized["cache_read_input_tokens"] == 60
+    assert normalized["cache_write_input_tokens"] == 20
+    # Do not infer the actual write price from requested 1h (including missing headers).
+    assert normalized["cache_write_by_ttl"] == {
+        "ephemeral_5m_input_tokens": 20 if actual_ttl == "5m" else 0,
+        "ephemeral_1h_input_tokens": 20 if actual_ttl == "1h" else 0,
+    }
+
+
+def test_kimi_cache_write_headers_are_request_scoped_and_tolerate_invalid_values():
+    provider = _provider()
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 1,
+        "prompt_tokens_details": {"cache_write_tokens": 20},
+    }
+    first = provider._normalize_response_usage(
+        usage, response_headers={"Msh-Usage-Cache-Write-Tokens-1h": "20"}
+    )
+    second = provider._normalize_response_usage(
+        usage, response_headers={"Msh-Usage-Cache-Write-Tokens-5m": "20"}
+    )
+    invalid = provider._normalize_response_usage(
+        usage,
+        response_headers={
+            "Msh-Usage-Cache-Write-Tokens-5m": "bad",
+            "Msh-Usage-Cache-Write-Tokens-1h": "-1",
+        },
+    )
+    assert first["cache_write_by_ttl"]["ephemeral_1h_input_tokens"] == 20
+    assert second["cache_write_by_ttl"]["ephemeral_1h_input_tokens"] == 0
+    assert invalid["cache_write_input_tokens"] == 20
+    assert sum(invalid["cache_write_by_ttl"].values()) == 0
 
 
 def test_kimi_message_normalizer_preserves_reasoning_content():

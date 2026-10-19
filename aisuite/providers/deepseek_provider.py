@@ -692,6 +692,13 @@ class DeepseekProvider(Provider):
             metadata=metadata,
         )
 
+    async def _create_completion_request(self, **kwargs):
+        """Transport hook for compatible providers that need response headers."""
+        return await self.client.chat.completions.create(**kwargs), {}
+
+    def _normalize_response_usage(self, usage_obj, *, response_headers):
+        return self._normalize_usage(usage_obj)
+
     async def chat_completions_create(
         self, model, messages, stream: bool = False, **kwargs
     ) -> Union[ChatCompletionResponse, AsyncGenerator[ChatCompletionResponse, None]]:
@@ -724,7 +731,7 @@ class DeepseekProvider(Provider):
                 stream_options["include_usage"] = True
             stream_kwargs["stream_options"] = stream_options
 
-            response = await self.client.chat.completions.create(
+            response, response_headers = await self._create_completion_request(
                 model=model,
                 messages=prepared_messages,
                 stream=True,
@@ -740,7 +747,10 @@ class DeepseekProvider(Provider):
                         # Capture usage from streaming chunks (only appears on final chunk)
                         if hasattr(chunk, "usage") and chunk.usage:
                             stream_usage = (
-                                self._normalize_usage(chunk.usage) or stream_usage
+                                self._normalize_response_usage(
+                                    chunk.usage, response_headers=response_headers
+                                )
+                                or stream_usage
                             )
 
                         # OpenAI-compatible APIs can emit usage in a trailing
@@ -863,7 +873,7 @@ class DeepseekProvider(Provider):
 
             return stream_generator()
         else:
-            response = await self.client.chat.completions.create(
+            response, response_headers = await self._create_completion_request(
                 model=model,
                 messages=prepared_messages,
                 stream=False,
@@ -903,7 +913,9 @@ class DeepseekProvider(Provider):
                 )
 
             usage = getattr(response, "usage", None)
-            usage_dict = self._normalize_usage(usage)
+            usage_dict = self._normalize_response_usage(
+                usage, response_headers=response_headers
+            )
 
             metadata = {
                 "id": response.id,
