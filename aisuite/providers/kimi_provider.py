@@ -114,6 +114,16 @@ class KimiProvider(DeepseekProvider):
         value = self._extract_reasoning_input(reasoning_content)
         return isinstance(value, str) and bool(value.strip())
 
+    def _prepare_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        prepared_messages = super()._prepare_messages(messages)
+        for message in prepared_messages:
+            # An absent Kimi reasoning field stays absent on the wire, including
+            # when model_dump() added a default None. Keep the complete tool
+            # protocol block; DeepSeek's explicit empty-reasoning rule is separate.
+            if message.get("reasoning_content") is None:
+                message.pop("reasoning_content", None)
+        return prepared_messages
+
     @staticmethod
     def _normalize_message(message: Any) -> Dict[str, Any]:
         if isinstance(message, dict):

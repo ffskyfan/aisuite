@@ -7,7 +7,7 @@ import pytest
 import httpx
 
 from aisuite import Client
-from aisuite.framework.message import ReasoningContent
+from aisuite.framework.message import Message, ReasoningContent
 from aisuite.framework.message_normalizer import MessageNormalizer
 from aisuite.providers.kimi_provider import KimiProvider
 
@@ -397,6 +397,66 @@ async def test_kimi_client_replays_complete_tool_message_when_reasoning_is_absen
     assert "reasoning_content" not in replayed_assistant
     assert replayed_assistant["tool_calls"][0]["id"] == tool_call_id
     assert replayed_tool_result["tool_call_id"] == tool_call_id
+
+
+@pytest.mark.parametrize("as_model", [False, True], ids=["dict", "model"])
+@pytest.mark.parametrize("reasoning", [None, ReasoningContent(thinking="")])
+def test_kimi_replay_omits_empty_reasoning_without_mutating_tool_history(as_model, reasoning):
+    provider = _provider()
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": reasoning,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"brief.md"}'},
+            }
+        ],
+    }
+    messages = [
+        Message(**assistant) if as_model else assistant,
+        {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+    ]
+    original = copy.deepcopy(messages)
+
+    replay = provider.build_replay_view("kimi-k3", messages)
+
+    assert "reasoning_content" not in replay.request_view[0]
+    assert replay.request_view[0]["tool_calls"][0]["id"] == "call_1"
+    assert replay.request_view[0]["tool_calls"][0]["function"] == assistant["tool_calls"][0]["function"]
+    assert replay.request_view[1] == messages[1]
+    assert messages == original
+
+
+@pytest.mark.parametrize("reasoning", ["", {}, {"thinking": ""}])
+def test_kimi_replay_omits_empty_serialized_reasoning(reasoning):
+    provider = _provider()
+    messages = [{"role": "assistant", "content": "done", "reasoning_content": reasoning}]
+    original = copy.deepcopy(messages)
+    assert provider.build_replay_view("kimi-k3", messages).request_view == [
+        {"role": "assistant", "content": "done"}
+    ]
+    assert messages == original
+
+
+@pytest.mark.parametrize("as_model", [False, True], ids=["dict", "model"])
+def test_kimi_replay_keeps_native_reasoning_instead_of_display_text(as_model):
+    provider = _provider()
+    assistant = {
+        "role": "assistant",
+        "content": "done",
+        "reasoning_content": ReasoningContent(
+            thinking="display text",
+            provider="kimi",
+            raw_data=provider._build_reasoning_replay_payload("native reasoning"),
+        ),
+    }
+    messages = [Message(**assistant) if as_model else assistant]
+    original = copy.deepcopy(messages)
+    assert provider.build_replay_view("kimi-k3", messages).request_view[0]["reasoning_content"] == "native reasoning"
+    assert messages == original
 
 
 def test_kimi_provider_round_trips_reasoning_replay_payload():
