@@ -26,6 +26,8 @@ class KimiProvider(DeepseekProvider):
     def get_multimodal_capabilities(
         self, model: str | None = None
     ) -> MultimodalCapabilities:
+        if model == "kimi-k3.1-pro":
+            return MultimodalCapabilities(user_images="supported", tool_result_images="supported")
         # Moonshot model families differ in user-image support. Keep user input
         # optimistic, but do not send non-standard image blocks as tool output.
         return MultimodalCapabilities(
@@ -234,15 +236,29 @@ class KimiProvider(DeepseekProvider):
                 item.code for item in validation.diagnostics if item.severity == "error"
             )
             raise LLMError(f"Kimi replay window validation failed: {error_codes}")
+        prepared_messages = self._prepare_messages(messages)
+        if model == "kimi-k3.1-pro":
+            prepared_messages = self._project_tool_result_images(prepared_messages)
         return ReplayBuildResult(
-            request_view=self._prepare_messages(messages),
+            request_view=prepared_messages,
             replay_mode="canonical_with_reasoning",
             degraded=validation.degraded,
             diagnostics=validation.diagnostics,
         )
 
-    def _prepare_request_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    def _prepare_model_request_kwargs(self, model: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return self._prepare_request_kwargs(kwargs, model=model)
+
+    def _prepare_request_kwargs(
+        self, kwargs: Dict[str, Any], *, model: Optional[str] = None
+    ) -> Dict[str, Any]:
         prepared = dict(kwargs)
+        effort = prepared.get("reasoning_effort")
+        reasoning = prepared.get("reasoning")
+        if effort is None and isinstance(reasoning, dict):
+            effort = reasoning.get("effort")
+        prepared.pop("thinking_level", None)
+        prepared.pop("thinking_config", None)
         prepared.pop("thinking", None)
         prepared.pop("reasoning", None)
         extra_body = prepared.pop("extra_body", None)
@@ -277,7 +293,14 @@ class KimiProvider(DeepseekProvider):
 
         if "max_tokens" in prepared and "max_completion_tokens" not in prepared:
             prepared["max_completion_tokens"] = prepared.pop("max_tokens")
-        prepared["reasoning_effort"] = "max"
+        if model == "kimi-k3.1-pro":
+            effort = {"medium": "high", "xhigh": "high", "none": "low", "minimal": "low"}.get(effort, effort)
+            effort = effort or "max"
+            if effort not in {"low", "high", "max"}:
+                raise ValueError("Kimi K3.1 Pro reasoning_effort must be low, high or max")
+            prepared["reasoning_effort"] = effort
+        else:
+            prepared["reasoning_effort"] = "max"
         return prepared
 
     async def _create_completion_request(self, **kwargs):

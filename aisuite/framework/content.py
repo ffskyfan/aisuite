@@ -329,3 +329,61 @@ def to_anthropic_content(content: Any) -> Any:
                 }
             )
     return converted
+
+
+def project_tool_result_images_to_user(
+    messages: List[Dict[str, Any]],
+    *,
+    forward_text: str = "[visual tool result attached in following user message]",
+) -> List[Dict[str, Any]]:
+    """Keep tool results text-only and attach their images after the full result group.
+
+    Preserve call/result adjacency and canonical history, including parallel calls.
+    """
+    projected: List[Dict[str, Any]] = []
+    pending_visual_parts: List[Dict[str, Any]] = []
+
+    def flush_visual_parts() -> None:
+        if pending_visual_parts:
+            projected.append(
+                {"role": "user", "content": list(pending_visual_parts)}
+            )
+            pending_visual_parts.clear()
+
+    for raw_message in messages:
+        message = copy.deepcopy(
+            raw_message.model_dump()
+            if hasattr(raw_message, "model_dump")
+            else dict(raw_message)
+        )
+        # AISuite-only tool metadata is not part of the wire schema.
+        message.pop("is_error", None)
+        if message.get("role") != "tool":
+            flush_visual_parts()
+            projected.append(message)
+            continue
+
+        content = message.get("content")
+        if not has_image_content(content):
+            if isinstance(content, list):
+                message["content"] = content_text(content)
+            projected.append(message)
+            continue
+
+        tool_call_id = str(message.get("tool_call_id") or "unknown")
+        text = content_text(content).strip()
+        message["content"] = text or forward_text
+        projected.append(message)
+        pending_visual_parts.append(
+            {
+                "type": "text",
+                "text": (
+                    "The following image is visual output from tool result "
+                    f"{tool_call_id}. Inspect it as part of that tool result."
+                ),
+            }
+        )
+        pending_visual_parts.extend(part for part in content if is_image_part(part))
+
+    flush_visual_parts()
+    return projected

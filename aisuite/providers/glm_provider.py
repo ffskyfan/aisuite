@@ -32,7 +32,7 @@ from aisuite.framework.replay_payload import (
 )
 from aisuite.framework.stop_reason import stop_reason_manager
 from aisuite.provider import LLMError, Provider
-from aisuite.framework.content import MultimodalCapabilities
+from aisuite.framework.content import MultimodalCapabilities, project_tool_result_images_to_user
 
 
 class GlmProvider(Provider):
@@ -44,12 +44,12 @@ class GlmProvider(Provider):
         normalized_model = (model or "").lower()
         user_images = (
             "supported"
-            if any(marker in normalized_model for marker in ("glm-4v", "glm-4.5v", "glm-4.6v"))
+            if any(marker in normalized_model for marker in ("glm-4v", "glm-4.5v", "glm-4.6v", "glm-5.3-flash"))
             else "unsupported"
         )
         return MultimodalCapabilities(
             user_images=user_images,
-            tool_result_images="unsupported",
+            tool_result_images="supported" if normalized_model == "glm-5.3-flash" else "unsupported",
         )
 
     def __init__(self, **config):
@@ -343,8 +343,9 @@ class GlmProvider(Provider):
 
         return prepared_messages
 
-    def _prepare_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    def _prepare_kwargs(self, kwargs: Dict[str, Any], *, model: Optional[str] = None) -> Dict[str, Any]:
         prepared = dict(kwargs)
+        always_thinking = model in {"glm-5.3", "glm-5.3-flash"}
 
         reasoning = prepared.pop("reasoning", None)
         reasoning_effort = prepared.get("reasoning_effort")
@@ -366,20 +367,31 @@ class GlmProvider(Provider):
         normalized_effort = None
         if isinstance(reasoning_effort, str):
             effort = reasoning_effort.strip().lower()
-            if effort in {"max", "xhigh"}:
+            if always_thinking and effort in {"low", "none", "minimal", "disable", "disabled"}:
+                normalized_effort = "low"
+            elif always_thinking and effort == "xhigh":
+                normalized_effort = "high"
+            elif effort in {"max", "xhigh"}:
                 normalized_effort = "max"
             elif effort in {"low", "medium", "high"}:
                 normalized_effort = "high"
             elif effort in {"none", "minimal", "disable", "disabled"}:
                 prepared["thinking"] = {"type": "disabled"}
 
-        # GLM models default thinking to enabled if omitted. Normalize omission to
-        # an explicit disabled state so provider behavior matches AISuite's
-        # cross-provider expectation that "not requested" means "off".
+        # Older GLM models preserve AISuite's historical omission=off behavior.
+        # GLM 5.3 is always thinking and keeps its native max default when omitted.
         if prepared.get("thinking") is None:
             prepared["thinking"] = {
-                "type": "enabled" if normalized_effort else "disabled"
+                "type": "enabled" if normalized_effort or always_thinking else "disabled"
             }
+
+        if always_thinking:
+            thinking = dict(prepared.get("thinking") or {})
+            if thinking.get("type") == "disabled" and normalized_effort is None:
+                normalized_effort = "low"
+            thinking["type"] = "enabled"
+            prepared["thinking"] = thinking
+            normalized_effort = normalized_effort or "max"
 
         thinking = prepared.get("thinking")
         thinking_type = (
@@ -455,8 +467,11 @@ class GlmProvider(Provider):
             )
             raise LLMError(f"GLM replay window validation failed: {error_codes}")
 
+        prepared_messages = self._prepare_messages(messages)
+        if model == "glm-5.3-flash":
+            prepared_messages = project_tool_result_images_to_user(prepared_messages)
         return ReplayBuildResult(
-            request_view=self._prepare_messages(messages),
+            request_view=prepared_messages,
             replay_mode="canonical_with_reasoning",
             degraded=validation.degraded,
             diagnostics=validation.diagnostics,
@@ -700,7 +715,10 @@ class GlmProvider(Provider):
         else:
             replay_build = self.build_replay_view(model, messages, **kwargs)
             prepared_messages = replay_build.request_view
-        prepared_kwargs = self._prepare_kwargs(kwargs)
+        prepared_kwargs = self._prepare_kwargs(kwargs, model=model)
+
+        if stream and model in {"glm-5.3", "glm-5.3-flash"}:
+            prepared_kwargs["tool_stream"] = True
 
         try:
             if stream:

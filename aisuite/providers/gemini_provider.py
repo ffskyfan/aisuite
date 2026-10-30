@@ -754,7 +754,7 @@ class GeminiProvider(Provider):
         return MultimodalCapabilities(
             user_images="supported",
             tool_result_images=(
-                "supported" if self._is_gemini_3_model(model or "")
+                "supported" if self._is_modern_gemini_model(model or "")
                 else "unsupported"
             ),
         )
@@ -833,15 +833,15 @@ class GeminiProvider(Provider):
                 )
         return text, media_parts
 
-    def _is_gemini_3_model(self, model_id: str) -> bool:
-        """Heuristic check for Gemini 3 series models.
+    def _is_modern_gemini_model(self, model_id: str) -> bool:
+        """Check for Gemini 3/4 models using thinking levels and signed tool calls.
 
         We use a simple substring match so it works for both plain
         "gemini-3-..." and provider-prefixed names like "google/gemini-3-...".
         """
         if not model_id:
             return False
-        return "gemini-3" in model_id
+        return model_id.rsplit("/", 1)[-1].startswith(("gemini-3", "gemini-4"))
 
     @staticmethod
     def _supports_minimal_thinking_level(model_id: str) -> bool:
@@ -851,13 +851,15 @@ class GeminiProvider(Provider):
         return model_id.rsplit("/", 1)[-1] == "gemini-3-flash-preview"
 
     @staticmethod
-    def _uses_modern_flash_sampling_contract(model_id: str) -> bool:
-        """Gemini 3.6+ Flash rejects legacy sampling controls."""
+    def _uses_modern_sampling_contract(model_id: str) -> bool:
+        """Gemini 3.6+ Flash and 4 Argon reject legacy sampling controls."""
         if not model_id:
             return False
         return model_id.rsplit("/", 1)[-1] in {
             "gemini-3.6-flash",
             "gemini-3.7-flash",
+            "gemini-3.8-flash",
+            "gemini-4-argon",
         }
 
     def _resolve_tool_call_signature(self, model_id: str, tool_call: Any) -> Tuple[Optional[str], bool]:
@@ -874,7 +876,7 @@ class GeminiProvider(Provider):
         # Gemini 3 requires a thought_signature for replaying Gemini-originated
         # tool calls. Placeholder fallback is reserved for degraded/legacy
         # histories that do not carry Gemini-native replay metadata.
-        if not signature and self._is_gemini_3_model(model_id) and self._should_use_placeholder_signature(tool_call, metadata):
+        if not signature and self._is_modern_gemini_model(model_id) and self._should_use_placeholder_signature(tool_call, metadata):
             signature = GEMINI_SIGNATURE_PLACEHOLDER
             placeholder = True
 
@@ -1019,7 +1021,7 @@ class GeminiProvider(Provider):
         )
         replay_metadata["_exact_metadata"] = exact_metadata
 
-        if self._is_gemini_3_model(model_id):
+        if self._is_modern_gemini_model(model_id):
             if not provider_function_name:
                 diagnostic = self._build_protocol_diagnostic(
                     "missing_provider_function_name",
@@ -1141,7 +1143,7 @@ class GeminiProvider(Provider):
         diagnostics: List[ReplayDiagnostic] = []
         degraded = False
 
-        if not self._is_gemini_3_model(model):
+        if not self._is_modern_gemini_model(model):
             return ReplayValidationResult(ok=True)
 
         normalized_messages = [self._normalize_message_dict(msg) for msg in messages]
@@ -1270,7 +1272,7 @@ class GeminiProvider(Provider):
             signature, placeholder = self._resolve_tool_call_signature(model_id, tool_call)
 
             if (
-                self._is_gemini_3_model(model_id)
+                self._is_modern_gemini_model(model_id)
                 and _is_exact_gemini_tool_call_metadata(metadata)
                 and not signature
             ):
@@ -1532,16 +1534,16 @@ class GeminiProvider(Provider):
             elif isinstance(reasoning, str):
                 reasoning_effort = reasoning
 
-        uses_modern_flash_sampling_contract = self._uses_modern_flash_sampling_contract(
+        uses_modern_sampling_contract = self._uses_modern_sampling_contract(
             model_id
         )
-        if uses_modern_flash_sampling_contract:
+        if uses_modern_sampling_contract:
             # Gemini 3.6+ removed these controls. Drop product-level defaults too,
             # otherwise an otherwise valid request fails before generation starts.
             for param in ("temperature", "top_p", "top_k", "candidate_count"):
                 kwargs.pop(param, None)
 
-        if self._is_gemini_3_model(model_id):
+        if self._is_modern_gemini_model(model_id):
             # Gemini 3 models support low/medium/high. Only the original Flash
             # preview additionally supports minimal; 3.7 returns an error for it.
             level = None
@@ -1584,7 +1586,7 @@ class GeminiProvider(Provider):
             # Older Gemini 3 endpoints expect temperature=1.0. Gemini 3.6+
             # rejects the field entirely, so they must use the provider default.
             if (
-                not uses_modern_flash_sampling_contract
+                not uses_modern_sampling_contract
                 and "temperature" not in kwargs
                 and "temperature" not in config_kwargs
             ):
@@ -1658,7 +1660,7 @@ class GeminiProvider(Provider):
                 convo_history = messages[:-1]
             elif (
                 messages[-1]["role"] == "assistant"
-                and uses_modern_flash_sampling_contract
+                and uses_modern_sampling_contract
             ):
                 # Gemini 3.6+ rejects a prefilled model turn. Keep the model turn
                 # as history and add an explicit user continuation instead.

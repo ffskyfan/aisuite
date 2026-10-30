@@ -1065,7 +1065,7 @@ class AnthropicProvider(Provider):
                 replay_request_view,
                 capabilities,
             )
-        kwargs = self._prepare_kwargs(kwargs)
+        kwargs = self._prepare_kwargs(kwargs, model=model)
 
         # Manual extended thinking and adaptive thinking have different replay
         # requirements.  The manual-mode repair below must not run for adaptive
@@ -1186,10 +1186,25 @@ class AnthropicProvider(Provider):
             # All message fixes should be done before the first API call
             raise
 
-    def _prepare_kwargs(self, kwargs):
+    def _prepare_kwargs(self, kwargs, *, model=None):
         """Prepare kwargs for the API call."""
         kwargs = kwargs.copy()
         kwargs.setdefault("max_tokens", DEFAULT_MAX_TOKENS)
+
+        if (model or "").rsplit("/", 1)[-1] in {"claude-sonnet-5.5", "claude-sonnet-5-5"}:
+            for field in ("temperature", "top_p", "top_k"):
+                kwargs.pop(field, None)
+            choice = kwargs.get("tool_choice")
+            choice_type = choice.get("type") if isinstance(choice, dict) else choice
+            if choice_type in {"any", "tool", "required", "function"}:
+                raise ValueError("Claude Sonnet 5.5 supports only auto/none tool_choice")
+            thinking = dict(kwargs.get("thinking") or {"type": "adaptive"})
+            if thinking.get("type") == "disabled":
+                thinking = {"type": "adaptive"}
+                kwargs["output_config"] = {**(kwargs.get("output_config") or {}), "effort": "low"}
+            if thinking.get("type") == "adaptive":
+                thinking.setdefault("display", "summarized")
+            kwargs["thinking"] = thinking
 
         if "tools" in kwargs:
             kwargs["tools"] = self.converter.convert_tool_spec(kwargs["tools"])

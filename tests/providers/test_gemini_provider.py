@@ -289,7 +289,8 @@ async def test_gemini_3_reasoning_effort_is_passed_as_thinking_level(
 
 
 @pytest.mark.asyncio
-async def test_gemini_3_7_flash_removes_unsupported_sampling_controls():
+@pytest.mark.parametrize("model", ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"])
+async def test_gemini_3_7_flash_removes_unsupported_sampling_controls(model):
     provider = GeminiProvider(api_key="test-gemini-key")
     provider.client = MagicMock()
     chat = MagicMock()
@@ -302,7 +303,7 @@ async def test_gemini_3_7_flash_removes_unsupported_sampling_controls():
         return_value="ok",
     ):
         result = await provider.chat_completions_create(
-            "gemini-3.7-flash",
+            model,
             [{"role": "user", "content": "hello"}],
             max_tokens=1024,
             temperature=0.7,
@@ -317,7 +318,8 @@ async def test_gemini_3_7_flash_removes_unsupported_sampling_controls():
 
 
 @pytest.mark.asyncio
-async def test_gemini_3_7_flash_coerces_nested_minimal_thinking_to_low():
+@pytest.mark.parametrize("model", ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"])
+async def test_gemini_3_7_flash_coerces_nested_minimal_thinking_to_low(model):
     provider = GeminiProvider(api_key="test-gemini-key")
     provider.client = MagicMock()
     chat = MagicMock()
@@ -330,7 +332,7 @@ async def test_gemini_3_7_flash_coerces_nested_minimal_thinking_to_low():
         return_value="ok",
     ):
         result = await provider.chat_completions_create(
-            "gemini-3.7-flash",
+            model,
             [{"role": "user", "content": "hello"}],
             thinking_config={"thinking_level": "minimal"},
         )
@@ -344,7 +346,8 @@ async def test_gemini_3_7_flash_coerces_nested_minimal_thinking_to_low():
 
 
 @pytest.mark.asyncio
-async def test_gemini_3_7_flash_converts_final_model_prefill_to_user_continuation():
+@pytest.mark.parametrize("model", ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon"])
+async def test_gemini_3_7_flash_converts_final_model_prefill_to_user_continuation(model):
     provider = GeminiProvider(api_key="test-gemini-key")
     provider.client = MagicMock()
     chat = MagicMock()
@@ -357,7 +360,7 @@ async def test_gemini_3_7_flash_converts_final_model_prefill_to_user_continuatio
         return_value="ok",
     ):
         result = await provider.chat_completions_create(
-            "gemini-3.7-flash",
+            model,
             [
                 {"role": "user", "content": "Write a scene."},
                 {"role": "assistant", "content": "The door opened"},
@@ -384,8 +387,9 @@ def test_gemini_thinking_level_fails_loudly_with_unsupported_sdk(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("model", ["gemini-3.1-pro", "gemini-3.8-flash", "gemini-4-argon"])
 @patch("aisuite.providers.gemini_provider.genai.Client")
-def test_gemini_validate_replay_window_errors_on_missing_signature(_mock_client_cls):
+def test_gemini_validate_replay_window_errors_on_missing_signature(_mock_client_cls, model):
     provider = GeminiProvider(api_key="test-gemini-key")
     messages = [
         {
@@ -413,7 +417,7 @@ def test_gemini_validate_replay_window_errors_on_missing_signature(_mock_client_
         }
     ]
 
-    result = provider.validate_replay_window("gemini-3.1-pro", messages)
+    result = provider.validate_replay_window(model, messages)
 
     assert result.ok is False
     assert any(diag.code == "missing_thought_signature" for diag in result.diagnostics)

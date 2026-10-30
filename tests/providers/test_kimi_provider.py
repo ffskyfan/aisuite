@@ -74,9 +74,10 @@ def test_kimi_rejects_invalid_explicit_cache_options(options):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", ["kimi-k3", "kimi-k3.1-pro"])
 @pytest.mark.parametrize("actual_ttl", ["5m", "1h", None])
 async def test_kimi_cache_ttl_reaches_wire_and_usage_uses_actual_headers(
-    stream, actual_ttl
+    stream, actual_ttl, model
 ):
     requests = []
     usage = {
@@ -91,7 +92,7 @@ async def test_kimi_cache_ttl_reaches_wire_and_usage_uses_actual_headers(
         headers = (
             {f"Msh-Usage-Cache-Write-Tokens-{actual_ttl}": "20"} if actual_ttl else {}
         )
-        base = {"id": "chat_1", "created": 1, "model": "kimi-k3"}
+        base = {"id": "chat_1", "created": 1, "model": model}
         if stream:
             chunks = [
                 {
@@ -142,7 +143,8 @@ async def test_kimi_cache_ttl_reaches_wire_and_usage_uses_actual_headers(
         provider = KimiProvider(api_key="offline-test", http_client=http_client)
         try:
             response = await provider.chat_completions_create(
-                model="kimi-k3",
+                model=model,
+                reasoning_effort="low",
                 messages=[{"role": "user", "content": "hello"}],
                 stream=stream,
                 prompt_cache_options={"mode": "implicit", "ttl": "1h"},
@@ -160,6 +162,7 @@ async def test_kimi_cache_ttl_reaches_wire_and_usage_uses_actual_headers(
             await provider.aclose()
 
     assert len(requests) == 1
+    assert requests[0]["reasoning_effort"] == ("low" if model == "kimi-k3.1-pro" else "max")
     assert requests[0]["prompt_cache_options"] == {"mode": "implicit", "ttl": "1h"}
     assert "extra_body" not in requests[0]
     assert requests[0]["max_completion_tokens"] == 256

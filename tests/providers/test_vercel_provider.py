@@ -135,6 +135,7 @@ async def test_vercel_provider_passes_gpt_xhigh_effort_unchanged():
         ("gpt-5.6-sol", "openai", "openai"),
         ("claude-opus-5.5", "anthropic", "anthropic"),
         ("claude-sonnet-5", "anthropic", "anthropic"),
+        ("claude-sonnet-5.5", "anthropic", "anthropic"),
     ],
 )
 async def test_vercel_provider_pins_first_party_gateway_provider(

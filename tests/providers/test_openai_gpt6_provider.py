@@ -6,7 +6,7 @@ from aisuite.providers.openai_provider import OpenaiProvider
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"])
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"])
 async def test_gpt6_routes_through_responses_with_reasoning_and_tools(model):
     provider = object.__new__(OpenaiProvider)
     provider._responses_create = AsyncMock(return_value="responses-result")

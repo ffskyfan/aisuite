@@ -1,4 +1,3 @@
-import copy
 import openai
 import os
 import json
@@ -29,10 +28,8 @@ from aisuite.framework.replay_payload import (
 )
 from aisuite.framework.stop_reason import StopInfo, StopReason, stop_reason_manager
 from aisuite.framework.content import (
+    project_tool_result_images_to_user,
     MultimodalCapabilities,
-    content_text,
-    has_image_content,
-    is_image_part,
 )
 
 
@@ -316,59 +313,9 @@ class DeepseekProvider(Provider):
     def _project_tool_result_images(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Project screenshots for APIs whose tool messages must be text-only.
-
-        Shared by DeepSeek vision and Qwen. Flush only after the entire
-        contiguous tool-result group so parallel call/result pairs stay intact.
-        Canonical history is never modified or given synthetic user turns.
-        """
-        projected: List[Dict[str, Any]] = []
-        pending_visual_parts: List[Dict[str, Any]] = []
-
-        def flush_visual_parts() -> None:
-            if pending_visual_parts:
-                projected.append(
-                    {"role": "user", "content": list(pending_visual_parts)}
-                )
-                pending_visual_parts.clear()
-
-        for raw_message in messages:
-            message = copy.deepcopy(
-                raw_message.model_dump()
-                if hasattr(raw_message, "model_dump")
-                else dict(raw_message)
-            )
-            # AISuite-only tool metadata is not part of the wire schema.
-            message.pop("is_error", None)
-            if message.get("role") != "tool":
-                flush_visual_parts()
-                projected.append(message)
-                continue
-
-            content = message.get("content")
-            if not has_image_content(content):
-                if isinstance(content, list):
-                    message["content"] = content_text(content)
-                projected.append(message)
-                continue
-
-            tool_call_id = str(message.get("tool_call_id") or "unknown")
-            text = content_text(content).strip()
-            message["content"] = text or self.TOOL_IMAGE_FORWARD_TEXT
-            projected.append(message)
-            pending_visual_parts.append(
-                {
-                    "type": "text",
-                    "text": (
-                        "The following image is visual output from tool result "
-                        f"{tool_call_id}. Inspect it as part of that tool result."
-                    ),
-                }
-            )
-            pending_visual_parts.extend(part for part in content if is_image_part(part))
-
-        flush_visual_parts()
-        return projected
+        return project_tool_result_images_to_user(
+            messages, forward_text=self.TOOL_IMAGE_FORWARD_TEXT
+        )
 
     def _prepare_messages(
         self,
@@ -590,6 +537,10 @@ class DeepseekProvider(Provider):
             },
         }
 
+    def _prepare_model_request_kwargs(self, model: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Model-specific hook for providers sharing OpenAI-compatible transport."""
+        return self._prepare_request_kwargs(kwargs)
+
     def _prepare_request_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize DeepSeek-specific request controls for the OpenAI SDK."""
         prepared = dict(kwargs)
@@ -715,7 +666,7 @@ class DeepseekProvider(Provider):
             replay_build = self.build_replay_view(model, messages, **kwargs)
             prepared_messages = replay_build.request_view
 
-        request_kwargs = self._prepare_request_kwargs(kwargs)
+        request_kwargs = self._prepare_model_request_kwargs(model, kwargs)
 
         if stream:
             # Reset streaming state
