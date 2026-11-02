@@ -214,8 +214,16 @@ class GeminiStopMapper(ProviderStopMapper):
             )
 
         elif original_reason in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"]:
-            metadata = metadata or {}
-            metadata["error_class"] = "tool_call_error"
+            metadata = dict(metadata or {})
+            metadata["error_class"] = original_reason.lower()
+            # Only malformed generation can be repaired by asking for a new
+            # structured call. Configuration/limit failures must not loop.
+            metadata["retryable"] = original_reason == "MALFORMED_FUNCTION_CALL"
+            metadata.setdefault("error_message", {
+                "MALFORMED_FUNCTION_CALL": "模型生成的工具调用参数无效",
+                "UNEXPECTED_TOOL_CALL": "模型发出了未允许的工具调用",
+                "TOO_MANY_TOOL_CALLS": "模型连续调用工具次数超过上游限制",
+            }[original_reason])
             return self._create_stop_info(
                 StopReason.TOOL_CALL_ERROR, original_reason, metadata
             )

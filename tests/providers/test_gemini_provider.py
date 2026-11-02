@@ -701,3 +701,75 @@ def test_gemini_stop_reason_maps_protocol_error():
     ).choices[0].stop_info
 
     assert stop_info.reason == StopReason.PROTOCOL_ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["non_stream", "chat_stream", "tool_result_stream"])
+@pytest.mark.parametrize(
+    "finish_reason,retryable,error_message",
+    [
+        ("MALFORMED_FUNCTION_CALL", True, "模型生成的工具调用参数无效"),
+        ("UNEXPECTED_TOOL_CALL", False, "模型发出了未允许的工具调用"),
+        ("TOO_MANY_TOOL_CALLS", False, "模型连续调用工具次数超过上游限制"),
+    ],
+)
+async def test_gemini_tool_error_preserves_details_and_retry_policy(
+    transport, finish_reason, retryable, error_message,
+):
+    detail = f"Provider diagnostic for {finish_reason}: edit_file"
+    response = SimpleNamespace(
+        text="",
+        candidates=[SimpleNamespace(
+            content=SimpleNamespace(parts=[]),
+            finish_reason=finish_reason,
+            finish_message=detail,
+        )],
+        model_version="gemini-3.7-flash",
+        usage_metadata=None,
+    )
+    with patch("aisuite.providers.gemini_provider.genai.Client"):
+        provider = GeminiProvider(api_key="test-gemini-key")
+    chat = provider.client.chats.create.return_value
+    chat.send_message.return_value = response
+    chat.send_message_stream.return_value = iter([response])
+    provider.client.models.generate_content_stream.return_value = iter([response])
+    messages = [{"role": "user", "content": "Update the outline."}]
+    if transport == "tool_result_stream":
+        messages.extend([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "fc_read",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"file_path":"outline.aifc"}'},
+                    "extra_content": _build_tool_call_extra(
+                        "sig_read", provider_call_id="fc_read", provider_function_name="read_file",
+                    ),
+                }],
+            },
+            {"role": "tool", "tool_call_id": "fc_read", "content": "Original outline."},
+        ])
+
+    result = await provider.chat_completions_create(
+        "gemini-3.7-flash", messages, stream=transport != "non_stream",
+    )
+    if transport == "non_stream":
+        chat.send_message.assert_called_once()
+        stop_info = result.choices[0].stop_info
+    else:
+        chunks = [chunk async for chunk in result]
+        assert len(chunks) == 1
+        stop_info = chunks[-1].choices[0].stop_info
+        if transport == "chat_stream":
+            chat.send_message_stream.assert_called_once()
+        else:
+            provider.client.models.generate_content_stream.assert_called_once()
+            chat.send_message_stream.assert_not_called()
+
+    assert stop_info.reason == StopReason.TOOL_CALL_ERROR
+    assert stop_info.original_reason == finish_reason
+    assert stop_info.metadata["retryable"] is retryable
+    assert stop_info.metadata["error_class"] == finish_reason.lower()
+    assert stop_info.metadata["error_message"] == error_message
+    assert stop_info.metadata["finish_message"] == detail
+    assert stop_info.metadata["tool_calls_count"] == 0

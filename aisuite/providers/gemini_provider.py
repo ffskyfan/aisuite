@@ -16,7 +16,7 @@ from aisuite.framework.replay_payload import (
     get_replay_payload,
     unwrap_replay_payload,
 )
-from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.framework.stop_reason import StopInfo, stop_reason_manager
 from aisuite.framework.content import (
     MultimodalCapabilities,
     MultimodalContentError,
@@ -157,6 +157,33 @@ def _normalize_finish_reason(reason: Any) -> Optional[str]:
         # e.g. "FinishReason.MALFORMED_FUNCTION_CALL" -> "MALFORMED_FUNCTION_CALL"
         return text.rsplit(".", 1)[-1]
     return text
+
+
+def _build_gemini_stop_info(
+    candidate: Any,
+    *,
+    content_length: int,
+    tool_calls_count: int,
+    model: Optional[str],
+) -> Optional[StopInfo]:
+    """Keep stop semantics and provider diagnostics identical across transports."""
+    finish_reason = _normalize_finish_reason(getattr(candidate, "finish_reason", None))
+    if not finish_reason:
+        return None
+    metadata = {
+        "has_content": content_length > 0 or tool_calls_count > 0,
+        "content_length": content_length,
+        "tool_calls_count": tool_calls_count,
+        "finish_reason": finish_reason,
+        "model": model,
+        "provider": GEMINI_PROVIDER_NAME,
+    }
+    finish_message = getattr(candidate, "finish_message", None)
+    if isinstance(finish_message, str) and finish_message:
+        # Retain raw details for diagnosis; user-facing messages are supplied
+        # separately by the stop mapper.
+        metadata["finish_message"] = finish_message
+    return stop_reason_manager.map_stop_reason(GEMINI_PROVIDER_NAME, finish_reason, metadata)
 
 
 def _extract_provider_call_id(source: Any) -> Optional[str]:
@@ -616,28 +643,12 @@ class GeminiMessageConverter:
         # Get finish_reason for stop_info creation
         finish_reason = _normalize_finish_reason(response.candidates[0].finish_reason) if response.candidates else None
 
-        # Create stop_info (we need to import stop_reason_manager at the top level)
-        stop_info = None
-        if finish_reason:
-            choice_data = {
-                "content": {
-                    "parts": [{"text": content}] if content else []
-                }
-            }
-            # Add tool calls to choice_data if present
-            if tool_calls:
-                choice_data["content"]["parts"].extend([{"functionCall": tc} for tc in tool_calls])
-
-            # Import stop_reason_manager here to avoid circular imports
-            from aisuite.framework.stop_reason import stop_reason_manager
-            stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason, {
-                "has_content": bool(content or tool_calls),
-                "content_length": len(content) if content else 0,
-                "tool_calls_count": len(tool_calls) if tool_calls else 0,
-                "finish_reason": finish_reason,
-                "model": response.model_version,
-                "provider": "gemini"
-            })
+        stop_info = _build_gemini_stop_info(
+            candidate,
+            content_length=len(content) if content else 0,
+            tool_calls_count=len(tool_calls) if tool_calls else 0,
+            model=response.model_version,
+        )
 
         # 提取 usage 元数据（token 统计）
         usage_metadata = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
@@ -1841,14 +1852,12 @@ class GeminiProvider(Provider):
                         if chunk.candidates and chunk.candidates[0].finish_reason:
                             finish_reason = _normalize_finish_reason(chunk.candidates[0].finish_reason)
                             # Use accumulated values for accurate stop_info metadata
-                            stop_metadata = {
-                                "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
-                                "content_length": self._stream_content_length,
-                                "tool_calls_count": self._stream_tool_calls_count,
-                                "finish_reason": finish_reason,
-                                "model": model_id,
-                                "provider": "gemini"
-                            }
+                            stop_info = _build_gemini_stop_info(
+                                candidate,
+                                content_length=self._stream_content_length,
+                                tool_calls_count=self._stream_tool_calls_count,
+                                model=model_id,
+                            )
                             if finish_reason in _TOOL_CALL_ERROR_FINISH_REASONS | _PROTOCOL_ERROR_FINISH_REASONS:
                                 try:
                                     roles_tail = [getattr(c, "role", None) for c in contents][-12:]
@@ -1861,7 +1870,6 @@ class GeminiProvider(Provider):
                                     tool_names_for_log,
                                     roles_tail,
                                 )
-                            stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason or "", stop_metadata)
 
                         response_metadata = {
                             'id': response_id,
@@ -2014,14 +2022,12 @@ class GeminiProvider(Provider):
                     if chunk.candidates and chunk.candidates[0].finish_reason:
                         finish_reason = _normalize_finish_reason(chunk.candidates[0].finish_reason)
                         # Use accumulated values for accurate stop_info metadata
-                        stop_metadata = {
-                            "has_content": self._stream_content_length > 0 or self._stream_tool_calls_count > 0,
-                            "content_length": self._stream_content_length,
-                            "tool_calls_count": self._stream_tool_calls_count,
-                            "finish_reason": finish_reason,
-                            "model": model_id,
-                            "provider": "gemini"
-                        }
+                        stop_info = _build_gemini_stop_info(
+                            candidate,
+                            content_length=self._stream_content_length,
+                            tool_calls_count=self._stream_tool_calls_count,
+                            model=model_id,
+                        )
                         if finish_reason in _TOOL_CALL_ERROR_FINISH_REASONS | _PROTOCOL_ERROR_FINISH_REASONS:
                             try:
                                 roles_tail = [getattr(c, "role", None) for c in (history_msgs or [])][-12:]
@@ -2035,7 +2041,6 @@ class GeminiProvider(Provider):
                                 len(last_user_message or ""),
                                 roles_tail,
                             )
-                        stop_info = stop_reason_manager.map_stop_reason("gemini", finish_reason or "", stop_metadata)
 
                     response_metadata = {
                         'id': response_id, # Use the captured ID (or None if never found)
