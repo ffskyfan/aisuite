@@ -1,3 +1,4 @@
+import asyncio
 import openai
 import os
 import json
@@ -19,6 +20,7 @@ from aisuite.framework.replay_payload import (
     unwrap_replay_payload,
 )
 from aisuite.framework.stop_reason import stop_reason_manager
+from aisuite.framework.openai_stream_diagnostics import OpenAIStreamDiagnostics
 from aisuite.framework.content import (
     MultimodalCapabilities,
     filter_images_for_capabilities,
@@ -924,15 +926,24 @@ class OpenaiProvider(Provider):
             self._stream_content_length = 0
             self._stream_tool_calls_count = 0
             self._stream_reasoning_buffer = ""
-            response = await self.client.responses.create(
-                model=model,
-                input=input_items,
-                stream=True,
-                **responses_kwargs
-            )
+            diagnostics = OpenAIStreamDiagnostics(model, len(input_items), responses_kwargs)
+            try:
+                response = await self.client.responses.create(
+                    model=model,
+                    input=input_items,
+                    stream=True,
+                    **responses_kwargs
+                )
+            except BaseException as error:
+                outcome = "cancelled" if isinstance(error, asyncio.CancelledError) else "request_failed"
+                diagnostics.log_summary(outcome, error)
+                raise
+            diagnostics.attach_response(response)
             stream_usage = None
 
             async def stream_gen():
+                outcome = "closed"
+                stream_error = None
                 try:
                     nonlocal stream_usage
                     emitted_text_from_delta = False
@@ -964,6 +975,7 @@ class OpenaiProvider(Provider):
                         )
 
                     async for chunk in response:
+                        diagnostics.record_event(chunk)
                         ctype = getattr(chunk, 'type', None)
 
                         # Capture usage information if available on this event
@@ -1046,8 +1058,16 @@ class OpenaiProvider(Provider):
                                 choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role=None, tool_calls=None, reasoning_content=None), finish_reason='stop', stop_info=stop_info)],
                                 metadata=response_metadata
                             )
+                    outcome = "completed"
+                except BaseException as error:
+                    stream_error = error
+                    outcome = "cancelled" if isinstance(error, asyncio.CancelledError) else "interrupted"
+                    raise
                 finally:
-                    await self._close_stream_response(response)
+                    try:
+                        diagnostics.log_summary(outcome, stream_error)
+                    finally:
+                        await self._close_stream_response(response)
             return stream_gen()
         else:
             resp = await self.client.responses.create(
