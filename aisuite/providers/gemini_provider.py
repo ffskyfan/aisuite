@@ -285,6 +285,7 @@ def _build_tool_call_extra(
     placeholder: bool = False,
     degraded: bool = False,
     degraded_reason: Optional[str] = None,
+    signature_required: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Build replay metadata for a Gemini tool call."""
     normalized_signature = None
@@ -299,6 +300,7 @@ def _build_tool_call_extra(
 
     if (
         not normalized_signature
+        and signature_required
         and not placeholder
         and (provider_call_id or provider_function_name)
         and not degraded
@@ -614,6 +616,7 @@ class GeminiMessageConverter:
                                 signature,
                                 provider_call_id=provider_call_id,
                                 provider_function_name=part.function_call.name,
+                                signature_required=not tool_calls,
                             )
                         )
 
@@ -862,8 +865,13 @@ class GeminiProvider(Provider):
         return model_id.rsplit("/", 1)[-1] == "gemini-3-flash-preview"
 
     @staticmethod
+    def _supports_xhigh_thinking_level(model_id: str) -> bool:
+        """Hydrogen adds xhigh; Carbon and Argon still stop at high."""
+        return bool(model_id) and model_id.rsplit("/", 1)[-1] == "gemini-4-hydrogen"
+
+    @staticmethod
     def _uses_modern_sampling_contract(model_id: str) -> bool:
-        """Gemini 3.6+ Flash and 4 Argon reject legacy sampling controls."""
+        """Models that no longer use custom sampling controls or model prefill."""
         if not model_id:
             return False
         return model_id.rsplit("/", 1)[-1] in {
@@ -871,6 +879,8 @@ class GeminiProvider(Provider):
             "gemini-3.7-flash",
             "gemini-3.8-flash",
             "gemini-4-argon",
+            "gemini-4-hydrogen",
+            "gemini-4-carbon",
         }
 
     def _resolve_tool_call_signature(self, model_id: str, tool_call: Any) -> Tuple[Optional[str], bool]:
@@ -1162,7 +1172,7 @@ class GeminiProvider(Provider):
         for msg in normalized_messages:
             role = msg.get("role")
             if role == "assistant" and isinstance(msg.get("tool_calls"), list):
-                for tool_call in msg["tool_calls"]:
+                for call_index, tool_call in enumerate(msg["tool_calls"]):
                     metadata = _extract_gemini_tool_call_metadata(tool_call)
                     if not metadata:
                         degraded = True
@@ -1186,7 +1196,13 @@ class GeminiProvider(Provider):
                                 metadata={"tool_call_id": getattr(tool_call, "id", None) if not isinstance(tool_call, dict) else tool_call.get("id")},
                             )
                         )
-                    if not metadata.get("thought_signature") and _is_exact_gemini_tool_call_metadata(metadata):
+                    # Only the first parallel call in each model step requires
+                    # a signature. Later calls must retain their original absence.
+                    if (
+                        call_index == 0
+                        and not metadata.get("thought_signature")
+                        and _is_exact_gemini_tool_call_metadata(metadata)
+                    ):
                         diagnostics.append(
                             self._build_protocol_diagnostic(
                                 "missing_thought_signature",
@@ -1261,7 +1277,7 @@ class GeminiProvider(Provider):
         if not isinstance(tool_calls, list):
             return parts if parts else None
 
-        for tool_call in tool_calls:
+        for call_index, tool_call in enumerate(tool_calls):
             func_name = None
             raw_args: Any = "{}"
             provider_call_id = None
@@ -1284,6 +1300,7 @@ class GeminiProvider(Provider):
 
             if (
                 self._is_modern_gemini_model(model_id)
+                and call_index == 0
                 and _is_exact_gemini_tool_call_metadata(metadata)
                 and not signature
             ):
@@ -1532,7 +1549,7 @@ class GeminiProvider(Provider):
             if "include_thoughts" not in thinking_config_fields:
                 thinking_config_fields["include_thoughts"] = True
 
-        # Reasoning / thinking control for Gemini 3 models
+        # Reasoning / thinking control for Gemini 3/4 models
         # Accept OpenAI-style reasoning_effort / reasoning, and direct thinking_level
         reasoning_effort = kwargs.pop("reasoning_effort", None)
         thinking_level = kwargs.pop("thinking_level", None)
@@ -1549,23 +1566,24 @@ class GeminiProvider(Provider):
             model_id
         )
         if uses_modern_sampling_contract:
-            # Gemini 3.6+ removed these controls. Drop product-level defaults too,
-            # otherwise an otherwise valid request fails before generation starts.
+            # These endpoints ignore or reject custom sampling. Drop product
+            # defaults too so out-of-range values cannot invalidate the request.
             for param in ("temperature", "top_p", "top_k", "candidate_count"):
                 kwargs.pop(param, None)
 
         if self._is_modern_gemini_model(model_id):
-            # Gemini 3 models support low/medium/high. Only the original Flash
-            # preview additionally supports minimal; 3.7 returns an error for it.
+            # Only the original Flash preview supports minimal; Hydrogen adds
+            # xhigh. Normalize all entry points without lowering Hydrogen's xhigh.
             level = None
             supports_minimal = self._supports_minimal_thinking_level(model_id)
+            highest_level = "xhigh" if self._supports_xhigh_thinking_level(model_id) else "high"
             configured_level = thinking_config_fields.get("thinking_level")
             if isinstance(configured_level, str):
                 configured_level = configured_level.lower()
                 if configured_level == "minimal" and not supports_minimal:
                     configured_level = "low"
                 if configured_level in {"max", "xhigh"}:
-                    configured_level = "high"
+                    configured_level = highest_level
                 thinking_config_fields["thinking_level"] = configured_level
             if isinstance(thinking_level, str) and thinking_level:
                 level = thinking_level.lower()
@@ -1576,12 +1594,12 @@ class GeminiProvider(Provider):
                 elif eff in {"low", "medium", "high"}:
                     level = eff
                 elif eff in {"max", "xhigh"}:
-                    level = "high"
+                    level = highest_level
 
             if level == "minimal" and not supports_minimal:
                 level = "low"
             if level in {"max", "xhigh"}:
-                level = "high"
+                level = highest_level
 
             thinking_requested = (
                 bool(thinking_config_fields)
@@ -1594,8 +1612,8 @@ class GeminiProvider(Provider):
                 if "include_thoughts" not in thinking_config_fields:
                     thinking_config_fields["include_thoughts"] = True
 
-            # Older Gemini 3 endpoints expect temperature=1.0. Gemini 3.6+
-            # rejects the field entirely, so they must use the provider default.
+            # Older Gemini 3 endpoints expect temperature=1.0. Newer models
+            # use provider-controlled sampling instead.
             if (
                 not uses_modern_sampling_contract
                 and "temperature" not in kwargs
@@ -1818,12 +1836,13 @@ class GeminiProvider(Provider):
                                 elif hasattr(part, 'function_call') and part.function_call:
                                     function_call_obj = part.function_call
                                     signature = _extract_thought_signature(part) or _extract_thought_signature(function_call_obj)
-                                    if signature and function_call_obj:
-                                        self._attach_thought_signature(function_call_obj, signature)
-                                    mock_delta = type('MockDelta', (), {
-                                        'function_call': function_call_obj
-                                    })()
-                                    tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
+                                    converted_calls = self._process_gemini_function_call_direct(
+                                        function_call_obj,
+                                        thought_signature=signature,
+                                        signature_required=self._stream_tool_calls_count == 0 and not tool_calls,
+                                    )
+                                    if converted_calls:
+                                        tool_calls = (tool_calls or []) + converted_calls
                                 elif getattr(part, 'text', None):
                                     content_text_parts.append(part.text)
 
@@ -1984,15 +2003,15 @@ class GeminiProvider(Provider):
                                 reasoning_text_parts.append(part.text)
                             # Check if the part is a function call
                             elif hasattr(part, 'function_call') and part.function_call:
-                                # Create a mock delta object for consistency with other providers
                                 function_call_obj = part.function_call
                                 signature = _extract_thought_signature(part) or _extract_thought_signature(function_call_obj)
-                                if signature and function_call_obj:
-                                    self._attach_thought_signature(function_call_obj, signature)
-                                mock_delta = type('MockDelta', (), {
-                                    'function_call': function_call_obj
-                                })()
-                                tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
+                                converted_calls = self._process_gemini_function_call_direct(
+                                    function_call_obj,
+                                    thought_signature=signature,
+                                    signature_required=self._stream_tool_calls_count == 0 and not tool_calls,
+                                )
+                                if converted_calls:
+                                    tool_calls = (tool_calls or []) + converted_calls
                             # Else, if it's not a thought but has text, it's regular content
                             elif getattr(part, 'text', None):
                                 content_text_parts.append(part.text)
@@ -2106,12 +2125,15 @@ class GeminiProvider(Provider):
         # Standard tool_calls processing (for future Gemini API changes)
         return self._process_standard_tool_calls(delta.tool_calls)
 
-    def _process_gemini_function_call_direct(self, function_call):
+    def _process_gemini_function_call_direct(self, function_call, *, thought_signature=None, signature_required=True):
         """
         Process Gemini function call directly (current Gemini format).
 
         Args:
             function_call: Gemini function call object
+            thought_signature: Signature on the enclosing Part, kept separate
+                because SDK FunctionCall objects may reject extra attributes.
+            signature_required: Only the first parallel call requires a signature.
 
         Returns:
             List of converted tool calls if complete, None otherwise
@@ -2121,7 +2143,7 @@ class GeminiProvider(Provider):
 
         try:
             provider_call_id = _extract_provider_call_id(function_call)
-            signature = _extract_thought_signature(function_call)
+            signature = thought_signature or _extract_thought_signature(function_call)
             # Gemini function calls are typically complete in a single chunk
             function = Function(
                 name=function_call.name,
@@ -2136,6 +2158,7 @@ class GeminiProvider(Provider):
                     signature,
                     provider_call_id=provider_call_id,
                     provider_function_name=function_call.name,
+                    signature_required=signature_required,
                 )
             )
 

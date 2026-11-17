@@ -1,6 +1,5 @@
 import importlib
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -80,14 +79,6 @@ fake_types = SimpleNamespace(
     Content=_FakeContent,
 )
 
-fake_google = ModuleType("google")
-fake_genai = ModuleType("google.genai")
-fake_genai.Client = MagicMock
-fake_genai.types = fake_types
-fake_google.genai = fake_genai
-sys.modules.setdefault("google", fake_google)
-sys.modules["google.genai"] = fake_genai
-
 gemini_module = importlib.import_module("aisuite.providers.gemini_provider")
 GeminiMessageConverter = gemini_module.GeminiMessageConverter
 GeminiProvider = gemini_module.GeminiProvider
@@ -97,6 +88,10 @@ _build_tool_call_extra = gemini_module._build_tool_call_extra
 @pytest.fixture(autouse=True)
 def set_gemini_api_key(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    # Keep these lightweight fakes local to this file. SDK contract tests need
+    # the actual google.genai module and request serialization in the same run.
+    monkeypatch.setattr(gemini_module, "genai", SimpleNamespace(Client=MagicMock))
+    monkeypatch.setattr(gemini_module, "types", fake_types)
 
 
 @patch("aisuite.providers.gemini_provider.genai.Client")
@@ -387,7 +382,9 @@ def test_gemini_thinking_level_fails_loudly_with_unsupported_sdk(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("model", ["gemini-3.1-pro", "gemini-3.8-flash", "gemini-4-argon"])
+@pytest.mark.parametrize(
+    "model", ["gemini-3.1-pro", "gemini-3.8-flash", "gemini-4-argon", "gemini-4-hydrogen", "gemini-4-carbon"]
+)
 @patch("aisuite.providers.gemini_provider.genai.Client")
 def test_gemini_validate_replay_window_errors_on_missing_signature(_mock_client_cls, model):
     provider = GeminiProvider(api_key="test-gemini-key")
