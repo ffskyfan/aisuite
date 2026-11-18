@@ -477,13 +477,20 @@ class OpenaiProvider(Provider):
 
         if is_gpt6:
             reasoning = prepared_kwargs.get('reasoning')
+            flat_effort = prepared_kwargs.pop('reasoning_effort', None)
+            if isinstance(reasoning, str):
+                reasoning = {'effort': reasoning}
+            if flat_effort is not None and (reasoning is None or isinstance(reasoning, dict)):
+                reasoning = {'effort': flat_effort, **(reasoning or {})}
             effort = reasoning.get('effort') if isinstance(reasoning, dict) else None
             if (
-                self._canonical_model_name(model).lower().startswith('gpt-6.1-sol')
+                self._canonical_model_name(model).lower().startswith(('gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra'))
                 and effort in ('none', 'minimal')
             ):
-                prepared_kwargs['reasoning'] = {**reasoning, 'effort': 'low'}
+                reasoning = {**reasoning, 'effort': 'low'}
                 effort = 'low'
+            if isinstance(reasoning, dict):
+                prepared_kwargs['reasoning'] = reasoning
             if effort != 'none':
                 for field in ('temperature', 'top_p', 'top_logprobs', 'logprobs'):
                     prepared_kwargs.pop(field, None)
@@ -715,6 +722,11 @@ class OpenaiProvider(Provider):
         response_id: Optional[str] = None,
         reasoning_items: Any = None,
     ) -> Dict[str, Any]:
+        if output is not None:
+            output = [
+                item.model_dump(mode="json", exclude_unset=True) if hasattr(item, "model_dump") else item
+                for item in output
+            ]
         payload = {
             "output": output,
             "response_id": response_id,
@@ -1106,34 +1118,29 @@ class OpenaiProvider(Provider):
                 stream=False,
                 **responses_kwargs
             )
-            # 非流式：提取content和reasoning
+            # Non-streaming Responses return function calls alongside reasoning and messages.
             content = getattr(resp, 'output_text', None)
             reasoning_content = None
-
-            # 提取reasoning content
+            output = self._extract_responses_output_items(resp)
+            tool_calls = []
             reasoning_text = None
-            if hasattr(resp, 'output') and resp.output:
-                for item in resp.output:
-                    reasoning_text = self._extract_reasoning_text_from_item(item)
-                    if reasoning_text:
-                        break
+            has_reasoning = False
+            for item in output:
+                if self._response_output_item_type(item) == 'reasoning':
+                    has_reasoning = True
+                    reasoning_text = reasoning_text or self._extract_reasoning_text_from_item(item)
+                tool_call = self._convert_responses_function_call_item(item)
+                if tool_call:
+                    tool_calls.append(tool_call)
 
-            if reasoning_text:
+            reasoning_items = getattr(resp, 'reasoning_items', None)
+            if has_reasoning or reasoning_items:
                 reasoning_content = ReasoningContent(
-                    thinking=reasoning_text,
+                    thinking=reasoning_text or "[推理内容已加密，暂未提供摘要]",
                     provider="openai",
                     raw_data=self._build_responses_replay_payload(
-                        output=resp.output if hasattr(resp, 'output') else None,
-                        response_id=getattr(resp, 'id', None),
-                    )
-                )
-            elif hasattr(resp, 'reasoning_items') and resp.reasoning_items:
-                reasoning_content = ReasoningContent(
-                    thinking="[推理内容已加密，暂未提供摘要]",
-                    provider="openai",
-                    raw_data=self._build_responses_replay_payload(
-                        reasoning_items=resp.reasoning_items,
-                        output=resp.output if hasattr(resp, 'output') else None,
+                        reasoning_items=reasoning_items,
+                        output=output,
                         response_id=getattr(resp, 'id', None),
                     )
                 )
@@ -1175,13 +1182,15 @@ class OpenaiProvider(Provider):
                 }.get(reason, 'incomplete')
             elif status not in (None, 'completed'):
                 finish_reason = 'error'
+            elif tool_calls:
+                finish_reason = 'tool_calls'
 
             return ChatCompletionResponse(
                 choices=[
                     Choice(index=0, message=Message(
                         content=content,
                         role='assistant',
-                        tool_calls=None,
+                        tool_calls=tool_calls if finish_reason == 'tool_calls' else None,
                         refusal=None,
                         reasoning_content=reasoning_content
                     ), finish_reason=finish_reason)
