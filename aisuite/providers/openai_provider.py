@@ -21,6 +21,7 @@ from aisuite.framework.replay_payload import (
 )
 from aisuite.framework.stop_reason import stop_reason_manager
 from aisuite.framework.openai_stream_diagnostics import OpenAIStreamDiagnostics
+from aisuite.providers.openai_tool_schema import project_function
 from aisuite.framework.content import (
     MultimodalCapabilities,
     filter_images_for_capabilities,
@@ -850,7 +851,7 @@ class OpenaiProvider(Provider):
         return "".join(text_parts) if text_parts else None
 
     @classmethod
-    def _convert_responses_function_call_item(cls, item: Any) -> Optional[ChatCompletionMessageToolCall]:
+    def _convert_responses_function_call_item(cls, item: Any, argument_plans=None) -> Optional[ChatCompletionMessageToolCall]:
         if cls._response_output_item_type(item) != "function_call":
             return None
 
@@ -865,6 +866,8 @@ class OpenaiProvider(Provider):
 
         if not call_id or not name:
             return None
+        if argument_plans and name in argument_plans:
+            arguments = argument_plans[name].decode(arguments)
 
         return ChatCompletionMessageToolCall(
             id=call_id,
@@ -904,18 +907,18 @@ class OpenaiProvider(Provider):
             diagnostics=validation.diagnostics,
         )
 
-    def _responses_stream_message(self, response):
+    def _responses_stream_message(self, response, argument_plans=None):
         """Preserve the native output, even when reasoning has no visible summary."""
         output = self._extract_responses_output_items(response)
         content = "".join(self._extract_text_from_responses_output_item(item) or "" for item in output)
-        calls = [call for item in output if (call := self._convert_responses_function_call_item(item))]
+        calls = [call for item in output if (call := self._convert_responses_function_call_item(item, argument_plans))]
         thinking = "".join(self._extract_reasoning_text_from_item(item) or "" for item in output)
         return Message(
             role="assistant", content=content, tool_calls=calls or None,
             reasoning_content=ReasoningContent(
                 thinking=thinking, provider="openai",
                 raw_data=self._build_responses_replay_payload(
-                    output=[item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in output],
+                    output=output,
                     response_id=getattr(response, "id", None),
                 ),
             ),
@@ -927,7 +930,7 @@ class OpenaiProvider(Provider):
         - 将 Chat 风格的 assistant.tool_calls -> Responses function_call
         - 将 role:tool -> function_call_output
         - 若上一轮消息包含 reasoning_content.raw_data.output（Responses 原生 output），直接 extend 到本轮 input
-        - 支持流式事件：response.output_text.delta / response.function_call_arguments.delta / done
+        - 文本按增量输出，工具调用在 output_item.done 或终态收到完整参数后交付
         """
         replay_request_view = kwargs.pop("_replay_request_view", None)
         replay_mode = kwargs.pop("_replay_mode", None)
@@ -950,13 +953,13 @@ class OpenaiProvider(Provider):
         if 'max_completion_tokens' in responses_kwargs:
             max_tokens_value = responses_kwargs.pop('max_completion_tokens')
             responses_kwargs.setdefault('max_output_tokens', max_tokens_value)
-        # 工具转换为 Responses API 期望的扁平格式（如存在 function 包裹则展开），并透传 strict
+        # Keep decoding state local to this request, including during streaming.
+        argument_plans = {}
         if 'tools' in responses_kwargs:
-            responses_kwargs['tools'] = self._convert_tools_for_responses_api(responses_kwargs['tools'])
+            responses_kwargs['tools'] = self._convert_tools_for_responses_api(responses_kwargs['tools'], argument_plans)
 
         if stream:
             # 重置流式状态
-            self._streaming_tool_calls = {}
             self._stream_content_length = 0
             self._stream_tool_calls_count = 0
             self._stream_reasoning_buffer = ""
@@ -1036,17 +1039,6 @@ class OpenaiProvider(Provider):
                                 choices=[StreamChoice(index=0, delta=ChoiceDelta(content=chunk.delta, role="assistant", tool_calls=None, reasoning_content=None), finish_reason=None)],
                                 metadata={'id': getattr(chunk, 'response_id', None) or getattr(chunk, 'id', None), 'model': getattr(chunk, 'model', None)}
                             )
-                        elif ctype == 'response.function_call_arguments.delta' and hasattr(chunk, 'delta'):
-                            # 复用 Chat 路径的积累器
-                            mock_delta = type('MockDelta', (), {'tool_calls': [type('MTC', (), {'index': getattr(chunk, 'output_index', 0), 'id': chunk.item_id, 'function': type('MF', (), {'arguments': chunk.delta, 'name': ''})(), 'type': 'function'})()]})()
-                            tool_calls = self._accumulate_and_convert_tool_calls(mock_delta)
-                            if tool_calls:
-                                # Accumulate tool calls count
-                                self._stream_tool_calls_count += len(tool_calls)
-                                yield ChatCompletionResponse(
-                                    choices=[StreamChoice(index=0, delta=ChoiceDelta(content=None, role="assistant", tool_calls=tool_calls, reasoning_content=None), finish_reason=None)],
-                                    metadata={'id': getattr(chunk, 'response_id', None), 'model': getattr(chunk, 'model', None)}
-                                )
                         elif ctype == 'response.output_item.done':
                             item = getattr(chunk, 'item', None)
                             item_text = self._extract_text_from_responses_output_item(item)
@@ -1055,7 +1047,7 @@ class OpenaiProvider(Provider):
                                 emitted_text_items.add(item_id)
                                 yield _stream_text_response(item_text, chunk)
 
-                            tool_call = self._convert_responses_function_call_item(item)
+                            tool_call = self._convert_responses_function_call_item(item, argument_plans)
                             if tool_call:
                                 tool_call_keys = self._responses_tool_call_keys(tool_call)
                                 if not tool_call_keys.intersection(emitted_tool_call_ids):
@@ -1072,7 +1064,7 @@ class OpenaiProvider(Provider):
                                 finish = 'length' if reason == 'max_output_tokens' else 'content_filter' if reason == 'content_filter' else 'incomplete'
                             elif ctype == 'response.failed' or status not in (None, 'completed'):
                                 finish = 'error'
-                            canonical = self._responses_stream_message(completed_response)
+                            canonical = self._responses_stream_message(completed_response, argument_plans)
                             if finish == 'stop':
                                 for item in self._extract_responses_output_items(completed_response):
                                     item_text = self._extract_text_from_responses_output_item(item)
@@ -1129,14 +1121,14 @@ class OpenaiProvider(Provider):
                 if self._response_output_item_type(item) == 'reasoning':
                     has_reasoning = True
                     reasoning_text = reasoning_text or self._extract_reasoning_text_from_item(item)
-                tool_call = self._convert_responses_function_call_item(item)
+                tool_call = self._convert_responses_function_call_item(item, argument_plans)
                 if tool_call:
                     tool_calls.append(tool_call)
 
             reasoning_items = getattr(resp, 'reasoning_items', None)
-            if has_reasoning or reasoning_items:
+            if has_reasoning or reasoning_items or any(call.function.name in argument_plans for call in tool_calls):
                 reasoning_content = ReasoningContent(
-                    thinking=reasoning_text or "[推理内容已加密，暂未提供摘要]",
+                    thinking=reasoning_text or ("[推理内容已加密，暂未提供摘要]" if has_reasoning or reasoning_items else ""),
                     provider="openai",
                     raw_data=self._build_responses_replay_payload(
                         reasoning_items=reasoning_items,
@@ -1198,13 +1190,13 @@ class OpenaiProvider(Provider):
                 metadata=metadata
             )
 
-    def _convert_tools_for_responses_api(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _convert_tools_for_responses_api(self, tools: List[Dict[str, Any]], argument_plans=None) -> List[Dict[str, Any]]:
         converted = []
         for t in tools or []:
-            if not isinstance(t, dict):
+            if not isinstance(t, dict) or t.get("type") != "function":
                 converted.append(t)
                 continue
-            if t.get('type') == 'function' and 'function' in t:
+            if 'function' in t:
                 fn = t['function'] or {}
                 item = {
                     'type': 'function',
@@ -1214,16 +1206,16 @@ class OpenaiProvider(Provider):
                 }
                 if 'strict' in fn:
                     item['strict'] = fn['strict']
-                    try:
-                        params = item['parameters'] or {}
-                        if fn['strict'] and isinstance(params, dict) and 'additionalProperties' not in params:
-                            params['additionalProperties'] = False
-                            item['parameters'] = params
-                    except Exception:
-                        pass
-                converted.append(item)
             else:
-                converted.append(t)
+                item = t
+            wire, plan = project_function(item)
+            if wire is item and 'function' in t and item.get('strict'):
+                params = item['parameters']
+                if isinstance(params, dict) and 'additionalProperties' not in params:
+                    wire = {**item, 'parameters': {**params, 'additionalProperties': False}}
+            if plan and argument_plans is not None:
+                argument_plans[item['name']] = plan
+            converted.append(wire)
         return converted
 
 
