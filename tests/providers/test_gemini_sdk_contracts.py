@@ -16,7 +16,8 @@ from aisuite.providers.gemini_provider import GeminiProvider
 # serialized HTTP payload below, including xhigh, instead of mocking the enum.
 pytestmark = pytest.mark.filterwarnings("ignore:xhigh is not a valid ThinkingLevel:UserWarning")
 
-NEW_MODELS = ["gemini-4-hydrogen", "gemini-4-carbon"]
+XHIGH_MODELS = ("gemini-4-hydrogen", "gemini-4-neon")
+NEW_MODELS = XHIGH_MODELS + ("gemini-4-carbon",)
 
 
 @pytest.fixture
@@ -81,7 +82,7 @@ def offline_gemini():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", NEW_MODELS)
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+@pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh", "max"])
 @pytest.mark.parametrize("entry", ["thinking_config", "thinking_level", "reasoning", "reasoning_effort"])
 @pytest.mark.parametrize("stream", [False, True])
 async def test_native_thinking_and_sampling_reach_http(offline_gemini, model, effort, entry, stream):
@@ -105,9 +106,9 @@ async def test_native_thinking_and_sampling_reach_http(offline_gemini, model, ef
     if stream:
         result = [chunk async for chunk in result][-1]
     body = json.loads(requests[0].content)
-    expected = effort
+    expected = "low" if effort == "minimal" else effort
     if effort in {"xhigh", "max"}:
-        expected = "xhigh" if model == "gemini-4-hydrogen" else "high"
+        expected = "xhigh" if model in XHIGH_MODELS else "high"
     config = body["generationConfig"]
     thinking = config["thinkingConfig"]
     assert thinking.get("thinkingLevel", thinking.get("thinking_level")).lower() == expected
