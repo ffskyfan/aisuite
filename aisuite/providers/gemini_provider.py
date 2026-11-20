@@ -866,8 +866,11 @@ class GeminiProvider(Provider):
 
     @staticmethod
     def _supports_xhigh_thinking_level(model_id: str) -> bool:
-        """Hydrogen adds xhigh; Carbon and Argon still stop at high."""
-        return bool(model_id) and model_id.rsplit("/", 1)[-1] == "gemini-4-hydrogen"
+        """Hydrogen and Neon accept the extra-high thinking level."""
+        return bool(model_id) and model_id.rsplit("/", 1)[-1] in {
+            "gemini-4-hydrogen",
+            "gemini-4-neon",
+        }
 
     @staticmethod
     def _uses_modern_sampling_contract(model_id: str) -> bool:
@@ -881,6 +884,7 @@ class GeminiProvider(Provider):
             "gemini-4-argon",
             "gemini-4-hydrogen",
             "gemini-4-carbon",
+            "gemini-4-neon",
         }
 
     def _resolve_tool_call_signature(self, model_id: str, tool_call: Any) -> Tuple[Optional[str], bool]:
@@ -1572,8 +1576,7 @@ class GeminiProvider(Provider):
                 kwargs.pop(param, None)
 
         if self._is_modern_gemini_model(model_id):
-            # Only the original Flash preview supports minimal; Hydrogen adds
-            # xhigh. Normalize all entry points without lowering Hydrogen's xhigh.
+            # Use the model's native range for every thinking control entry point.
             level = None
             supports_minimal = self._supports_minimal_thinking_level(model_id)
             highest_level = "xhigh" if self._supports_xhigh_thinking_level(model_id) else "high"
